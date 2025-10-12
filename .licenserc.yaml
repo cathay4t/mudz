@@ -1,0 +1,14 @@
+header:
+  license:
+    content: |
+      SPDX-License-Identifier: Apache-2.0
+  paths-ignore:
+    - 'target'
+    - '**/*.toml'
+    - '**/*.lock'
+    - '**/*.yml'
+    - '**/*.md'
+    - 'CHANGELOG'
+    - 'LICENSE'
+    - '.gitignore'
+  comment: on-failure

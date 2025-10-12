@@ -1,0 +1,13 @@
+[package]
+name = "packet-dns"
+version.workspace = true
+authors.workspace = true
+description = "The rust crate for DNS packet parsing/emiting"
+documentation.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lib]
+name = "packet_dns"
+path = "lib.rs"
