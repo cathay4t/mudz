@@ -1,13 +1,13 @@
 [package]
-name = "packet-dns"
+name = "mudz"
 version.workspace = true
 authors.workspace = true
-description = "The rust crate for DNS packet parsing/emiting"
+description = "The library of controling mudz daemon"
 documentation.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
 [lib]
-name = "packet_dns"
+name = "mudz"
 path = "lib.rs"

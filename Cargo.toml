@@ -1,9 +1,8 @@
 [workspace]
 resolver = "2"
 members = [
-    "src/cli",
+    "src/lib",
     "src/daemon",
-    "src/packet-dns",
 ]
 
 [workspace.package]
@@ -29,4 +28,3 @@ rand = { version = "0.9" }
 [workspace.dependencies.tokio]
 version ="1.35.0"
 features = ["net", "rt", "rt-multi-thread", "macros", "sync", "time", "fs"]
-
