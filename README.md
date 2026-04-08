@@ -49,6 +49,14 @@ domains = [
 ]
 # Don't send AAAA queries for this group
 disable_ipv6 = true
+
+# Return NXDOMAIN for these domains without sending any upstream query
+# (useful for blocking domains)
+[group.blocked]
+nameservers = []
+domains = [
+    "ads.example.com",
+]
 ```
 
 ## License

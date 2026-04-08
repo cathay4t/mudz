@@ -31,6 +31,8 @@ struct UpstreamClients {
     https_clients: Vec<DnsHttpsClient>,
     /// Disable AAAA queries for this group
     disable_ipv6: bool,
+    /// Group has no nameservers configured -- return NXDOMAIN immediately
+    empty_nameservers: bool,
 }
 
 impl UpstreamClients {
@@ -50,10 +52,13 @@ impl UpstreamClients {
             }
         }
 
+        let empty_nameservers = addrs.is_empty();
+
         Ok(Self {
             udp_clients,
             https_clients,
             disable_ipv6,
+            empty_nameservers,
         })
     }
 
@@ -105,11 +110,12 @@ impl DnsUdpServer {
                 &group.nameservers,
                 group.disable_ipv6,
             )?;
-            if clients.has_clients() {
-                // Store domain routes
-                for domain in &group.domains {
-                    domain_routes.push((domain.clone(), name.clone()));
-                }
+            // Always register the group (even with no clients, so we can
+            // return NXDOMAIN for groups with empty nameservers)
+            for domain in &group.domains {
+                domain_routes.push((domain.clone(), name.clone()));
+            }
+            if clients.has_clients() || clients.empty_nameservers {
                 named_groups.insert(name.clone(), clients);
             }
         }
@@ -303,6 +309,26 @@ impl DnsUdpServer {
             log::trace!("Routing {} {:?} to fallback", domain, query_type);
             fallback
         };
+
+        // If this group has no nameservers configured, return NXDOMAIN
+        if upstream.empty_nameservers {
+            log::trace!(
+                "Returning NXDOMAIN for {} (empty nameservers group)",
+                domain
+            );
+            let response =
+                DnsMessage::new_nxdomain(transaction_id, &domain, query_type)?;
+            socket
+                .send_to(&response.to_bytes()?, client_addr)
+                .await
+                .map_err(|e| {
+                    DnsError::new(
+                        ErrorKind::IoError(e.to_string()),
+                        "Failed to send NXDOMAIN response",
+                    )
+                })?;
+            return Ok(());
+        }
 
         // If this group disables IPv6 and the query is for AAAA,
         // return an empty NoError response immediately
