@@ -574,7 +574,7 @@ impl DnsUdpServer {
 
         Err(DnsError::new(
             ErrorKind::InvalidResponse,
-            "All upstream DNS servers failed",
+            format!("All upstream DNS servers failed for domain: {}", domain),
         ))
     }
 
