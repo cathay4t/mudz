@@ -7,7 +7,7 @@
 
 ## Usage
 
-Create `/etc/mudz/mudz.conf` with these contents:
+ * Create `/etc/mudz/mudz.conf` with these contents:
 
 ```toml
 [main]
@@ -39,10 +39,15 @@ domains = [
 ]
 ```
 
-Run the daemon
+ * Build and Run the daemon:
 
 ```bash
-CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER="sudo" cargo run --release
+sudo mkdir /etc/mudz
+sudo cp -fv mudz.conf.example /etc/mudz/mudz.conf
+cargo build --release
+sudo cp -fv target/release/mudzd /usr/bin/
+sudo cp -fv mudz.service /etc/systemd/system/
+sudo systemctl enable mudz.service --now
 ```
 
 ## License

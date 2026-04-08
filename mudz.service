@@ -1,0 +1,12 @@
+[Unit]
+Description=Mudz DNS Caching Daemon
+After=network.target
+Before=network-online.target nss-lookup.target
+Wants=nss-lookup.target
+
+[Service]
+ExecStart=/usr/bin/mudzd
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target
