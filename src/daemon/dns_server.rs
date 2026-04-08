@@ -2,10 +2,13 @@
 
 use std::{
     collections::HashMap,
+    future::Future,
     net::{Ipv4Addr, Ipv6Addr, SocketAddr},
+    pin::Pin,
     sync::Arc,
 };
 
+use futures::stream::{FuturesUnordered, StreamExt};
 use mudz::{
     DnsDomainName, DnsError, DnsHeader, DnsHttpsClient, DnsMessage,
     DnsMessageType, DnsQueryType, DnsQuestion, DnsRecordClass,
@@ -473,12 +476,24 @@ impl DnsUdpServer {
         domain: &str,
         query_type: DnsQueryType,
     ) -> Result<Vec<u8>, DnsError> {
-        let mut handles = Vec::new();
+        let num_clients =
+            upstream.udp_clients.len() + upstream.https_clients.len();
 
-        // Try all UDP clients simultaneously
+        if num_clients == 0 {
+            return Err(DnsError::new(
+                ErrorKind::InvalidResponse,
+                "No upstream clients configured",
+            ));
+        }
+
+        type ResolveFuture =
+            Pin<Box<dyn Future<Output = Result<Vec<u8>, DnsError>> + Send>>;
+        let mut futures = FuturesUnordered::<ResolveFuture>::new();
+
+        // Create futures for all UDP clients
         for client in &upstream.udp_clients {
             let server = client.server_addr().to_string();
-            let domain = domain.to_string();
+            let domain_str = domain.to_string();
             log::trace!(
                 "Querying upstream UDP {} for {} {:?}",
                 server,
@@ -486,38 +501,34 @@ impl DnsUdpServer {
                 query_type
             );
             let client = client.clone();
-            let handle = tokio::spawn(async move {
+            futures.push(Box::pin(async move {
                 let result =
-                    Self::resolve_udp_single(&client, &domain, query_type)
+                    Self::resolve_udp_single(&client, &domain_str, query_type)
                         .await;
-                match &result {
-                    Ok(_) => {
-                        log::trace!(
-                            "Upstream UDP {} responded for {} {:?}",
-                            server,
-                            domain,
-                            query_type
-                        );
-                    }
-                    Err(e) => {
-                        log::trace!(
-                            "Upstream UDP {} failed for {} {:?}: {}",
-                            server,
-                            domain,
-                            query_type,
-                            e
-                        );
-                    }
+                if result.is_ok() {
+                    log::trace!(
+                        "Upstream UDP {} responded for {} {:?}",
+                        server,
+                        domain_str,
+                        query_type
+                    );
+                } else if let Err(ref e) = result {
+                    log::trace!(
+                        "Upstream UDP {} failed for {} {:?}: {}",
+                        server,
+                        domain_str,
+                        query_type,
+                        e
+                    );
                 }
                 result
-            });
-            handles.push(handle);
+            }));
         }
 
-        // Try all HTTPS clients simultaneously
+        // Create futures for all HTTPS clients
         for client in &upstream.https_clients {
             let server = client.server_url().to_string();
-            let domain = domain.to_string();
+            let domain_str = domain.to_string();
             log::trace!(
                 "Querying upstream HTTPS {} for {} {:?}",
                 server,
@@ -525,52 +536,37 @@ impl DnsUdpServer {
                 query_type
             );
             let client = client.clone();
-            let handle = tokio::spawn(async move {
-                let result =
-                    Self::resolve_https_single(&client, &domain, query_type)
-                        .await;
-                match &result {
-                    Ok(_) => {
-                        log::trace!(
-                            "Upstream HTTPS {} responded for {} {:?}",
-                            server,
-                            domain,
-                            query_type
-                        );
-                    }
-                    Err(e) => {
-                        log::trace!(
-                            "Upstream HTTPS {} failed for {} {:?}: {}",
-                            server,
-                            domain,
-                            query_type,
-                            e
-                        );
-                    }
+            futures.push(Box::pin(async move {
+                let result = Self::resolve_https_single(
+                    &client,
+                    &domain_str,
+                    query_type,
+                )
+                .await;
+                if result.is_ok() {
+                    log::trace!(
+                        "Upstream HTTPS {} responded for {} {:?}",
+                        server,
+                        domain_str,
+                        query_type
+                    );
+                } else if let Err(ref e) = result {
+                    log::trace!(
+                        "Upstream HTTPS {} failed for {} {:?}: {}",
+                        server,
+                        domain_str,
+                        query_type,
+                        e
+                    );
                 }
                 result
-            });
-            handles.push(handle);
+            }));
         }
 
-        if handles.is_empty() {
-            return Err(DnsError::new(
-                ErrorKind::InvalidResponse,
-                "No upstream clients configured",
-            ));
-        }
-
-        // Wait for all handles, return first success
-        let results = futures::future::join_all(handles).await;
-        for result in results {
-            match result {
-                Ok(Ok(response)) => return Ok(response),
-                Ok(Err(e)) => {
-                    log::debug!("Upstream error: {}", e);
-                }
-                Err(e) => {
-                    log::debug!("Upstream task failed: {}", e);
-                }
+        // Poll futures, return first success
+        while let Some(result) = futures.next().await {
+            if result.is_ok() {
+                return result;
             }
         }
 
