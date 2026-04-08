@@ -42,7 +42,7 @@ domains = [
     "youtube.com",
 ]
 
-[nameserver.company]
+[nameservers.company]
 nameservers = ["10.0.0.1"]
 domains = [
     "fish-touching.net",
