@@ -7,40 +7,6 @@
 
 ## Usage
 
- * Create `/etc/mudz/mudz.conf` with these contents:
-
-```toml
-[main]
-# Which UDP socket to listen
-udp_bind = "127.0.0.1:53"
-# Maximum number of cache entries
-max_cache_size = 4096
-# Log level (trace, debug, info, warn, error)
-log_level = "info"
-
-[fallback]
-# Send out DNS request to all nameservers simultaneously, and reply to user
-# once got any valid reply
-nameservers = ["223.5.5.5", "119.29.29.29"]
-
-# Redirect user's request on these domains to specified nameservers instead of
-# fallback ones
-[nameservers.google]
-nameservers = ["8.8.8.8"]
-domains = [
-    "google.com",
-    "youtube.com",
-]
-
-[nameserver.company]
-nameservers = ["10.0.0.1"]
-domains = [
-    "fish-touching.net",
-]
-```
-
- * Build and Run the daemon:
-
 ```bash
 sudo mkdir /etc/mudz
 sudo cp -fv mudz.conf.example /etc/mudz/mudz.conf
