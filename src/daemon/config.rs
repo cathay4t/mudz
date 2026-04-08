@@ -5,8 +5,8 @@ use std::{collections::HashMap, fs, path::Path};
 use mudz::DnsError;
 use serde::Deserialize;
 
-/// Default config file path
-pub const DEFAULT_CONFIG_PATH: &str = "/etc/mudz/mudz.conf";
+const DEFAULT_MAX_CACHE_SIZE: usize = 4096;
+const DEFAULT_UDP_BIND: &str = "127.0.0.1:53";
 
 /// Configuration for the main section
 #[derive(Debug, Deserialize, Clone)]
@@ -16,6 +16,7 @@ pub struct MainConfig {
     pub udp_bind: String,
     /// Maximum number of cache entries
     pub max_cache_size: usize,
+    #[serde(default)]
     /// Log level (e.g., "info", "debug", "warn", "error")
     pub log_level: String,
 }
@@ -23,8 +24,8 @@ pub struct MainConfig {
 impl Default for MainConfig {
     fn default() -> Self {
         Self {
-            udp_bind: "127.0.0.1:53".to_string(),
-            max_cache_size: 4096,
+            udp_bind: DEFAULT_UDP_BIND.to_string(),
+            max_cache_size: DEFAULT_MAX_CACHE_SIZE,
             log_level: "info".to_string(),
         }
     }
@@ -48,7 +49,7 @@ impl Default for FallbackConfig {
 
 /// Configuration for a named group of upstream DNS servers
 #[derive(Debug, Deserialize, Clone, Default)]
-#[serde(deny_unknown_fields)]
+#[serde(default, deny_unknown_fields)]
 pub struct UpstreamGroup {
     /// Nameservers in this group
     pub nameservers: Vec<String>,

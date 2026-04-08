@@ -36,7 +36,7 @@ nameservers = ["223.5.5.5", "119.29.29.29"]
 # Redirect user's request on these domains to specified nameservers instead of
 # fallback ones
 [group.google]
-nameservers = ["8.8.8.8"]
+nameservers = ["8.8.8.8", "https://dns.google/dns-query"]
 domains = [
     "google.com",
     "youtube.com",

@@ -9,8 +9,10 @@ mod host;
 
 use self::{config::MudzConfig, dns_server::DnsUdpServer};
 
+const DEFAULT_CONFIG_PATH: &str = "/etc/mudz/mudz.conf";
+
 fn main() -> Result<(), DnsError> {
-    let config = MudzConfig::from_file(config::DEFAULT_CONFIG_PATH)?;
+    let config = MudzConfig::from_file(DEFAULT_CONFIG_PATH)?;
     let cache_size = config.main.max_cache_size;
     let log_level = &config.main.log_level;
 
