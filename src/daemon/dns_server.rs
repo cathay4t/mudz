@@ -704,30 +704,7 @@ impl DnsUdpServer {
         socket: &UdpSocket,
         transaction_id: u16,
     ) -> Result<(), DnsError> {
-        let error_response = DnsMessage {
-            header: DnsHeader {
-                id: transaction_id,
-                message_type: DnsMessageType::Response,
-                qr: true,
-                opcode: 0,
-                aa: false,
-                tc: false,
-                rd: true,
-                ra: true,
-                z: 0,
-                rcode: DnsResponseCode::ServFail,
-                qdcount: 0,
-                ancount: 0,
-                nscount: 0,
-                arcount: 0,
-            },
-            questions: Vec::new(),
-            answers: Vec::new(),
-            authorities: Vec::new(),
-            additionals: Vec::new(),
-        };
-
-        let bytes = error_response.to_bytes()?;
+        let bytes = DnsMessage::new_servfail(transaction_id).to_bytes()?;
         socket.send_to(&bytes, client_addr).await.map_err(|e| {
             DnsError::new(
                 ErrorKind::IoError(e.to_string()),

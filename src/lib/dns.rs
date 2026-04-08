@@ -655,6 +655,35 @@ impl DnsMessage {
         })
     }
 
+    /// Create a SERVFAIL response.
+    ///
+    /// # Arguments
+    /// * `transaction_id` - Transaction ID from the original query
+    pub fn new_servfail(transaction_id: u16) -> Self {
+        DnsMessage {
+            header: DnsHeader {
+                id: transaction_id,
+                message_type: DnsMessageType::Response,
+                qr: true,
+                opcode: 0,
+                aa: false,
+                tc: false,
+                rd: true,
+                ra: true,
+                z: 0,
+                rcode: DnsResponseCode::ServFail,
+                qdcount: 0,
+                ancount: 0,
+                nscount: 0,
+                arcount: 0,
+            },
+            questions: Vec::new(),
+            answers: Vec::new(),
+            authorities: Vec::new(),
+            additionals: Vec::new(),
+        }
+    }
+
     /// Parse a dot-separated domain name string into a DnsDomainName
     fn parse_domain_name(name: &str) -> Result<DnsDomainName, DnsError> {
         if name.is_empty() {
