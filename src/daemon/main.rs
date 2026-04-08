@@ -2,8 +2,10 @@
 
 use mudz::DnsError;
 
+mod cache;
 mod config;
 mod dns_server;
+mod host;
 
 use self::{config::MudzConfig, dns_server::DnsUdpServer};
 

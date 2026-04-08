@@ -2,11 +2,8 @@
 
 use std::{
     collections::HashMap,
-    fs,
-    io::{BufRead, BufReader},
     net::{Ipv4Addr, Ipv6Addr, SocketAddr},
     sync::Arc,
-    time::{Duration, Instant},
 };
 
 use mudz::{
@@ -16,177 +13,11 @@ use mudz::{
 };
 use tokio::{net::UdpSocket, sync::RwLock};
 
-use crate::config::MudzConfig;
-
-/// Minimum TTL to cache (seconds)
-const MIN_CACHE_TTL: u32 = 60;
-/// Maximum TTL to cache (seconds, 1 day)
-const MAX_CACHE_TTL: u32 = 86400;
-
-/// Path to the hosts file
-const HOSTS_FILE: &str = "/etc/hosts";
-
-/// Cache entry for a DNS query result
-struct CacheEntry {
-    /// Cached DNS message bytes (response format)
-    response_bytes: Vec<u8>,
-    /// Expiry time based on record TTL
-    expires_at: Instant,
-}
-
-/// DNS cache storage
-struct DnsCache {
-    /// Map of (domain, query_type) -> cache entry
-    entries: HashMap<(String, DnsQueryType), CacheEntry>,
-    /// Maximum number of cache entries
-    max_size: usize,
-}
-
-impl DnsCache {
-    fn new(max_size: usize) -> Self {
-        Self {
-            entries: HashMap::new(),
-            max_size,
-        }
-    }
-
-    /// Get a cached response if it exists and hasn't expired
-    fn get(
-        &self,
-        domain: &str,
-        query_type: DnsQueryType,
-    ) -> Option<&CacheEntry> {
-        self.entries
-            .get(&(domain.to_string(), query_type))
-            .filter(|entry| entry.expires_at > Instant::now())
-    }
-
-    /// Insert or update a cache entry
-    fn insert(
-        &mut self,
-        domain: String,
-        query_type: DnsQueryType,
-        response: Vec<u8>,
-        ttl: u32,
-    ) {
-        // Clamp TTL to reasonable bounds
-        let effective_ttl = ttl.clamp(MIN_CACHE_TTL, MAX_CACHE_TTL);
-
-        // Evict old entries if cache is full
-        if self.entries.len() >= self.max_size {
-            self.evict_expired();
-            // If still full, remove first entry
-            if let Some(oldest_key) = self.entries.keys().next().cloned()
-                && self.entries.len() >= self.max_size
-            {
-                self.entries.remove(&oldest_key);
-            }
-        }
-
-        self.entries.insert(
-            (domain, query_type),
-            CacheEntry {
-                response_bytes: response,
-                expires_at: Instant::now()
-                    + Duration::from_secs(effective_ttl as u64),
-            },
-        );
-    }
-
-    /// Remove all expired entries
-    fn evict_expired(&mut self) {
-        let now = Instant::now();
-        self.entries.retain(|_, entry| entry.expires_at > now);
-    }
-}
-
-/// Parsed /etc/hosts entries
-#[derive(Clone)]
-struct HostsFile {
-    /// Map of domain -> list of IPv4 addresses
-    a_records: HashMap<String, Vec<Ipv4Addr>>,
-    /// Map of domain -> list of IPv6 addresses
-    aaaa_records: HashMap<String, Vec<Ipv6Addr>>,
-}
-
-impl HostsFile {
-    /// Parse /etc/hosts and return the parsed entries
-    fn new() -> Self {
-        let mut a_records: HashMap<String, Vec<Ipv4Addr>> = HashMap::new();
-        let mut aaaa_records: HashMap<String, Vec<Ipv6Addr>> = HashMap::new();
-
-        if let Ok(file) = fs::File::open(HOSTS_FILE) {
-            let reader = BufReader::new(file);
-            for line in reader.lines().map_while(Result::ok) {
-                Self::parse_line(&line, &mut a_records, &mut aaaa_records);
-            }
-            log::info!(
-                "Loaded /etc/hosts: {} A records, {} AAAA records",
-                a_records.len(),
-                aaaa_records.len()
-            );
-        } else {
-            log::debug!("Could not open {}, skipping", HOSTS_FILE);
-        }
-
-        Self {
-            a_records,
-            aaaa_records,
-        }
-    }
-
-    /// Parse a single line from /etc/hosts
-    fn parse_line(
-        line: &str,
-        a_records: &mut HashMap<String, Vec<Ipv4Addr>>,
-        aaaa_records: &mut HashMap<String, Vec<Ipv6Addr>>,
-    ) {
-        let line = line.trim();
-        // Skip empty lines and comments
-        if line.is_empty() || line.starts_with('#') {
-            return;
-        }
-
-        let parts: Vec<&str> = line.split_whitespace().collect();
-        if parts.len() < 2 {
-            return;
-        }
-
-        let addr_str = parts[0];
-        let hostnames = &parts[1..];
-
-        // Try to parse as IPv4 or IPv6 address
-        if let Ok(ipv4) = addr_str.parse::<Ipv4Addr>() {
-            for hostname in hostnames {
-                if !hostname.starts_with('#') {
-                    a_records
-                        .entry(hostname.to_lowercase())
-                        .or_default()
-                        .push(ipv4);
-                }
-            }
-        } else if let Ok(ipv6) = addr_str.parse::<Ipv6Addr>() {
-            for hostname in hostnames {
-                if !hostname.starts_with('#') {
-                    aaaa_records
-                        .entry(hostname.to_lowercase())
-                        .or_default()
-                        .push(ipv6);
-                }
-            }
-        }
-    }
-
-    /// Look up A records for a domain
-    fn lookup_a(&self, domain: &str) -> Option<&Vec<Ipv4Addr>> {
-        self.a_records.get(&domain.to_lowercase())
-    }
-
-    /// Look up AAAA records for a domain
-    fn lookup_aaaa(&self, domain: &str) -> Option<&Vec<Ipv6Addr>> {
-        self.aaaa_records.get(&domain.to_lowercase())
-    }
-}
+use crate::{
+    cache::{DnsCache, MAX_CACHE_TTL},
+    config::MudzConfig,
+    host::HostsFile,
+};
 
 /// Named upstream resolver clients
 #[derive(Clone)]
