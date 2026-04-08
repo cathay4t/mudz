@@ -10,7 +10,7 @@ pub const DEFAULT_CONFIG_PATH: &str = "/etc/mudz/mudz.conf";
 
 /// Configuration for the main section
 #[derive(Debug, Deserialize, Clone)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct MainConfig {
     /// UDP socket bind address
     pub udp_bind: String,
@@ -32,7 +32,7 @@ impl Default for MainConfig {
 
 /// Configuration for the fallback (default upstream) section
 #[derive(Debug, Deserialize, Clone)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct FallbackConfig {
     /// Upstream DNS servers for fallback
     pub nameservers: Vec<String>,
@@ -46,9 +46,10 @@ impl Default for FallbackConfig {
     }
 }
 
-/// Configuration for a named group of nameservers
+/// Configuration for a named group of upstream DNS servers
 #[derive(Debug, Deserialize, Clone, Default)]
-pub struct NameserverGroup {
+#[serde(deny_unknown_fields)]
+pub struct UpstreamGroup {
     /// Nameservers in this group
     pub nameservers: Vec<String>,
     /// Domains that should be routed to this group
@@ -59,13 +60,15 @@ pub struct NameserverGroup {
 
 /// Full mudz configuration
 #[derive(Debug, Deserialize, Clone, Default)]
+#[serde(default, deny_unknown_fields)]
 pub struct MudzConfig {
     /// Main settings
     pub main: MainConfig,
     /// Fallback (default upstream) settings
     pub fallback: FallbackConfig,
-    /// Named nameserver groups, keyed by group name
-    pub nameservers: HashMap<String, NameserverGroup>,
+    /// Named upstream groups, keyed by group name (from [group.*] sections)
+    #[serde(rename = "group")]
+    pub groups: HashMap<String, UpstreamGroup>,
 }
 
 impl MudzConfig {
@@ -82,59 +85,61 @@ impl MudzConfig {
                 ),
             )
         })?;
-
-        Self::from_str(&content)
-    }
-
-    /// Parse configuration from a TOML string
-    pub fn from_str(content: &str) -> Result<Self, DnsError> {
-        let toml_value: toml::Value = toml::from_str(content).map_err(|e| {
+        toml::from_str::<Self>(&content).map_err(|e| {
             DnsError::new(
-                mudz::ErrorKind::InvalidResponse,
+                mudz::ErrorKind::InvalidConfig,
                 format!("Failed to parse config: {e}"),
             )
-        })?;
-
-        // The config format uses [nameservers.NAME] and [nameserver.NAME]
-        // sections. We need to collect these into a single HashMap.
-        let main = toml_value
-            .get("main")
-            .and_then(|v| MainConfig::deserialize(v.clone()).ok())
-            .unwrap_or_default();
-
-        let fallback = toml_value
-            .get("fallback")
-            .and_then(|v| FallbackConfig::deserialize(v.clone()).ok())
-            .unwrap_or_default();
-
-        let mut nameservers: HashMap<String, NameserverGroup> = HashMap::new();
-
-        // Collect [nameservers.*] sections
-        if let Some(nameservers_section) = toml_value.get("nameservers")
-            && let Some(table) = nameservers_section.as_table()
-        {
-            for (name, value) in table {
-                if let Ok(group) = NameserverGroup::deserialize(value.clone()) {
-                    nameservers.insert(name.clone(), group);
-                }
-            }
-        }
-
-        // Also collect [nameserver.*] sections (singular form)
-        if let Some(nameserver_section) = toml_value.get("nameserver")
-            && let Some(table) = nameserver_section.as_table()
-        {
-            for (name, value) in table {
-                if let Ok(group) = NameserverGroup::deserialize(value.clone()) {
-                    nameservers.insert(name.clone(), group);
-                }
-            }
-        }
-
-        Ok(Self {
-            main,
-            fallback,
-            nameservers,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_unknown_field_in_group_rejected() {
+        let config_str = r#"
+[fallback]
+nameservers = ["8.8.8.8"]
+
+[group.test]
+nameservers = ["1.1.1.1"]
+domains = ["example.com"]
+unknown_field = "bad"
+"#;
+        let result = toml::from_str::<MudzConfig>(config_str);
+        assert!(
+            result.is_err(),
+            "Expected error for unknown field in [group.*] section"
+        );
+        let err = result.unwrap_err();
+        assert!(
+            err.to_string().contains("unknown field `unknown_field`"),
+            "Error should mention unknown_field, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_valid_group_accepted() {
+        let config_str = r#"
+[fallback]
+nameservers = ["8.8.8.8"]
+
+[group.google]
+nameservers = ["8.8.4.4"]
+domains = ["google.com"]
+disable_ipv6 = true
+"#;
+        let result = toml::from_str::<MudzConfig>(config_str);
+        assert!(result.is_ok(), "Expected valid config, got: {result:?}");
+        let config = result.unwrap();
+        assert_eq!(config.groups.len(), 1);
+        assert!(config.groups.contains_key("google"));
+        let google_group = &config.groups["google"];
+        assert_eq!(google_group.nameservers, vec!["8.8.4.4"]);
+        assert_eq!(google_group.domains, vec!["google.com"]);
+        assert!(google_group.disable_ipv6);
     }
 }

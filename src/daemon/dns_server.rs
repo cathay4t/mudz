@@ -100,7 +100,7 @@ impl DnsUdpServer {
         // Create named groups and domain routes
         let mut named_groups: HashMap<String, UpstreamClients> = HashMap::new();
         let mut domain_routes: Vec<(String, String)> = Vec::new();
-        for (name, group) in &config.nameservers {
+        for (name, group) in &config.groups {
             let clients = UpstreamClients::from_server_addrs(
                 &group.nameservers,
                 group.disable_ipv6,

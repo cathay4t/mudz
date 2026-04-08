@@ -27,8 +27,8 @@ fn main() -> Result<(), DnsError> {
         config.fallback.nameservers,
     );
 
-    if !config.nameservers.is_empty() {
-        for (name, group) in &config.nameservers {
+    if !config.groups.is_empty() {
+        for (name, group) in &config.groups {
             log::info!(
                 "Domain group '{}': {:?} -> {:?}",
                 name,

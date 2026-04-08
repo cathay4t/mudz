@@ -13,14 +13,14 @@ nameservers = ["223.5.5.5", "119.29.29.29"]
 
 # Redirect user's request on these domains to specified nameservers instead of
 # fallback ones
-[nameservers.google]
+[group.google]
 nameservers = ["8.8.8.8"]
 domains = [
     "google.com",
     "youtube.com",
 ]
 
-[nameservers.company]
+[group.company]
 nameservers = ["10.0.0.1"]
 domains = [
     "fish-touching.net",

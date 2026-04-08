@@ -16,6 +16,7 @@ pub enum ErrorKind {
     IoError(String),
     Timeout,
     InvalidResponse,
+    InvalidConfig,
 }
 
 impl fmt::Display for ErrorKind {
@@ -36,6 +37,7 @@ impl fmt::Display for ErrorKind {
             ErrorKind::IoError(msg) => write!(f, "io_error: {msg}"),
             ErrorKind::Timeout => write!(f, "timeout"),
             ErrorKind::InvalidResponse => write!(f, "invalid_response"),
+            ErrorKind::InvalidConfig => write!(f, "invalid_config"),
         }
     }
 }
