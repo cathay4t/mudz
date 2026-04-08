@@ -402,15 +402,25 @@ impl DnsHttpsClient {
         // Parse and validate the response
         let response_message = DnsMessage::from_bytes(&response_bytes)?;
 
-        if response_message.header.rcode != crate::dns::DnsResponseCode::NoError
-        {
-            return Err(DnsError::new(
-                ErrorKind::InvalidResponse,
-                format!(
-                    "DNS server returned error code: {:?}",
-                    response_message.header.rcode
-                ),
-            ));
+        // Return the response even if it contains NXDomain or other non-error
+        // rcodes. NXDomain is a valid DNS response meaning "this domain
+        // doesn't exist" and should be passed through to the client.
+        // Only treat FormErr and ServFail as actual errors.
+        match response_message.header.rcode {
+            crate::dns::DnsResponseCode::FormErr => {
+                return Err(DnsError::new(
+                    ErrorKind::InvalidResponse,
+                    "DNS server returned error code: FormErr",
+                ));
+            }
+            crate::dns::DnsResponseCode::ServFail => {
+                return Err(DnsError::new(
+                    ErrorKind::InvalidResponse,
+                    "DNS server returned error code: ServFail",
+                ));
+            }
+            _ => {} /* NoError, NXDomain, NotImp, Refused, OTHER are all
+                     * valid responses to pass through */
         }
 
         Ok(response_bytes)

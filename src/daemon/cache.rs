@@ -43,7 +43,7 @@ impl DnsCache {
         query_type: DnsQueryType,
     ) -> Option<&CacheEntry> {
         self.entries
-            .get(&(domain.to_string(), query_type))
+            .get(&(domain.to_lowercase(), query_type))
             .filter(|entry| entry.expires_at > Instant::now())
     }
 

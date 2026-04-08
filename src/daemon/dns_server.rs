@@ -438,11 +438,13 @@ impl DnsUdpServer {
         domain: &str,
         domain_routes: &[(String, String)],
     ) -> Option<String> {
+        let domain_lower = domain.to_lowercase();
         for (route_domain, group_name) in domain_routes {
+            let route_domain_lower = route_domain.to_lowercase();
             // Match exact domain or subdomain (e.g., "google.com" matches
             // "foo.google.com")
-            if domain == route_domain
-                || domain.ends_with(&format!(".{route_domain}"))
+            if domain_lower == route_domain_lower
+                || domain_lower.ends_with(&format!(".{route_domain_lower}"))
             {
                 return Some(group_name.clone());
             }

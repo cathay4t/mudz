@@ -174,7 +174,7 @@ impl fmt::Display for DnsDomainName {
             "{}",
             self.labels
                 .iter()
-                .map(|label| String::from_utf8_lossy(label))
+                .map(|label| String::from_utf8_lossy(label).to_lowercase())
                 .collect::<Vec<_>>()
                 .join(".")
         )
@@ -182,6 +182,17 @@ impl fmt::Display for DnsDomainName {
 }
 
 impl DnsDomainName {
+    /// Case-insensitive comparison for domain names per RFC 1035
+    pub fn eq_ignore_case(&self, other: &Self) -> bool {
+        if self.labels.len() != other.labels.len() {
+            return false;
+        }
+        self.labels
+            .iter()
+            .zip(other.labels.iter())
+            .all(|(label1, label2)| label1.eq_ignore_ascii_case(label2))
+    }
+
     /// Parse a domain name from the buffer, handling compression pointers
     pub fn parse_from(
         buf: &[u8],
@@ -620,7 +631,8 @@ impl DnsMessage {
                     format!("Label '{}' exceeds 63 characters", label),
                 ));
             }
-            labels.push(label.as_bytes().to_vec());
+            // Normalize to lowercase per RFC 1035
+            labels.push(label.to_ascii_lowercase().into_bytes());
         }
 
         if labels.is_empty() {
