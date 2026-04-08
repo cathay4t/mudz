@@ -11,13 +11,26 @@ use mudz::{
     DnsMessageType, DnsQueryType, DnsQuestion, DnsRecordClass,
     DnsResourceRecord, DnsResponseCode, DnsUdpClient, ErrorKind,
 };
-use tokio::{net::UdpSocket, sync::RwLock};
+use tokio::{
+    net::UdpSocket,
+    sync::{Mutex as AsyncMutex, RwLock, oneshot},
+};
 
 use crate::{
     cache::{DnsCache, MAX_CACHE_TTL},
     config::MudzConfig,
     host::HostsFile,
 };
+
+/// Type alias for in-flight query deduplication
+type InFlightQueries = Arc<
+    AsyncMutex<
+        HashMap<
+            (String, DnsQueryType),
+            Vec<oneshot::Sender<Result<Vec<u8>, DnsError>>>,
+        >,
+    >,
+>;
 
 /// Named upstream resolver clients
 #[derive(Clone)]
@@ -70,6 +83,8 @@ pub struct DnsUdpServer {
     recv_buf_size: usize,
     /// /etc/hosts entries
     hosts_file: HostsFile,
+    /// In-flight query deduplication map
+    in_flight_queries: InFlightQueries,
 }
 
 impl DnsUdpServer {
@@ -109,6 +124,7 @@ impl DnsUdpServer {
             domain_routes,
             recv_buf_size: 4096,
             hosts_file: HostsFile::new(),
+            in_flight_queries: Arc::new(AsyncMutex::new(HashMap::new())),
         })
     }
 
@@ -143,6 +159,7 @@ impl DnsUdpServer {
             let named_groups = self.named_groups.clone();
             let domain_routes = self.domain_routes.clone();
             let hosts_file = self.hosts_file.clone();
+            let in_flight_queries = Arc::clone(&self.in_flight_queries);
 
             // Handle each query in a separate task
             tokio::spawn(async move {
@@ -155,6 +172,7 @@ impl DnsUdpServer {
                     &named_groups,
                     &domain_routes,
                     &hosts_file,
+                    &in_flight_queries,
                 )
                 .await
                 {
@@ -188,6 +206,7 @@ impl DnsUdpServer {
         named_groups: &HashMap<String, UpstreamClients>,
         domain_routes: &[(String, String)],
         hosts_file: &HostsFile,
+        in_flight_queries: &InFlightQueries,
     ) -> Result<(), DnsError> {
         // Parse the incoming query
         let query = DnsMessage::from_bytes(&query_bytes)?;
@@ -225,9 +244,8 @@ impl DnsUdpServer {
             Self::resolve_from_hosts(hosts_file, &domain, query_type)
         {
             log::trace!("Hosts hit for {} {:?}", domain, query_type);
-            let mut response = DnsMessage::from_bytes(&response_bytes)?;
-            response.header.id = transaction_id;
-            let response_bytes = response.to_bytes()?;
+            let response_bytes =
+                Self::update_transaction_id(&response_bytes, transaction_id)?;
             socket.send_to(&response_bytes, client_addr).await.map_err(
                 |e| {
                     DnsError::new(
@@ -244,11 +262,10 @@ impl DnsUdpServer {
             let cache_read = cache.read().await;
             if let Some(cached) = cache_read.get(&domain, query_type) {
                 log::trace!("Cache hit for {} {:?}", domain, query_type);
-                let mut response =
-                    DnsMessage::from_bytes(&cached.response_bytes)?;
-                // Update the transaction ID to match the client's query
-                response.header.id = transaction_id;
-                let response_bytes = response.to_bytes()?;
+                let response_bytes = Self::update_transaction_id(
+                    &cached.response_bytes,
+                    transaction_id,
+                )?;
                 socket.send_to(&response_bytes, client_addr).await.map_err(
                     |e| {
                         DnsError::new(
@@ -267,46 +284,87 @@ impl DnsUdpServer {
             query_type
         );
 
-        // Select upstream based on domain
-        let upstream = if let Some(group_name) =
-            Self::find_group_for_domain(&domain, domain_routes)
-        {
-            log::trace!(
-                "Routing {} {:?} to group '{}'",
-                domain,
-                query_type,
-                group_name
-            );
-            named_groups.get(&group_name).unwrap_or(fallback)
-        } else {
-            log::trace!("Routing {} {:?} to fallback", domain, query_type);
-            fallback
+        // Check for in-flight query (deduplication)
+        let response_bytes = {
+            let mut queries = in_flight_queries.lock().await;
+            if let Some(waiters) =
+                queries.get_mut(&(domain.clone(), query_type))
+            {
+                // Another task is already querying upstream — wait for result
+                let (tx, rx) = oneshot::channel();
+                waiters.push(tx);
+                drop(queries); // Release lock while waiting
+                log::trace!(
+                    "Joining in-flight query for {} {:?}",
+                    domain,
+                    query_type
+                );
+                rx.await.map_err(|e| {
+                    DnsError::new(
+                        ErrorKind::InvalidResponse,
+                        format!("In-flight query channel closed: {e}"),
+                    )
+                })??
+            } else {
+                // Register this query as the initiator
+                queries.insert((domain.clone(), query_type), Vec::new());
+                drop(queries); // Release lock before querying upstream
+
+                let upstream = if let Some(group_name) =
+                    Self::find_group_for_domain(&domain, domain_routes)
+                {
+                    log::trace!(
+                        "Routing {} {:?} to group '{}'",
+                        domain,
+                        query_type,
+                        group_name
+                    );
+                    named_groups.get(&group_name).unwrap_or(fallback)
+                } else {
+                    log::trace!(
+                        "Routing {} {:?} to fallback",
+                        domain,
+                        query_type
+                    );
+                    fallback
+                };
+
+                let result =
+                    Self::resolve_upstream(upstream, &domain, query_type).await;
+
+                // Broadcast result to all waiters
+                let mut queries = in_flight_queries.lock().await;
+                if let Some(waiters) =
+                    queries.remove(&(domain.clone(), query_type))
+                {
+                    for waiter in waiters {
+                        let _ = waiter.send(result.clone());
+                    }
+                }
+
+                result?
+            }
         };
 
-        // Query upstream resolver
-        let response_message =
-            Self::resolve_upstream(upstream, &domain, query_type).await?;
-
-        // Extract TTL from response
-        let response = DnsMessage::from_bytes(&response_message)?;
+        // Parse once to extract TTL
+        let response = DnsMessage::from_bytes(&response_bytes)?;
         let ttl =
             Self::extract_ttl_from_response(&response).unwrap_or(MAX_CACHE_TTL);
 
-        // Cache the response
+        // Update transaction ID and cache in one pass
+        let response_bytes =
+            Self::update_transaction_id(&response_bytes, transaction_id)?;
+
+        // Cache the final response bytes
         {
             let mut cache_write = cache.write().await;
             cache_write.insert(
                 domain.clone(),
                 query_type,
-                response_message.clone(),
+                response_bytes.clone(),
                 ttl,
             );
         }
-
-        // Update transaction ID and send response
-        let mut response = DnsMessage::from_bytes(&response_message)?;
-        response.header.id = transaction_id;
-        let response_bytes = response.to_bytes()?;
 
         socket
             .send_to(&response_bytes, client_addr)
@@ -333,6 +391,25 @@ impl DnsUdpServer {
         );
 
         Ok(())
+    }
+
+    /// Update the transaction ID in a DNS response without full re-parsing.
+    /// Directly modifies the ID bytes at offset 0-1.
+    fn update_transaction_id(
+        response_bytes: &[u8],
+        transaction_id: u16,
+    ) -> Result<Vec<u8>, DnsError> {
+        let mut bytes = response_bytes.to_vec();
+        if bytes.len() < 12 {
+            return Err(DnsError::new(
+                ErrorKind::InvalidResponse,
+                "Response too short",
+            ));
+        }
+        let id_bytes = transaction_id.to_be_bytes();
+        bytes[0] = id_bytes[0];
+        bytes[1] = id_bytes[1];
+        Ok(bytes)
     }
 
     /// Find the named group that matches a domain
@@ -547,7 +624,7 @@ impl DnsUdpServer {
 
         let mut response = DnsMessage {
             header: DnsHeader {
-                id: 0, // Will be set by caller
+                id: 0, // Will be set by caller via update_transaction_id
                 message_type: DnsMessageType::Response,
                 qr: true,
                 opcode: 0,
