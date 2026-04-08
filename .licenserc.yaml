@@ -11,4 +11,6 @@ header:
     - 'CHANGELOG'
     - 'LICENSE'
     - '.gitignore'
+    - 'mudz.service'
+    - 'mudz.conf.example'
   comment: on-failure
