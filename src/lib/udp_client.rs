@@ -211,7 +211,7 @@ impl DnsUdpClient {
             })?;
 
         // Receive the response with timeout
-        let mut response_buf = [0u8; 512]; // Standard DNS UDP size limit
+        let mut response_buf = [0u8; 4096]; // EDNS0 maximum UDP size limit
 
         let response =
             timeout(self.timeout, socket.recv_from(&mut response_buf))
@@ -344,7 +344,7 @@ impl DnsUdpClient {
                 )
             })?;
 
-        let mut response_buf = [0u8; 512];
+        let mut response_buf = [0u8; 4096];
         let response =
             timeout(self.timeout, socket.recv_from(&mut response_buf))
                 .await
