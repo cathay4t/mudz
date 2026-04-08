@@ -157,6 +157,13 @@ impl DnsUdpServer {
             let domain_routes = self.domain_routes.clone();
             let hosts_file = self.hosts_file.clone();
 
+            // Extract transaction ID early for error responses
+            let transaction_id = if query_bytes.len() >= 2 {
+                u16::from_be_bytes([query_bytes[0], query_bytes[1]])
+            } else {
+                0
+            };
+
             // Handle each query in a separate task
             tokio::spawn(async move {
                 match Self::handle_query(
@@ -175,9 +182,12 @@ impl DnsUdpServer {
                     Err(e) => {
                         log::error!("Error handling query: {}", e);
                         // Send SERVFAIL response on error
-                        if let Err(send_err) =
-                            Self::send_error_response(client_addr, &socket)
-                                .await
+                        if let Err(send_err) = Self::send_error_response(
+                            client_addr,
+                            &socket,
+                            transaction_id,
+                        )
+                        .await
                         {
                             log::error!(
                                 "Failed to send error response: {}",
@@ -584,20 +594,9 @@ impl DnsUdpServer {
         domain: &str,
         query_type: DnsQueryType,
     ) -> Result<Vec<u8>, DnsError> {
-        match query_type {
-            DnsQueryType::A => {
-                let ips = client.query_a_record(domain).await?;
-                Self::build_response(domain, query_type, &ips)
-            }
-            DnsQueryType::AAAA => {
-                let ips = client.query_aaaa_record(domain).await?;
-                Self::build_response(domain, query_type, &ips)
-            }
-            _ => {
-                // For all other query types, forward and cache raw response
-                client.query_raw(domain, query_type).await
-            }
-        }
+        // Use query_raw for all query types to properly handle NXDOMAIN
+        // and other response codes
+        client.query_raw(domain, query_type).await
     }
 
     /// Resolve using a single HTTPS upstream client
@@ -606,20 +605,9 @@ impl DnsUdpServer {
         domain: &str,
         query_type: DnsQueryType,
     ) -> Result<Vec<u8>, DnsError> {
-        match query_type {
-            DnsQueryType::A => {
-                let ips = client.query_a_record(domain).await?;
-                Self::build_response(domain, query_type, &ips)
-            }
-            DnsQueryType::AAAA => {
-                let ips = client.query_aaaa_record(domain).await?;
-                Self::build_response(domain, query_type, &ips)
-            }
-            _ => {
-                // For all other query types, forward and cache raw response
-                client.query_raw(domain, query_type).await
-            }
-        }
+        // Use query_raw for all query types to properly handle NXDOMAIN
+        // and other response codes
+        client.query_raw(domain, query_type).await
     }
 
     /// Build a DNS response message from IP addresses
@@ -688,10 +676,11 @@ impl DnsUdpServer {
     async fn send_error_response(
         client_addr: SocketAddr,
         socket: &UdpSocket,
+        transaction_id: u16,
     ) -> Result<(), DnsError> {
         let error_response = DnsMessage {
             header: DnsHeader {
-                id: 0,
+                id: transaction_id,
                 message_type: DnsMessageType::Response,
                 qr: true,
                 opcode: 0,
