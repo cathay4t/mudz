@@ -2,6 +2,8 @@
 
 use std::{
     collections::HashMap,
+    fs,
+    io::{BufRead, BufReader},
     net::{Ipv4Addr, Ipv6Addr, SocketAddr},
     sync::Arc,
     time::{Duration, Instant},
@@ -20,6 +22,9 @@ use crate::config::MudzConfig;
 const MIN_CACHE_TTL: u32 = 60;
 /// Maximum TTL to cache (seconds, 1 day)
 const MAX_CACHE_TTL: u32 = 86400;
+
+/// Path to the hosts file
+const HOSTS_FILE: &str = "/etc/hosts";
 
 /// Cache entry for a DNS query result
 struct CacheEntry {
@@ -95,6 +100,94 @@ impl DnsCache {
     }
 }
 
+/// Parsed /etc/hosts entries
+#[derive(Clone)]
+struct HostsFile {
+    /// Map of domain -> list of IPv4 addresses
+    a_records: HashMap<String, Vec<Ipv4Addr>>,
+    /// Map of domain -> list of IPv6 addresses
+    aaaa_records: HashMap<String, Vec<Ipv6Addr>>,
+}
+
+impl HostsFile {
+    /// Parse /etc/hosts and return the parsed entries
+    fn new() -> Self {
+        let mut a_records: HashMap<String, Vec<Ipv4Addr>> = HashMap::new();
+        let mut aaaa_records: HashMap<String, Vec<Ipv6Addr>> = HashMap::new();
+
+        if let Ok(file) = fs::File::open(HOSTS_FILE) {
+            let reader = BufReader::new(file);
+            for line in reader.lines().map_while(Result::ok) {
+                Self::parse_line(&line, &mut a_records, &mut aaaa_records);
+            }
+            log::info!(
+                "Loaded /etc/hosts: {} A records, {} AAAA records",
+                a_records.len(),
+                aaaa_records.len()
+            );
+        } else {
+            log::debug!("Could not open {}, skipping", HOSTS_FILE);
+        }
+
+        Self {
+            a_records,
+            aaaa_records,
+        }
+    }
+
+    /// Parse a single line from /etc/hosts
+    fn parse_line(
+        line: &str,
+        a_records: &mut HashMap<String, Vec<Ipv4Addr>>,
+        aaaa_records: &mut HashMap<String, Vec<Ipv6Addr>>,
+    ) {
+        let line = line.trim();
+        // Skip empty lines and comments
+        if line.is_empty() || line.starts_with('#') {
+            return;
+        }
+
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        if parts.len() < 2 {
+            return;
+        }
+
+        let addr_str = parts[0];
+        let hostnames = &parts[1..];
+
+        // Try to parse as IPv4 or IPv6 address
+        if let Ok(ipv4) = addr_str.parse::<Ipv4Addr>() {
+            for hostname in hostnames {
+                if !hostname.starts_with('#') {
+                    a_records
+                        .entry(hostname.to_lowercase())
+                        .or_default()
+                        .push(ipv4);
+                }
+            }
+        } else if let Ok(ipv6) = addr_str.parse::<Ipv6Addr>() {
+            for hostname in hostnames {
+                if !hostname.starts_with('#') {
+                    aaaa_records
+                        .entry(hostname.to_lowercase())
+                        .or_default()
+                        .push(ipv6);
+                }
+            }
+        }
+    }
+
+    /// Look up A records for a domain
+    fn lookup_a(&self, domain: &str) -> Option<&Vec<Ipv4Addr>> {
+        self.a_records.get(&domain.to_lowercase())
+    }
+
+    /// Look up AAAA records for a domain
+    fn lookup_aaaa(&self, domain: &str) -> Option<&Vec<Ipv6Addr>> {
+        self.aaaa_records.get(&domain.to_lowercase())
+    }
+}
+
 /// Named upstream resolver clients
 #[derive(Clone)]
 struct UpstreamClients {
@@ -144,6 +237,8 @@ pub struct DnsUdpServer {
     domain_routes: Vec<(String, String)>,
     /// Socket receive buffer size
     recv_buf_size: usize,
+    /// /etc/hosts entries
+    hosts_file: HostsFile,
 }
 
 impl DnsUdpServer {
@@ -182,6 +277,7 @@ impl DnsUdpServer {
             named_groups,
             domain_routes,
             recv_buf_size: 4096,
+            hosts_file: HostsFile::new(),
         })
     }
 
@@ -215,6 +311,7 @@ impl DnsUdpServer {
             let fallback = self.fallback.clone();
             let named_groups = self.named_groups.clone();
             let domain_routes = self.domain_routes.clone();
+            let hosts_file = self.hosts_file.clone();
 
             // Handle each query in a separate task
             tokio::spawn(async move {
@@ -226,6 +323,7 @@ impl DnsUdpServer {
                     &fallback,
                     &named_groups,
                     &domain_routes,
+                    &hosts_file,
                 )
                 .await
                 {
@@ -249,6 +347,7 @@ impl DnsUdpServer {
     }
 
     /// Handle a single DNS query
+    #[allow(clippy::too_many_arguments)]
     async fn handle_query(
         query_bytes: Vec<u8>,
         client_addr: SocketAddr,
@@ -257,6 +356,7 @@ impl DnsUdpServer {
         fallback: &UpstreamClients,
         named_groups: &HashMap<String, UpstreamClients>,
         domain_routes: &[(String, String)],
+        hosts_file: &HostsFile,
     ) -> Result<(), DnsError> {
         // Parse the incoming query
         let query = DnsMessage::from_bytes(&query_bytes)?;
@@ -288,6 +388,25 @@ impl DnsUdpServer {
             query_type,
             client_addr
         );
+
+        // Check /etc/hosts first
+        if let Some(response_bytes) =
+            Self::resolve_from_hosts(hosts_file, &domain, query_type)
+        {
+            log::trace!("Hosts hit for {} {:?}", domain, query_type);
+            let mut response = DnsMessage::from_bytes(&response_bytes)?;
+            response.header.id = transaction_id;
+            let response_bytes = response.to_bytes()?;
+            socket.send_to(&response_bytes, client_addr).await.map_err(
+                |e| {
+                    DnsError::new(
+                        ErrorKind::IoError(e.to_string()),
+                        "Failed to send hosts response",
+                    )
+                },
+            )?;
+            return Ok(());
+        }
 
         // Check cache first
         {
@@ -400,6 +519,25 @@ impl DnsUdpServer {
             }
         }
         None
+    }
+
+    /// Try to resolve from /etc/hosts, returning DNS response bytes or None
+    fn resolve_from_hosts(
+        hosts_file: &HostsFile,
+        domain: &str,
+        query_type: DnsQueryType,
+    ) -> Option<Vec<u8>> {
+        match query_type {
+            DnsQueryType::A => {
+                let ips = hosts_file.lookup_a(domain)?;
+                Self::build_response(domain, query_type, ips.as_slice()).ok()
+            }
+            DnsQueryType::AAAA => {
+                let ips = hosts_file.lookup_aaaa(domain)?;
+                Self::build_response(domain, query_type, ips.as_slice()).ok()
+            }
+            _ => None, // /etc/hosts only supports A and AAAA
+        }
     }
 
     /// Resolve using upstream resolver with all clients in the group
