@@ -1,65 +1,40 @@
 // SPDX-License-Identifier: Apache-2.0
 
-use clap::{Arg, ArgAction, Command};
 use mudz::DnsError;
 
+mod config;
 mod dns_server;
-use self::dns_server::DnsUdpServer;
+
+use self::{config::MudzConfig, dns_server::DnsUdpServer};
 
 fn main() -> Result<(), DnsError> {
-    env_logger::init();
+    let config = MudzConfig::from_file(config::DEFAULT_CONFIG_PATH)?;
+    let cache_size = config.main.max_cache_size;
+    let log_level = &config.main.log_level;
 
-    let matches = Command::new("mudzd")
-        .version("0.1.0")
-        .about("Linux DNS Caching Daemon")
-        .arg(
-            Arg::new("listen")
-                .short('l')
-                .long("listen")
-                .value_name("ADDRESS")
-                .help("Address to listen on (default: 127.0.0.1:53)")
-                .default_value("127.0.0.1:53"),
-        )
-        .arg(
-            Arg::new("upstream")
-                .short('u')
-                .long("upstream")
-                .value_name("DNS_SERVER")
-                .help("Upstream DNS server or DoH URL (default: 8.8.8.8)")
-                .default_value("8.8.8.8"),
-        )
-        .arg(
-            Arg::new("https")
-                .short('H')
-                .long("https")
-                .help("Use DNS-over-HTTPS instead of UDP")
-                .action(ArgAction::SetTrue),
-        )
-        .arg(
-            Arg::new("cache-size")
-                .short('c')
-                .long("cache-size")
-                .value_name("SIZE")
-                .help("Maximum cache entries (default: 1000)")
-                .default_value("1000")
-                .value_parser(clap::value_parser!(usize)),
-        )
-        .get_matches();
+    env_logger::Builder::from_env(
+        env_logger::Env::default().default_filter_or(log_level),
+    )
+    .init();
 
-    let listen_addr = matches.get_one::<String>("listen").unwrap();
-    let upstream = matches.get_one::<String>("upstream").unwrap();
-    let use_https = matches.get_flag("https");
-    let cache_size = *matches.get_one::<usize>("cache-size").unwrap();
-
-    let server =
-        DnsUdpServer::new(listen_addr, upstream, use_https, cache_size)?;
+    let server = DnsUdpServer::from_config(&config, cache_size)?;
 
     log::info!(
-        "Starting DNS Caching Server on {} (upstream: {}, HTTPS: {})",
+        "Starting DNS Caching Server on {} (fallback: {:?})",
         server.listen_addr(),
-        upstream,
-        use_https
+        config.fallback.nameservers,
     );
+
+    if !config.nameservers.is_empty() {
+        for (name, group) in &config.nameservers {
+            log::info!(
+                "Domain group '{}': {:?} -> {:?}",
+                name,
+                group.domains,
+                group.nameservers
+            );
+        }
+    }
 
     // Run the server in a Tokio runtime
     let rt = tokio::runtime::Runtime::new().map_err(|e| {

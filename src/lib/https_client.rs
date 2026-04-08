@@ -176,7 +176,7 @@ impl DnsHttpsClient {
     ) -> Result<Vec<T>, DnsError> {
         let mut current_domain = domain_name.to_string();
 
-        for depth in 0..=MAX_CNAME_DEPTH {
+        for _depth in 0..=MAX_CNAME_DEPTH {
             let result = self.query_dns::<T>(&current_domain).await?;
 
             match result {
@@ -185,19 +185,16 @@ impl DnsHttpsClient {
                     current_domain = target;
                 }
                 QueryResult::NoRecords => {
-                    if depth == MAX_CNAME_DEPTH {
-                        return Err(DnsError::new(
-                            ErrorKind::InvalidResponse,
-                            "CNAME chain too deep, possible infinite loop",
-                        ));
-                    }
-                    // Continue loop with next domain
+                    // No records of this type exist for this domain
+                    return Ok(Vec::new());
                 }
             }
         }
 
-        // Should not reach here, but handle gracefully
-        Ok(Vec::new())
+        Err(DnsError::new(
+            ErrorKind::InvalidResponse,
+            "CNAME chain too deep, possible infinite loop",
+        ))
     }
 
     /// Perform a single DNS query over HTTPS per RFC 8484.
@@ -288,6 +285,14 @@ impl DnsHttpsClient {
             );
         }
 
+        log::trace!(
+            "HTTPS response for {} {:?}: {} records, {} CNAMEs",
+            domain,
+            T::QUERY_TYPE,
+            records.len(),
+            if first_cname_target.is_some() { 1 } else { 0 }
+        );
+
         // If we found records, return them
         if !records.is_empty() {
             return Ok(QueryResult::FoundRecords(records));
@@ -295,10 +300,17 @@ impl DnsHttpsClient {
 
         // If no records but we have a CNAME, follow the redirect
         if let Some(cname_target) = first_cname_target {
+            log::trace!(
+                "HTTPS CNAME redirect for {} {:?} -> {}",
+                domain,
+                T::QUERY_TYPE,
+                cname_target
+            );
             return Ok(QueryResult::CNAMEredirect(cname_target));
         }
 
         // No records and no CNAMEs
+        log::trace!("HTTPS no records for {} {:?}", domain, T::QUERY_TYPE);
         Ok(QueryResult::NoRecords)
     }
 
@@ -319,6 +331,12 @@ impl DnsHttpsClient {
         domain: &str,
         query_type: DnsQueryType,
     ) -> Result<Vec<u8>, DnsError> {
+        log::trace!(
+            "query_raw HTTPS: querying {} {:?} for {}",
+            self.server_url,
+            query_type,
+            domain
+        );
         // Create the DNS query message with ID=0 for HTTP caching
         let query = DnsMessage::new_query(0, domain, query_type)?;
         let query_bytes = query.to_bytes()?;

@@ -364,9 +364,10 @@ impl DnsHeader {
             .unwrap_or(DnsResponseCode::OTHER(flags & 0xF));
 
         // RFC 1035 §4.1.1: Z field must be zero in all queries and responses
-        // We parse it but don't reject non-zero values for compatibility
+        // Some upstream servers set non-zero Z bits, so we parse but log at
+        // debug level
         if z != 0 {
-            log::warn!("DNS header has non-zero Z field: {}", z);
+            log::debug!("DNS header has non-zero Z field: {}", z);
         }
 
         Ok(DnsHeader {

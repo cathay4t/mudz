@@ -14,6 +14,8 @@ use mudz::{
 };
 use tokio::{net::UdpSocket, sync::RwLock};
 
+use crate::config::MudzConfig;
+
 /// Minimum TTL to cache (seconds)
 const MIN_CACHE_TTL: u32 = 60;
 /// Maximum TTL to cache (seconds, 1 day)
@@ -91,71 +93,94 @@ impl DnsCache {
         let now = Instant::now();
         self.entries.retain(|_, entry| entry.expires_at > now);
     }
+}
 
-    /// Get current cache size
-    #[allow(dead_code)]
-    fn len(&self) -> usize {
-        self.entries.len()
+/// Named upstream resolver clients
+#[derive(Clone)]
+struct UpstreamClients {
+    /// DNS UDP clients (one per nameserver address)
+    udp_clients: Vec<DnsUdpClient>,
+    /// DNS HTTPS clients (one per DoH server URL)
+    https_clients: Vec<DnsHttpsClient>,
+}
+
+impl UpstreamClients {
+    /// Create upstream clients from server addresses (auto-detect UDP vs HTTPS)
+    fn from_server_addrs(addrs: &[String]) -> Result<Self, DnsError> {
+        let mut udp_clients: Vec<DnsUdpClient> = Vec::new();
+        let mut https_clients: Vec<DnsHttpsClient> = Vec::new();
+
+        for addr in addrs {
+            if addr.starts_with("https://") {
+                https_clients.push(DnsHttpsClient::with_server(addr)?);
+            } else {
+                udp_clients.push(DnsUdpClient::with_server(addr)?);
+            }
+        }
+
+        Ok(Self {
+            udp_clients,
+            https_clients,
+        })
+    }
+
+    /// Check if this group has any clients configured
+    fn has_clients(&self) -> bool {
+        !self.udp_clients.is_empty() || !self.https_clients.is_empty()
     }
 }
 
-/// Upstream resolver type
-#[derive(Clone)]
-enum ResolverType {
-    Udp,
-    Https,
-}
-
-/// DNS UDP server with caching support
+/// DNS UDP server with caching and per-domain routing support
 pub struct DnsUdpServer {
     /// Cache for DNS responses
     cache: Arc<RwLock<DnsCache>>,
     /// Listen address
     listen_addr: String,
-    /// Upstream DNS UDP client
-    udp_client: Option<DnsUdpClient>,
-    /// Upstream DNS HTTPS client
-    https_client: Option<DnsHttpsClient>,
-    /// Resolver type
-    resolver_type: ResolverType,
+    /// Fallback upstream clients
+    fallback: UpstreamClients,
+    /// Named upstream client groups (for per-domain routing)
+    named_groups: HashMap<String, UpstreamClients>,
+    /// Domain to group name mapping: (domain_pattern, group_name)
+    domain_routes: Vec<(String, String)>,
     /// Socket receive buffer size
     recv_buf_size: usize,
 }
 
 impl DnsUdpServer {
-    /// Create a new DNS UDP server with caching
+    /// Create a new DNS UDP server with caching and config-based routing
     ///
     /// # Arguments
-    /// * `listen_addr` - Address to listen on (e.g., "127.0.0.1:5353")
-    /// * `upstream_dns` - Upstream DNS server address or DoH server URL
-    /// * `use_https` - If true, use DNS-over-HTTPS, otherwise use UDP
+    /// * `config` - The mudz configuration
     /// * `max_cache_size` - Maximum number of cache entries
-    pub fn new(
-        listen_addr: &str,
-        upstream_dns: &str,
-        use_https: bool,
+    pub fn from_config(
+        config: &MudzConfig,
         max_cache_size: usize,
     ) -> Result<Self, DnsError> {
-        let (udp_client, https_client, resolver_type) = if use_https {
-            (
-                None,
-                Some(DnsHttpsClient::with_server(upstream_dns)?),
-                ResolverType::Https,
-            )
-        } else {
-            (
-                Some(DnsUdpClient::with_server(upstream_dns)?),
-                None,
-                ResolverType::Udp,
-            )
-        };
+        // Create fallback clients from config (auto-detect UDP vs HTTPS)
+        let fallback =
+            UpstreamClients::from_server_addrs(&config.fallback.nameservers)?;
+
+        // Create named groups and domain routes
+        let mut named_groups: HashMap<String, UpstreamClients> = HashMap::new();
+        let mut domain_routes: Vec<(String, String)> = Vec::new();
+        for (name, group) in &config.nameservers {
+            let clients =
+                UpstreamClients::from_server_addrs(&group.nameservers)?;
+            if clients.has_clients() {
+                // Store domain routes
+                for domain in &group.domains {
+                    domain_routes.push((domain.clone(), name.clone()));
+                }
+                named_groups.insert(name.clone(), clients);
+            }
+        }
 
         Ok(Self {
             cache: Arc::new(RwLock::new(DnsCache::new(max_cache_size))),
-            listen_addr: listen_addr.to_string(),
-            udp_client,
-            https_client,
-            resolver_type,
+            listen_addr: config.main.udp_bind.clone(),
+            fallback,
+            named_groups,
+            domain_routes,
             recv_buf_size: 4096,
         })
     }
@@ -187,9 +212,9 @@ impl DnsUdpServer {
             let query_bytes = buf[..size].to_vec();
             let cache = Arc::clone(&self.cache);
             let socket = Arc::clone(&socket);
-            let resolver_type = self.resolver_type.clone();
-            let udp_client = self.udp_client.clone();
-            let https_client = self.https_client.clone();
+            let fallback = self.fallback.clone();
+            let named_groups = self.named_groups.clone();
+            let domain_routes = self.domain_routes.clone();
 
             // Handle each query in a separate task
             tokio::spawn(async move {
@@ -198,9 +223,9 @@ impl DnsUdpServer {
                     client_addr,
                     &cache,
                     &socket,
-                    resolver_type,
-                    udp_client.as_ref(),
-                    https_client.as_ref(),
+                    &fallback,
+                    &named_groups,
+                    &domain_routes,
                 )
                 .await
                 {
@@ -229,9 +254,9 @@ impl DnsUdpServer {
         client_addr: SocketAddr,
         cache: &RwLock<DnsCache>,
         socket: &UdpSocket,
-        resolver_type: ResolverType,
-        udp_client: Option<&DnsUdpClient>,
-        https_client: Option<&DnsHttpsClient>,
+        fallback: &UpstreamClients,
+        named_groups: &HashMap<String, UpstreamClients>,
+        domain_routes: &[(String, String)],
     ) -> Result<(), DnsError> {
         // Parse the incoming query
         let query = DnsMessage::from_bytes(&query_bytes)?;
@@ -257,7 +282,7 @@ impl DnsUdpServer {
         let query_type = question.query_type;
         let transaction_id = query.header.id;
 
-        log::debug!(
+        log::trace!(
             "Received query: {} {:?} from {}",
             domain,
             query_type,
@@ -268,7 +293,7 @@ impl DnsUdpServer {
         {
             let cache_read = cache.read().await;
             if let Some(cached) = cache_read.get(&domain, query_type) {
-                log::debug!("Cache hit for {} {:?}", domain, query_type);
+                log::trace!("Cache hit for {} {:?}", domain, query_type);
                 let mut response =
                     DnsMessage::from_bytes(&cached.response_bytes)?;
                 // Update the transaction ID to match the client's query
@@ -286,21 +311,31 @@ impl DnsUdpServer {
             }
         }
 
-        log::debug!(
+        log::trace!(
             "Cache miss for {} {:?}, querying upstream",
             domain,
             query_type
         );
 
+        // Select upstream based on domain
+        let upstream = if let Some(group_name) =
+            Self::find_group_for_domain(&domain, domain_routes)
+        {
+            log::trace!(
+                "Routing {} {:?} to group '{}'",
+                domain,
+                query_type,
+                group_name
+            );
+            named_groups.get(&group_name).unwrap_or(fallback)
+        } else {
+            log::trace!("Routing {} {:?} to fallback", domain, query_type);
+            fallback
+        };
+
         // Query upstream resolver
-        let response_message = Self::resolve_upstream(
-            resolver_type,
-            udp_client,
-            https_client,
-            &domain,
-            query_type,
-        )
-        .await?;
+        let response_message =
+            Self::resolve_upstream(upstream, &domain, query_type).await?;
 
         // Extract TTL from response
         let response = DnsMessage::from_bytes(&response_message)?;
@@ -340,33 +375,149 @@ impl DnsUdpServer {
             client_addr
         );
 
+        log::trace!(
+            "Response sent for {} {:?} to {}",
+            domain,
+            query_type,
+            client_addr
+        );
+
         Ok(())
     }
 
-    /// Resolve using upstream resolver
+    /// Find the named group that matches a domain
+    fn find_group_for_domain(
+        domain: &str,
+        domain_routes: &[(String, String)],
+    ) -> Option<String> {
+        for (route_domain, group_name) in domain_routes {
+            // Match exact domain or subdomain (e.g., "google.com" matches
+            // "foo.google.com")
+            if domain == route_domain
+                || domain.ends_with(&format!(".{route_domain}"))
+            {
+                return Some(group_name.clone());
+            }
+        }
+        None
+    }
+
+    /// Resolve using upstream resolver with all clients in the group
+    /// Returns the first successful response
     async fn resolve_upstream(
-        resolver_type: ResolverType,
-        udp_client: Option<&DnsUdpClient>,
-        https_client: Option<&DnsHttpsClient>,
+        upstream: &UpstreamClients,
         domain: &str,
         query_type: DnsQueryType,
     ) -> Result<Vec<u8>, DnsError> {
-        match (resolver_type, udp_client, https_client) {
-            (ResolverType::Udp, Some(client), _) => {
-                Self::resolve_udp(client, domain, query_type).await
-            }
-            (ResolverType::Https, _, Some(client)) => {
-                Self::resolve_https(client, domain, query_type).await
-            }
-            _ => Err(DnsError::new(
-                ErrorKind::InvalidResponse,
-                "No upstream resolver configured",
-            )),
+        let mut handles = Vec::new();
+
+        // Try all UDP clients simultaneously
+        for client in &upstream.udp_clients {
+            let server = client.server_addr().to_string();
+            let domain = domain.to_string();
+            log::trace!(
+                "Querying upstream UDP {} for {} {:?}",
+                server,
+                domain,
+                query_type
+            );
+            let client = client.clone();
+            let handle = tokio::spawn(async move {
+                let result =
+                    Self::resolve_udp_single(&client, &domain, query_type)
+                        .await;
+                match &result {
+                    Ok(_) => {
+                        log::trace!(
+                            "Upstream UDP {} responded for {} {:?}",
+                            server,
+                            domain,
+                            query_type
+                        );
+                    }
+                    Err(e) => {
+                        log::trace!(
+                            "Upstream UDP {} failed for {} {:?}: {}",
+                            server,
+                            domain,
+                            query_type,
+                            e
+                        );
+                    }
+                }
+                result
+            });
+            handles.push(handle);
         }
+
+        // Try all HTTPS clients simultaneously
+        for client in &upstream.https_clients {
+            let server = client.server_url().to_string();
+            let domain = domain.to_string();
+            log::trace!(
+                "Querying upstream HTTPS {} for {} {:?}",
+                server,
+                domain,
+                query_type
+            );
+            let client = client.clone();
+            let handle = tokio::spawn(async move {
+                let result =
+                    Self::resolve_https_single(&client, &domain, query_type)
+                        .await;
+                match &result {
+                    Ok(_) => {
+                        log::trace!(
+                            "Upstream HTTPS {} responded for {} {:?}",
+                            server,
+                            domain,
+                            query_type
+                        );
+                    }
+                    Err(e) => {
+                        log::trace!(
+                            "Upstream HTTPS {} failed for {} {:?}: {}",
+                            server,
+                            domain,
+                            query_type,
+                            e
+                        );
+                    }
+                }
+                result
+            });
+            handles.push(handle);
+        }
+
+        if handles.is_empty() {
+            return Err(DnsError::new(
+                ErrorKind::InvalidResponse,
+                "No upstream clients configured",
+            ));
+        }
+
+        // Wait for all handles, return first success
+        let results = futures::future::join_all(handles).await;
+        for result in results {
+            match result {
+                Ok(Ok(response)) => return Ok(response),
+                Ok(Err(e)) => {
+                    log::debug!("Upstream error: {}", e);
+                }
+                Err(e) => {
+                    log::debug!("Upstream task failed: {}", e);
+                }
+            }
+        }
+
+        Err(DnsError::new(
+            ErrorKind::InvalidResponse,
+            "All upstream DNS servers failed",
+        ))
     }
 
-    /// Resolve using UDP upstream
-    async fn resolve_udp(
+    /// Resolve using a single UDP upstream client
+    async fn resolve_udp_single(
         client: &DnsUdpClient,
         domain: &str,
         query_type: DnsQueryType,
@@ -387,8 +538,8 @@ impl DnsUdpServer {
         }
     }
 
-    /// Resolve using HTTPS upstream
-    async fn resolve_https(
+    /// Resolve using a single HTTPS upstream client
+    async fn resolve_https_single(
         client: &DnsHttpsClient,
         domain: &str,
         query_type: DnsQueryType,
@@ -512,13 +663,6 @@ impl DnsUdpServer {
     /// Get the listen address
     pub fn listen_addr(&self) -> &str {
         &self.listen_addr
-    }
-
-    /// Get current cache size
-    #[allow(dead_code)]
-    pub async fn cache_size(&self) -> usize {
-        let cache_read = self.cache.read().await;
-        cache_read.len()
     }
 }
 

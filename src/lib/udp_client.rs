@@ -112,6 +112,11 @@ impl DnsUdpClient {
         self.timeout = timeout;
     }
 
+    /// Get the server address
+    pub fn server_addr(&self) -> SocketAddr {
+        self.server_addr
+    }
+
     /// Query A records for a domain name
     ///
     /// This function handles CNAME redirection by following CNAME chains
@@ -153,7 +158,7 @@ impl DnsUdpClient {
     ) -> Result<Vec<T>, DnsError> {
         let mut current_domain = domain_name.to_string();
 
-        for depth in 0..=MAX_CNAME_DEPTH {
+        for _depth in 0..=MAX_CNAME_DEPTH {
             let result = self.query_dns::<T>(&current_domain).await?;
 
             match result {
@@ -162,19 +167,16 @@ impl DnsUdpClient {
                     current_domain = target;
                 }
                 QueryResult::NoRecords => {
-                    if depth == MAX_CNAME_DEPTH {
-                        return Err(DnsError::new(
-                            ErrorKind::InvalidResponse,
-                            "CNAME chain too deep, possible infinite loop",
-                        ));
-                    }
-                    // Continue loop with next domain
+                    // No records of this type exist for this domain
+                    return Ok(Vec::new());
                 }
             }
         }
 
-        // Should not reach here, but handle gracefully
-        Ok(Vec::new())
+        Err(DnsError::new(
+            ErrorKind::InvalidResponse,
+            "CNAME chain too deep, possible infinite loop",
+        ))
     }
 
     /// Generic helper to perform a single DNS query and parse records
@@ -269,6 +271,14 @@ impl DnsUdpClient {
             );
         }
 
+        log::trace!(
+            "DNS response for {} {:?}: {} records, {} CNAMEs",
+            domain,
+            T::QUERY_TYPE,
+            records.len(),
+            if first_cname_target.is_some() { 1 } else { 0 }
+        );
+
         // If we found records, return them
         if !records.is_empty() {
             return Ok(QueryResult::FoundRecords(records));
@@ -276,10 +286,17 @@ impl DnsUdpClient {
 
         // If no records but we have a CNAME, follow the redirect
         if let Some(cname_target) = first_cname_target {
+            log::trace!(
+                "DNS CNAME redirect for {} {:?} -> {}",
+                domain,
+                T::QUERY_TYPE,
+                cname_target
+            );
             return Ok(QueryResult::CNAMEredirect(cname_target));
         }
 
         // No records and no CNAMEs
+        log::trace!("DNS no records for {} {:?}", domain, T::QUERY_TYPE);
         Ok(QueryResult::NoRecords)
     }
 
@@ -300,6 +317,12 @@ impl DnsUdpClient {
         domain: &str,
         query_type: DnsQueryType,
     ) -> Result<Vec<u8>, DnsError> {
+        log::trace!(
+            "query_raw: querying {} {:?} for {}",
+            self.server_addr,
+            query_type,
+            domain
+        );
         let id = rand::rng().random::<u16>();
         let query = DnsMessage::new_query(id, domain, query_type)?;
         let query_bytes = query.to_bytes()?;
@@ -340,6 +363,13 @@ impl DnsUdpClient {
 
         // Parse and validate the response
         let response_message = DnsMessage::from_bytes(response_bytes)?;
+
+        log::trace!(
+            "query_raw: got response for {} {:?} ({} answers)",
+            domain,
+            query_type,
+            response_message.answers.len()
+        );
 
         if response_message.header.id != id {
             return Err(DnsError::new(
