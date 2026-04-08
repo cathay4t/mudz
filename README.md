@@ -11,6 +11,7 @@
 sudo mkdir /etc/mudz
 sudo cp -fv mudz.conf.example /etc/mudz/mudz.conf
 cargo build --release
+sudo systemctl stop mudz.service
 sudo cp -fv target/release/mudzd /usr/bin/
 sudo cp -fv mudz.service /etc/systemd/system/
 sudo systemctl enable mudz.service --now
