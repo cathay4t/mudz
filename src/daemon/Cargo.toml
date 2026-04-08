@@ -11,3 +11,10 @@ rust-version.workspace = true
 [[bin]]
 name = "mudzd"
 path = "main.rs"
+
+[dependencies]
+mudz = { path = "../lib" }
+tokio.workspace = true
+log.workspace = true
+env_logger.workspace = true
+clap.workspace = true

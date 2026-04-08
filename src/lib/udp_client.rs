@@ -69,6 +69,7 @@ enum QueryResult<T> {
 }
 
 /// UDP client for DNS queries
+#[derive(Clone)]
 pub struct DnsUdpClient {
     /// DNS server address
     server_addr: SocketAddr,
@@ -282,8 +283,94 @@ impl DnsUdpClient {
         Ok(QueryResult::NoRecords)
     }
 
-    /// Helper to extract a specific record type or CNAME from a DNS resource
-    /// record
+    /// Query an arbitrary record type and return the raw response bytes.
+    ///
+    /// This method forwards the query to the upstream DNS server and returns
+    /// the raw DNS response bytes without parsing specific record types.
+    /// The caller is responsible for parsing the response.
+    ///
+    /// # Arguments
+    /// * `domain` - The domain name to query
+    /// * `query_type` - The type of DNS record to query
+    ///
+    /// # Returns
+    /// Raw DNS response bytes, or an error if the query fails
+    pub async fn query_raw(
+        &self,
+        domain: &str,
+        query_type: DnsQueryType,
+    ) -> Result<Vec<u8>, DnsError> {
+        let id = rand::rng().random::<u16>();
+        let query = DnsMessage::new_query(id, domain, query_type)?;
+        let query_bytes = query.to_bytes()?;
+
+        let socket = UdpSocket::bind("0.0.0.0:0").await.map_err(|e| {
+            DnsError::new(
+                ErrorKind::IoError(e.to_string()),
+                "Failed to bind UDP socket",
+            )
+        })?;
+
+        socket
+            .send_to(&query_bytes, self.server_addr)
+            .await
+            .map_err(|e| {
+                DnsError::new(
+                    ErrorKind::IoError(e.to_string()),
+                    "Failed to send DNS query",
+                )
+            })?;
+
+        let mut response_buf = [0u8; 512];
+        let response =
+            timeout(self.timeout, socket.recv_from(&mut response_buf))
+                .await
+                .map_err(|_| {
+                    DnsError::new(ErrorKind::Timeout, "DNS query timed out")
+                })?
+                .map_err(|e| {
+                    DnsError::new(
+                        ErrorKind::IoError(e.to_string()),
+                        "Failed to receive DNS response",
+                    )
+                })?;
+
+        let (bytes_received, _from_addr) = response;
+        let response_bytes = &response_buf[..bytes_received];
+
+        // Parse and validate the response
+        let response_message = DnsMessage::from_bytes(response_bytes)?;
+
+        if response_message.header.id != id {
+            return Err(DnsError::new(
+                ErrorKind::InvalidResponse,
+                "Response ID does not match query ID",
+            ));
+        }
+
+        if !response_message.header.qr {
+            return Err(DnsError::new(
+                ErrorKind::InvalidResponse,
+                "Received a query instead of a response",
+            ));
+        }
+
+        if response_message.header.rcode != crate::dns::DnsResponseCode::NoError
+        {
+            return Err(DnsError::new(
+                ErrorKind::InvalidResponse,
+                format!(
+                    "DNS server returned error code: {:?}",
+                    response_message.header.rcode
+                ),
+            ));
+        }
+
+        Ok(response_bytes.to_vec())
+    }
+
+    /// Generic helper to extract a specific record type or CNAME from a DNS
+    /// resource record
     fn extract_record_or_cname<T: DnsRecordType>(
         record: &DnsResourceRecord,
         records: &mut Vec<T>,

@@ -302,6 +302,102 @@ impl DnsHttpsClient {
         Ok(QueryResult::NoRecords)
     }
 
+    /// Query an arbitrary record type and return the raw response bytes.
+    ///
+    /// This method forwards the query to the upstream DoH server and returns
+    /// the raw DNS response bytes without parsing specific record types.
+    /// The caller is responsible for parsing the response.
+    ///
+    /// # Arguments
+    /// * `domain` - The domain name to query
+    /// * `query_type` - The type of DNS record to query
+    ///
+    /// # Returns
+    /// Raw DNS response bytes, or an error if the query fails
+    pub async fn query_raw(
+        &self,
+        domain: &str,
+        query_type: DnsQueryType,
+    ) -> Result<Vec<u8>, DnsError> {
+        // Create the DNS query message with ID=0 for HTTP caching
+        let query = DnsMessage::new_query(0, domain, query_type)?;
+        let query_bytes = query.to_bytes()?;
+
+        // Base64url-encode without padding (RFC 8484 Section 4.1)
+        let dns_param = BASE64URL_NOPAD.encode(&query_bytes);
+
+        // Build URL with dns query parameter
+        let url = format!("{}?dns={}", self.server_url, dns_param);
+
+        // Send HTTP GET request
+        let response = self
+            .http_client
+            .get(&url)
+            .header("Accept", DNS_MEDIA_TYPE)
+            .timeout(self.timeout)
+            .send()
+            .await
+            .map_err(|e| {
+                DnsError::new(
+                    ErrorKind::IoError(e.to_string()),
+                    "Failed to send DoH request",
+                )
+            })?;
+
+        // Check HTTP status - 2xx means success
+        let status = response.status();
+        if !status.is_success() {
+            return Err(DnsError::new(
+                ErrorKind::InvalidResponse,
+                format!(
+                    "DoH server returned HTTP status {}: {}",
+                    status,
+                    status.canonical_reason().unwrap_or("Unknown")
+                ),
+            ));
+        }
+
+        // Read response body
+        let response_bytes = response
+            .bytes()
+            .await
+            .map_err(|e| {
+                DnsError::new(
+                    ErrorKind::IoError(e.to_string()),
+                    "Failed to read DoH response body",
+                )
+            })?
+            .to_vec();
+
+        // Validate response size
+        if response_bytes.len() > MAX_DNS_MESSAGE_SIZE {
+            return Err(DnsError::new(
+                ErrorKind::InvalidResponse,
+                format!(
+                    "DoH response too large: {} bytes (max {})",
+                    response_bytes.len(),
+                    MAX_DNS_MESSAGE_SIZE
+                ),
+            ));
+        }
+
+        // Parse and validate the response
+        let response_message = DnsMessage::from_bytes(&response_bytes)?;
+
+        if response_message.header.rcode != crate::dns::DnsResponseCode::NoError
+        {
+            return Err(DnsError::new(
+                ErrorKind::InvalidResponse,
+                format!(
+                    "DNS server returned error code: {:?}",
+                    response_message.header.rcode
+                ),
+            ));
+        }
+
+        Ok(response_bytes)
+    }
+
     /// Helper to extract a specific record type or CNAME from a DNS resource
     /// record
     fn extract_record_or_cname<T: DnsRecordType>(

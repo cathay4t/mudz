@@ -29,7 +29,7 @@ impl DnsMessageType {
 }
 
 /// DNS query types
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum DnsQueryType {
     A,
     AAAA,
