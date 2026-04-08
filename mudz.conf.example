@@ -25,3 +25,5 @@ nameservers = ["10.0.0.1"]
 domains = [
     "fish-touching.net",
 ]
+# Don't send AAAA queries to this nameserver
+disable_ipv6 = true

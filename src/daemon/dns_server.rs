@@ -11,26 +11,13 @@ use mudz::{
     DnsMessageType, DnsQueryType, DnsQuestion, DnsRecordClass,
     DnsResourceRecord, DnsResponseCode, DnsUdpClient, ErrorKind,
 };
-use tokio::{
-    net::UdpSocket,
-    sync::{Mutex as AsyncMutex, RwLock, oneshot},
-};
+use tokio::{net::UdpSocket, sync::RwLock};
 
 use crate::{
     cache::{DnsCache, MAX_CACHE_TTL},
     config::MudzConfig,
     host::HostsFile,
 };
-
-/// Type alias for in-flight query deduplication
-type InFlightQueries = Arc<
-    AsyncMutex<
-        HashMap<
-            (String, DnsQueryType),
-            Vec<oneshot::Sender<Result<Vec<u8>, DnsError>>>,
-        >,
-    >,
->;
 
 /// Named upstream resolver clients
 #[derive(Clone)]
@@ -39,11 +26,16 @@ struct UpstreamClients {
     udp_clients: Vec<DnsUdpClient>,
     /// DNS HTTPS clients (one per DoH server URL)
     https_clients: Vec<DnsHttpsClient>,
+    /// Disable AAAA queries for this group
+    disable_ipv6: bool,
 }
 
 impl UpstreamClients {
     /// Create upstream clients from server addresses (auto-detect UDP vs HTTPS)
-    fn from_server_addrs(addrs: &[String]) -> Result<Self, DnsError> {
+    fn from_server_addrs(
+        addrs: &[String],
+        disable_ipv6: bool,
+    ) -> Result<Self, DnsError> {
         let mut udp_clients: Vec<DnsUdpClient> = Vec::new();
         let mut https_clients: Vec<DnsHttpsClient> = Vec::new();
 
@@ -58,6 +50,7 @@ impl UpstreamClients {
         Ok(Self {
             udp_clients,
             https_clients,
+            disable_ipv6,
         })
     }
 
@@ -83,8 +76,6 @@ pub struct DnsUdpServer {
     recv_buf_size: usize,
     /// /etc/hosts entries
     hosts_file: HostsFile,
-    /// In-flight query deduplication map
-    in_flight_queries: InFlightQueries,
 }
 
 impl DnsUdpServer {
@@ -98,15 +89,19 @@ impl DnsUdpServer {
         max_cache_size: usize,
     ) -> Result<Self, DnsError> {
         // Create fallback clients from config (auto-detect UDP vs HTTPS)
-        let fallback =
-            UpstreamClients::from_server_addrs(&config.fallback.nameservers)?;
+        let fallback = UpstreamClients::from_server_addrs(
+            &config.fallback.nameservers,
+            false,
+        )?;
 
         // Create named groups and domain routes
         let mut named_groups: HashMap<String, UpstreamClients> = HashMap::new();
         let mut domain_routes: Vec<(String, String)> = Vec::new();
         for (name, group) in &config.nameservers {
-            let clients =
-                UpstreamClients::from_server_addrs(&group.nameservers)?;
+            let clients = UpstreamClients::from_server_addrs(
+                &group.nameservers,
+                group.disable_ipv6,
+            )?;
             if clients.has_clients() {
                 // Store domain routes
                 for domain in &group.domains {
@@ -124,7 +119,6 @@ impl DnsUdpServer {
             domain_routes,
             recv_buf_size: 4096,
             hosts_file: HostsFile::new(),
-            in_flight_queries: Arc::new(AsyncMutex::new(HashMap::new())),
         })
     }
 
@@ -159,7 +153,6 @@ impl DnsUdpServer {
             let named_groups = self.named_groups.clone();
             let domain_routes = self.domain_routes.clone();
             let hosts_file = self.hosts_file.clone();
-            let in_flight_queries = Arc::clone(&self.in_flight_queries);
 
             // Handle each query in a separate task
             tokio::spawn(async move {
@@ -172,7 +165,6 @@ impl DnsUdpServer {
                     &named_groups,
                     &domain_routes,
                     &hosts_file,
-                    &in_flight_queries,
                 )
                 .await
                 {
@@ -206,7 +198,6 @@ impl DnsUdpServer {
         named_groups: &HashMap<String, UpstreamClients>,
         domain_routes: &[(String, String)],
         hosts_file: &HostsFile,
-        in_flight_queries: &InFlightQueries,
     ) -> Result<(), DnsError> {
         // Parse the incoming query
         let query = DnsMessage::from_bytes(&query_bytes)?;
@@ -284,67 +275,48 @@ impl DnsUdpServer {
             query_type
         );
 
-        // Check for in-flight query (deduplication)
-        let response_bytes = {
-            let mut queries = in_flight_queries.lock().await;
-            if let Some(waiters) =
-                queries.get_mut(&(domain.clone(), query_type))
-            {
-                // Another task is already querying upstream — wait for result
-                let (tx, rx) = oneshot::channel();
-                waiters.push(tx);
-                drop(queries); // Release lock while waiting
-                log::trace!(
-                    "Joining in-flight query for {} {:?}",
-                    domain,
-                    query_type
-                );
-                rx.await.map_err(|e| {
-                    DnsError::new(
-                        ErrorKind::InvalidResponse,
-                        format!("In-flight query channel closed: {e}"),
-                    )
-                })??
-            } else {
-                // Register this query as the initiator
-                queries.insert((domain.clone(), query_type), Vec::new());
-                drop(queries); // Release lock before querying upstream
-
-                let upstream = if let Some(group_name) =
-                    Self::find_group_for_domain(&domain, domain_routes)
-                {
-                    log::trace!(
-                        "Routing {} {:?} to group '{}'",
-                        domain,
-                        query_type,
-                        group_name
-                    );
-                    named_groups.get(&group_name).unwrap_or(fallback)
-                } else {
-                    log::trace!(
-                        "Routing {} {:?} to fallback",
-                        domain,
-                        query_type
-                    );
-                    fallback
-                };
-
-                let result =
-                    Self::resolve_upstream(upstream, &domain, query_type).await;
-
-                // Broadcast result to all waiters
-                let mut queries = in_flight_queries.lock().await;
-                if let Some(waiters) =
-                    queries.remove(&(domain.clone(), query_type))
-                {
-                    for waiter in waiters {
-                        let _ = waiter.send(result.clone());
-                    }
-                }
-
-                result?
-            }
+        // Select upstream based on domain
+        let upstream = if let Some(group_name) =
+            Self::find_group_for_domain(&domain, domain_routes)
+        {
+            log::trace!(
+                "Routing {} {:?} to group '{}'",
+                domain,
+                query_type,
+                group_name
+            );
+            named_groups.get(&group_name).unwrap_or(fallback)
+        } else {
+            log::trace!("Routing {} {:?} to fallback", domain, query_type);
+            fallback
         };
+
+        // If this group disables IPv6 and the query is for AAAA,
+        // return an empty NoError response immediately
+        if upstream.disable_ipv6 && query_type == DnsQueryType::AAAA {
+            log::trace!(
+                "Blocking AAAA query for {} (disable_ipv6 group)",
+                domain
+            );
+            let response_bytes = Self::build_empty_response(
+                transaction_id,
+                &domain,
+                query_type,
+            )?;
+            socket.send_to(&response_bytes, client_addr).await.map_err(
+                |e| {
+                    DnsError::new(
+                        ErrorKind::IoError(e.to_string()),
+                        "Failed to send empty response",
+                    )
+                },
+            )?;
+            return Ok(());
+        }
+
+        // Query upstream resolver
+        let response_bytes =
+            Self::resolve_upstream(upstream, &domain, query_type).await?;
 
         // Parse once to extract TTL
         let response = DnsMessage::from_bytes(&response_bytes)?;
@@ -410,6 +382,52 @@ impl DnsUdpServer {
         bytes[0] = id_bytes[0];
         bytes[1] = id_bytes[1];
         Ok(bytes)
+    }
+
+    /// Build an empty DNS response with NoError and no answers
+    fn build_empty_response(
+        transaction_id: u16,
+        domain: &str,
+        query_type: DnsQueryType,
+    ) -> Result<Vec<u8>, DnsError> {
+        let domain_obj = DnsDomainName {
+            labels: domain
+                .split('.')
+                .filter(|l| !l.is_empty())
+                .map(|l| l.as_bytes().to_vec())
+                .collect(),
+            raw_offset: 0,
+            compression_pointer: None,
+        };
+
+        let response = DnsMessage {
+            header: DnsHeader {
+                id: transaction_id,
+                message_type: DnsMessageType::Response,
+                qr: true,
+                opcode: 0,
+                aa: false,
+                tc: false,
+                rd: true,
+                ra: true,
+                z: 0,
+                rcode: DnsResponseCode::NoError,
+                qdcount: 1,
+                ancount: 0,
+                nscount: 0,
+                arcount: 0,
+            },
+            questions: vec![DnsQuestion {
+                domain: domain_obj,
+                query_type,
+                query_class: DnsRecordClass::IN,
+            }],
+            answers: Vec::new(),
+            authorities: Vec::new(),
+            additionals: Vec::new(),
+        };
+
+        response.to_bytes()
     }
 
     /// Find the named group that matches a domain

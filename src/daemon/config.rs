@@ -53,6 +53,8 @@ pub struct NameserverGroup {
     pub nameservers: Vec<String>,
     /// Domains that should be routed to this group
     pub domains: Vec<String>,
+    /// Disable AAAA queries for this group
+    pub disable_ipv6: bool,
 }
 
 /// Full mudz configuration

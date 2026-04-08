@@ -47,6 +47,8 @@ nameservers = ["10.0.0.1"]
 domains = [
     "fish-touching.net",
 ]
+# Don't send AAAA queries for this group
+disable_ipv6 = true
 ```
 
 ## License
