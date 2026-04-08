@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::{
+use mudz::{
     DnsDomainName, DnsHeader, DnsMessage, DnsMessageType, DnsQueryType,
-    DnsRecordClass, DnsResponseCode, error::ErrorKind,
+    DnsRecordClass, DnsResponseCode, ErrorKind,
 };
 
 #[test]

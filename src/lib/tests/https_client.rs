@@ -2,9 +2,8 @@
 
 use std::time::Duration;
 
+use mudz::{DnsHttpsClient, DnsMessage, DnsQueryType};
 use tokio::runtime::Runtime;
-
-use crate::{DnsHttpsClient, DnsMessage, DnsQueryType};
 
 #[test]
 fn test_dns_https_client_new() {

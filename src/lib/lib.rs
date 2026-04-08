@@ -4,8 +4,6 @@ mod dns;
 mod error;
 mod https_client;
 mod udp_client;
-#[cfg(test)]
-mod unit_tests;
 
 pub use self::{
     dns::{

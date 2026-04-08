@@ -1,10 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 
-use std::net::Ipv4Addr;
+use std::net::{Ipv4Addr, Ipv6Addr};
 
+use mudz::DnsUdpClient;
 use tokio::runtime::Runtime;
-
-use crate::DnsUdpClient;
 
 #[test]
 fn test_query_a_record() {
@@ -73,8 +72,6 @@ fn test_query_invalid_domain() {
 
 #[test]
 fn test_query_aaaa_record() {
-    use std::net::Ipv6Addr;
-
     let rt = Runtime::new().unwrap();
     let result = rt.block_on(async {
         let client = DnsUdpClient::new().unwrap();
