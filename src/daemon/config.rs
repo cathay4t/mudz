@@ -86,13 +86,120 @@ impl MudzConfig {
                 ),
             )
         })?;
-        toml::from_str::<Self>(&content).map_err(|e| {
+        let config = toml::from_str::<Self>(&content).map_err(|e| {
             DnsError::new(
                 mudz::ErrorKind::InvalidConfig,
                 format!("Failed to parse config: {e}"),
             )
-        })
+        })?;
+        config.validate()?;
+        Ok(config)
     }
+
+    /// Validate the configuration
+    fn validate(&self) -> Result<(), DnsError> {
+        self.validate_doh_hostname_resolution()?;
+        Ok(())
+    }
+
+    /// Validate that when all fallback servers are DoH, there's a dedicated
+    /// group with plain IP nameservers to resolve DoH server hostnames
+    fn validate_doh_hostname_resolution(&self) -> Result<(), DnsError> {
+        // Check if all fallback nameservers are DoH
+        let all_fallback_are_doh = self
+            .fallback
+            .nameservers
+            .iter()
+            .all(|ns| ns.starts_with("https://"));
+
+        if !all_fallback_are_doh {
+            return Ok(());
+        }
+
+        // Extract hostnames from DoH URLs in fallback
+        let doh_hostnames: Vec<String> = self
+            .fallback
+            .nameservers
+            .iter()
+            .filter_map(|url| extract_hostname_from_doh_url(url))
+            .collect();
+
+        if doh_hostnames.is_empty() {
+            return Ok(());
+        }
+
+        // Check if there's at least one group with plain IP nameservers that
+        // covers all DoH hostnames in its domains
+        let has_resolver_group = self.groups.values().any(|group| {
+            // Group must have at least one plain IP nameserver
+            let has_plain_ip_nameserver = group
+                .nameservers
+                .iter()
+                .any(|ns| !ns.starts_with("https://"));
+
+            if !has_plain_ip_nameserver {
+                return false;
+            }
+
+            // Group's domains should cover all DoH hostnames (or a superset)
+            // We check if each DoH hostname matches any domain in the group
+            doh_hostnames.iter().all(|hostname| {
+                group
+                    .domains
+                    .iter()
+                    .any(|domain| domain_matches(hostname, domain))
+            })
+        });
+
+        if !has_resolver_group {
+            return Err(DnsError::new(
+                mudz::ErrorKind::InvalidConfig,
+                format!(
+                    "All fallback servers are DoH servers, but no dedicated \
+                     group found to resolve DoH server hostnames ({:?}). \
+                     Please create a group with plain IP nameservers that \
+                     includes the DoH hostnames in its domains",
+                    doh_hostnames
+                ),
+            ));
+        }
+
+        Ok(())
+    }
+}
+
+/// Extract hostname from a DoH URL (e.g., "https://dns.alidns.com/dns-query" -> "dns.alidns.com")
+fn extract_hostname_from_doh_url(url: &str) -> Option<String> {
+    // Remove "https://" prefix
+    let without_scheme = url.strip_prefix("https://")?;
+    // Get the hostname part (before the first '/')
+    let hostname = without_scheme.split('/').next()?;
+    // Remove port if present
+    let hostname_without_port = hostname.split(':').next()?;
+    if hostname_without_port.is_empty() {
+        return None;
+    }
+    Some(hostname_without_port.to_string())
+}
+
+/// Check if a domain pattern matches a hostname
+/// Supports exact match and subdomain matching
+/// e.g., "dns.alidns.com" matches domain "alidns.com" or "dns.alidns.com"
+fn domain_matches(hostname: &str, domain_pattern: &str) -> bool {
+    let hostname = hostname.to_lowercase();
+    let domain = domain_pattern.to_lowercase();
+
+    // Exact match
+    if hostname == domain {
+        return true;
+    }
+
+    // Subdomain match: hostname ends with .domain
+    if hostname.ends_with(&format!(".{domain}")) {
+        return true;
+    }
+
+    false
 }
 
 #[cfg(test)]
@@ -142,5 +249,121 @@ disable_ipv6 = true
         assert_eq!(google_group.nameservers, vec!["8.8.4.4"]);
         assert_eq!(google_group.domains, vec!["google.com"]);
         assert!(google_group.disable_ipv6);
+    }
+
+    #[test]
+    fn test_all_doh_fallback_without_resolver_group_rejected() {
+        let config_str = r#"
+[fallback]
+nameservers = ["https://dns.alidns.com/dns-query", "https://doh.pub/dns-query"]
+
+[group.other]
+nameservers = ["8.8.8.8"]
+domains = ["other.com"]
+"#;
+        let config: MudzConfig =
+            toml::from_str(config_str).expect("Should parse TOML successfully");
+        let result = config.validate();
+        assert!(
+            result.is_err(),
+            "Expected error when all fallbacks are DoH without resolver group"
+        );
+        let err = result.unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("All fallback servers are DoH servers"),
+            "Error should mention DoH servers issue, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_all_doh_fallback_with_resolver_group_accepted() {
+        let config_str = r#"
+[fallback]
+nameservers = ["https://dns.alidns.com/dns-query", "https://doh.pub/dns-query"]
+
+[group.doh]
+nameservers = ["223.5.5.5", "119.29.29.29"]
+domains = [
+    "dns.alidns.com",
+    "doh.pub",
+]
+"#;
+        let config: MudzConfig =
+            toml::from_str(config_str).expect("Should parse TOML successfully");
+        let result = config.validate();
+        assert!(
+            result.is_ok(),
+            "Expected valid config with resolver group for DoH hostnames, \
+             got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_all_doh_fallback_with_subdomain_resolver_accepted() {
+        let config_str = r#"
+[fallback]
+nameservers = ["https://dns.alidns.com/dns-query"]
+
+[group.doh]
+nameservers = ["223.5.5.5"]
+domains = ["alidns.com"]
+"#;
+        let config: MudzConfig =
+            toml::from_str(config_str).expect("Should parse TOML successfully");
+        let result = config.validate();
+        assert!(
+            result.is_ok(),
+            "Expected valid config with subdomain matcher for DoH hostnames, \
+             got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_mixed_fallback_accepted() {
+        let config_str = r#"
+[fallback]
+nameservers = ["https://dns.alidns.com/dns-query", "8.8.8.8"]
+"#;
+        let result = toml::from_str::<MudzConfig>(config_str);
+        assert!(
+            result.is_ok(),
+            "Expected valid config with mixed fallback (DoH + plain IP), got: \
+             {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_extract_hostname_from_doh_url() {
+        assert_eq!(
+            extract_hostname_from_doh_url("https://dns.alidns.com/dns-query"),
+            Some("dns.alidns.com".to_string())
+        );
+        assert_eq!(
+            extract_hostname_from_doh_url("https://doh.pub/dns-query"),
+            Some("doh.pub".to_string())
+        );
+        assert_eq!(
+            extract_hostname_from_doh_url("https://dns.google/dns-query"),
+            Some("dns.google".to_string())
+        );
+        assert_eq!(
+            extract_hostname_from_doh_url("https://dns.google:443/dns-query"),
+            Some("dns.google".to_string())
+        );
+        assert_eq!(extract_hostname_from_doh_url("invalid"), None);
+    }
+
+    #[test]
+    fn test_domain_matches() {
+        // Exact match
+        assert!(domain_matches("dns.alidns.com", "dns.alidns.com"));
+        // Subdomain match
+        assert!(domain_matches("dns.alidns.com", "alidns.com"));
+        // No match
+        assert!(!domain_matches("dns.alidns.com", "other.com"));
+        // Case insensitive
+        assert!(domain_matches("DNS.ALIDNS.COM", "alidns.com"));
+        assert!(domain_matches("dns.alidns.com", "ALIDNS.COM"));
     }
 }

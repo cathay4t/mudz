@@ -31,7 +31,16 @@ log_level = "info"
 [fallback]
 # Send out DNS request to all nameservers simultaneously, and reply to user
 # once got any valid reply
+nameservers = ["https://dns.alidns.com/dns-query", "https://doh.pub/dns-query"]
+
+# When you use DoT only as fallback servers, make sure create a group
+# to resolve hostname of DoT server.
+[group.doh]
 nameservers = ["223.5.5.5", "119.29.29.29"]
+domains = [
+    "dns.alidns.com",
+    "doh.pub",
+]
 
 # Redirect user's request on these domains to specified nameservers instead of
 # fallback ones
@@ -47,7 +56,7 @@ nameservers = ["10.0.0.1"]
 domains = [
     "fish-touching.net",
 ]
-# Don't send AAAA queries for this group
+# Don't send AAAA queries to this nameserver
 disable_ipv6 = true
 
 # Return NXDOMAIN for these domains without sending any upstream query
