@@ -11,3 +11,14 @@ rust-version.workspace = true
 [lib]
 name = "mudz"
 path = "lib.rs"
+
+[dependencies]
+log.workspace = true
+tokio.workspace = true
+rand.workspace = true
+reqwest.workspace = true
+data-encoding.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt", "macros"] }
+futures = "0.3"
