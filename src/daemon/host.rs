@@ -12,7 +12,7 @@ const HOSTS_FILE: &str = "/etc/hosts";
 
 /// Parsed /etc/hosts entries
 #[derive(Clone)]
-pub struct HostsFile {
+pub(crate) struct HostsFile {
     /// Map of domain -> list of IPv4 addresses
     a_records: HashMap<String, Vec<Ipv4Addr>>,
     /// Map of domain -> list of IPv6 addresses

@@ -13,7 +13,7 @@ pub const MIN_CACHE_TTL: u32 = 60;
 pub const MAX_CACHE_TTL: u32 = 86400;
 
 /// Cache entry for a DNS query result
-pub struct CacheEntry {
+pub(crate) struct CacheEntry {
     /// Cached DNS message bytes (response format)
     pub response_bytes: Vec<u8>,
     /// Expiry time based on record TTL
@@ -21,7 +21,7 @@ pub struct CacheEntry {
 }
 
 /// DNS cache storage
-pub struct DnsCache {
+pub(crate) struct DnsCache {
     /// Map of (domain, query_type) -> cache entry
     entries: HashMap<(String, DnsQueryType), CacheEntry>,
     /// Maximum number of cache entries

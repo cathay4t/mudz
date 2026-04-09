@@ -11,7 +11,7 @@ const DEFAULT_UDP_BIND: &str = "127.0.0.1:53";
 /// Configuration for the main section
 #[derive(Debug, Deserialize, Clone)]
 #[serde(default, deny_unknown_fields)]
-pub struct MainConfig {
+pub(crate) struct MainConfig {
     /// UDP socket bind address
     pub udp_bind: String,
     /// Maximum number of cache entries
@@ -34,7 +34,7 @@ impl Default for MainConfig {
 /// Configuration for the fallback (default upstream) section
 #[derive(Debug, Deserialize, Clone)]
 #[serde(default, deny_unknown_fields)]
-pub struct FallbackConfig {
+pub(crate) struct FallbackConfig {
     /// Upstream DNS servers for fallback
     pub nameservers: Vec<String>,
 }
@@ -50,7 +50,7 @@ impl Default for FallbackConfig {
 /// Configuration for a named group of upstream DNS servers
 #[derive(Debug, Deserialize, Clone, Default)]
 #[serde(default, deny_unknown_fields)]
-pub struct UpstreamGroup {
+pub(crate) struct UpstreamGroup {
     /// Nameservers in this group
     pub nameservers: Vec<String>,
     /// Domains that should be routed to this group
@@ -62,7 +62,7 @@ pub struct UpstreamGroup {
 /// Full mudz configuration
 #[derive(Debug, Deserialize, Clone, Default)]
 #[serde(default, deny_unknown_fields)]
-pub struct MudzConfig {
+pub(crate) struct MudzConfig {
     /// Main settings
     pub main: MainConfig,
     /// Fallback (default upstream) settings

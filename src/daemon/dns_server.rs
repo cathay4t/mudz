@@ -69,7 +69,7 @@ impl UpstreamClients {
 }
 
 /// DNS UDP server with caching and per-domain routing support
-pub struct DnsUdpServer {
+pub(crate) struct DnsUdpServer {
     /// Cache for DNS responses
     cache: Arc<RwLock<DnsCache>>,
     /// Listen address
