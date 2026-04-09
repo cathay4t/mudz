@@ -359,54 +359,7 @@ impl DnsUdpClient {
                 })?;
 
         let (bytes_received, _from_addr) = response;
-        let response_bytes = &response_buf[..bytes_received];
-
-        // Parse and validate the response
-        let response_message = DnsMessage::from_bytes(response_bytes)?;
-
-        log::trace!(
-            "query_raw: got response for {} {:?} ({} answers)",
-            domain,
-            query_type,
-            response_message.answers.len()
-        );
-
-        if response_message.header.id != id {
-            return Err(DnsError::new(
-                ErrorKind::InvalidResponse,
-                "Response ID does not match query ID",
-            ));
-        }
-
-        if !response_message.header.qr {
-            return Err(DnsError::new(
-                ErrorKind::InvalidResponse,
-                "Received a query instead of a response",
-            ));
-        }
-
-        // Return the response even if it contains NXDomain or other non-error
-        // rcodes. NXDomain is a valid DNS response meaning "this domain
-        // doesn't exist" and should be passed through to the client.
-        // Only treat FormErr and ServFail as actual errors.
-        match response_message.header.rcode {
-            crate::dns::DnsResponseCode::FormErr => {
-                return Err(DnsError::new(
-                    ErrorKind::InvalidResponse,
-                    "DNS server returned error code: FormErr",
-                ));
-            }
-            crate::dns::DnsResponseCode::ServFail => {
-                return Err(DnsError::new(
-                    ErrorKind::InvalidResponse,
-                    "DNS server returned error code: ServFail",
-                ));
-            }
-            _ => {} /* NoError, NXDomain, NotImp, Refused, OTHER are all
-                     * valid responses to pass through */
-        }
-
-        Ok(response_bytes.to_vec())
+        Ok(response_buf[..bytes_received].to_vec())
     }
 
     /// Generic helper to extract a specific record type or CNAME from a DNS
