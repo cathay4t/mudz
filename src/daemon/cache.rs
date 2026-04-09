@@ -31,7 +31,7 @@ pub struct DnsCache {
 impl DnsCache {
     pub fn new(max_size: usize) -> Self {
         Self {
-            entries: HashMap::new(),
+            entries: HashMap::with_capacity(max_size),
             max_size,
         }
     }
