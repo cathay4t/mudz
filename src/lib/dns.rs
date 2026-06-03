@@ -727,25 +727,41 @@ impl DnsMessage {
         let header = DnsHeader::from_bytes(buf)?;
         let mut offset = 12;
 
-        let mut questions = Vec::with_capacity(header.qdcount as usize);
+        let remaining = buf.len().saturating_sub(offset);
+        let mut questions = Vec::with_capacity(std::cmp::min(
+            header.qdcount as usize,
+            remaining,
+        ));
         for _ in 0..header.qdcount {
             let question = DnsQuestion::parse_from(buf, &mut offset)?;
             questions.push(question);
         }
 
-        let mut answers = Vec::with_capacity(header.ancount as usize);
+        let remaining = buf.len().saturating_sub(offset);
+        let mut answers = Vec::with_capacity(std::cmp::min(
+            header.ancount as usize,
+            remaining,
+        ));
         for _ in 0..header.ancount {
             let record = DnsResourceRecord::parse_from(buf, &mut offset)?;
             answers.push(record);
         }
 
-        let mut authorities = Vec::with_capacity(header.nscount as usize);
+        let remaining = buf.len().saturating_sub(offset);
+        let mut authorities = Vec::with_capacity(std::cmp::min(
+            header.nscount as usize,
+            remaining,
+        ));
         for _ in 0..header.nscount {
             let record = DnsResourceRecord::parse_from(buf, &mut offset)?;
             authorities.push(record);
         }
 
-        let mut additionals = Vec::with_capacity(header.arcount as usize);
+        let remaining = buf.len().saturating_sub(offset);
+        let mut additionals = Vec::with_capacity(std::cmp::min(
+            header.arcount as usize,
+            remaining,
+        ));
         for _ in 0..header.arcount {
             let record = DnsResourceRecord::parse_from(buf, &mut offset)?;
             additionals.push(record);
