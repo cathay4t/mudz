@@ -86,6 +86,7 @@ impl MudzConfig {
                 ),
             )
         })?;
+        Self::validate_unique_group_names(&content)?;
         let config = toml::from_str::<Self>(&content).map_err(|e| {
             DnsError::new(
                 mudz::ErrorKind::InvalidConfig,
@@ -96,9 +97,44 @@ impl MudzConfig {
         Ok(config)
     }
 
+    /// Validate that group names are not empty
+    fn validate_group_names(&self) -> Result<(), DnsError> {
+        for name in self.groups.keys() {
+            if name.is_empty() {
+                return Err(DnsError::new(
+                    mudz::ErrorKind::InvalidConfig,
+                    "dns-resolver.cache.groups.name cannot be empty"
+                        .to_string(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
     /// Validate the configuration
     fn validate(&self) -> Result<(), DnsError> {
+        self.validate_group_names()?;
         self.validate_doh_hostname_resolution()?;
+        Ok(())
+    }
+
+    /// Validate that there are no duplicate group names in the raw TOML
+    /// content. serde's HashMap silently overwrites duplicates, so we check
+    /// before parsing.
+    fn validate_unique_group_names(content: &str) -> Result<(), DnsError> {
+        let mut seen = std::collections::HashSet::new();
+        for line in content.lines() {
+            let trimmed = line.trim();
+            if trimmed.starts_with("[group.") && trimmed.ends_with(']') {
+                let name = trimmed[7..trimmed.len() - 1].trim();
+                if !name.is_empty() && !seen.insert(name) {
+                    return Err(DnsError::new(
+                        mudz::ErrorKind::InvalidConfig,
+                        format!("Duplicate DNS cache group name: {name}"),
+                    ));
+                }
+            }
+        }
         Ok(())
     }
 

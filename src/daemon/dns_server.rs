@@ -147,15 +147,24 @@ impl DnsUdpServer {
         let mut buf = vec![0u8; self.recv_buf_size];
 
         loop {
-            let (size, client_addr) =
-                socket.recv_from(&mut buf).await.map_err(|e| {
-                    DnsError::new(
-                        ErrorKind::IoError(e.to_string()),
-                        "Failed to receive DNS query",
-                    )
-                })?;
+            let (size, client_addr) = match socket.recv_from(&mut buf).await {
+                Ok(v) => v,
+                Err(e) => {
+                    log::info!("Failed to receive DNS query: {e}");
+                    continue;
+                }
+            };
 
             let query_bytes = buf[..size].to_vec();
+
+            if query_bytes.len() < 12 {
+                continue;
+            }
+
+            let is_response = (query_bytes[2] & 0x80) != 0;
+            if is_response {
+                continue;
+            }
             let cache = Arc::clone(&self.cache);
             let socket = Arc::clone(&socket);
             let fallback = self.fallback.clone();
@@ -164,11 +173,8 @@ impl DnsUdpServer {
             let hosts_file = self.hosts_file.clone();
 
             // Extract transaction ID early for error responses
-            let transaction_id = if query_bytes.len() >= 2 {
-                u16::from_be_bytes([query_bytes[0], query_bytes[1]])
-            } else {
-                0
-            };
+            let transaction_id =
+                u16::from_be_bytes([query_bytes[0], query_bytes[1]]);
 
             // Handle each query in a separate task
             tokio::spawn(async move {
@@ -480,7 +486,11 @@ impl DnsUdpServer {
             // Match exact domain or subdomain (e.g., "google.com" matches
             // "foo.google.com")
             if domain_lower == route_domain_lower
-                || domain_lower.ends_with(&format!(".{route_domain_lower}"))
+                || (domain_lower.ends_with(&route_domain_lower)
+                    && domain_lower
+                        .as_bytes()
+                        .get(domain_lower.len() - route_domain_lower.len() - 1)
+                        == Some(&b'.'))
             {
                 return Some(group_name.clone());
             }

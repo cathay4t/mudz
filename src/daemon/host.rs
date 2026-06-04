@@ -51,9 +51,13 @@ impl HostsFile {
         a_records: &mut HashMap<String, Vec<Ipv4Addr>>,
         aaaa_records: &mut HashMap<String, Vec<Ipv6Addr>>,
     ) {
-        let line = line.trim();
+        // Strip inline comments
+        let line = match line.split('#').next() {
+            Some(content) => content.trim(),
+            None => return,
+        };
         // Skip empty lines and comments
-        if line.is_empty() || line.starts_with('#') {
+        if line.is_empty() {
             return;
         }
 
@@ -68,21 +72,17 @@ impl HostsFile {
         // Try to parse as IPv4 or IPv6 address
         if let Ok(ipv4) = addr_str.parse::<Ipv4Addr>() {
             for hostname in hostnames {
-                if !hostname.starts_with('#') {
-                    a_records
-                        .entry(hostname.to_lowercase())
-                        .or_default()
-                        .push(ipv4);
-                }
+                a_records
+                    .entry(hostname.to_lowercase())
+                    .or_default()
+                    .push(ipv4);
             }
         } else if let Ok(ipv6) = addr_str.parse::<Ipv6Addr>() {
             for hostname in hostnames {
-                if !hostname.starts_with('#') {
-                    aaaa_records
-                        .entry(hostname.to_lowercase())
-                        .or_default()
-                        .push(ipv6);
-                }
+                aaaa_records
+                    .entry(hostname.to_lowercase())
+                    .or_default()
+                    .push(ipv6);
             }
         }
     }

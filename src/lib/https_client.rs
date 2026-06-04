@@ -8,7 +8,7 @@
 use std::net::{Ipv4Addr, Ipv6Addr};
 
 use data_encoding::BASE64URL_NOPAD;
-use reqwest::Client;
+use reqwest::{Client, Url};
 
 use crate::{
     dns::{DnsDomainName, DnsMessage, DnsQueryType, DnsResourceRecord},
@@ -216,12 +216,18 @@ impl DnsHttpsClient {
         let dns_param = BASE64URL_NOPAD.encode(&query_bytes);
 
         // Build URL with dns query parameter
-        let url = format!("{}?dns={}", self.server_url, dns_param);
+        let mut url = Url::parse(&self.server_url).map_err(|e| {
+            DnsError::new(
+                ErrorKind::InvalidConfig,
+                format!("Invalid DoH server URL: {e}"),
+            )
+        })?;
+        url.query_pairs_mut().append_pair("dns", &dns_param);
 
         // Send HTTP GET request
         let response = self
             .http_client
-            .get(&url)
+            .get(url)
             .header("Accept", DNS_MEDIA_TYPE)
             .timeout(self.timeout)
             .send()
@@ -345,12 +351,18 @@ impl DnsHttpsClient {
         let dns_param = BASE64URL_NOPAD.encode(&query_bytes);
 
         // Build URL with dns query parameter
-        let url = format!("{}?dns={}", self.server_url, dns_param);
+        let mut url = Url::parse(&self.server_url).map_err(|e| {
+            DnsError::new(
+                ErrorKind::InvalidConfig,
+                format!("Invalid DoH server URL: {e}"),
+            )
+        })?;
+        url.query_pairs_mut().append_pair("dns", &dns_param);
 
         // Send HTTP GET request
         let response = self
             .http_client
-            .get(&url)
+            .get(url)
             .header("Accept", DNS_MEDIA_TYPE)
             .timeout(self.timeout)
             .send()
