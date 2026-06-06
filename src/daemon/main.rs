@@ -1,19 +1,25 @@
 // SPDX-License-Identifier: Apache-2.0
 
-use mudz::DnsError;
-
 mod cache;
 mod config;
-mod dns_server;
+mod doh;
+mod group;
 mod host;
+mod listener;
+mod resolver;
+mod server;
 
-use self::{config::MudzConfig, dns_server::DnsUdpServer};
+#[cfg(test)]
+mod tests;
+
+use mudz::{ErrorKind, MudzError};
+
+use self::{config::MudzConfig, server::DnsUdpServer};
 
 const DEFAULT_CONFIG_PATH: &str = "/etc/mudz/mudz.conf";
 
-fn main() -> Result<(), DnsError> {
+fn main() -> Result<(), MudzError> {
     let config = MudzConfig::from_file(DEFAULT_CONFIG_PATH)?;
-    let cache_size = config.main.max_cache_size;
     let log_level = &config.main.log_level;
 
     env_logger::Builder::from_env(
@@ -21,32 +27,23 @@ fn main() -> Result<(), DnsError> {
     )
     .init();
 
-    let server = DnsUdpServer::from_config(&config, cache_size)?;
-
     log::info!(
         "Starting DNS Caching Server on {} (fallback: {:?})",
-        server.listen_addr(),
+        config.main.udp_bind,
         config.fallback.nameservers,
     );
 
-    if !config.groups.is_empty() {
-        for (name, group) in &config.groups {
-            log::info!(
-                "Domain group '{}': {:?} -> {:?}",
-                name,
-                group.domains,
-                group.nameservers
-            );
-        }
-    }
-
     // Run the server in a Tokio runtime
-    let rt = tokio::runtime::Runtime::new().map_err(|e| {
-        DnsError::new(
-            mudz::ErrorKind::IoError(e.to_string()),
-            "Failed to create Tokio runtime",
-        )
-    })?;
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        // We only have two threads
+        .worker_threads(2)
+        .thread_name("mudz-worker")
+        .enable_io()
+        .enable_time()
+        .build()
+        .map_err(|_| {
+            MudzError::new(ErrorKind::Bug, "Failed to create Tokio runtime")
+        })?;
 
-    rt.block_on(async { server.run().await })
+    rt.block_on(async move { DnsUdpServer::new(config).await?.run().await })
 }

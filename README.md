@@ -4,6 +4,7 @@
  * Support DNS over UDP and HTTPs.
  * Domain based DNS name server selecting.
  * Pure rust code with memory safe guarantee.
+ * Lock free concurrency and high performance.
 
 ## Usage
 
@@ -32,15 +33,13 @@ log_level = "info"
 # Send out DNS request to all nameservers simultaneously, and reply to user
 # once got any valid reply
 nameservers = ["https://dns.alidns.com/dns-query", "https://doh.pub/dns-query"]
+disable_ipv6 = true
 
-# When you use DoT only as fallback servers, make sure create a group
-# to resolve hostname of DoT server.
-[group.doh]
+# To resolve DoH server hostnames via plain UDP, use the [doh] section.
+# Mandatory if any nameserver is a DoH URL.
+[doh]
 nameservers = ["223.5.5.5", "119.29.29.29"]
-domains = [
-    "dns.alidns.com",
-    "doh.pub",
-]
+disable_ipv6 = false
 
 # Redirect user's request on these domains to specified nameservers instead of
 # fallback ones

@@ -1,0 +1,13 @@
+ * Compression is expanded on re-emit, so forwarded responses grow. The client
+   query is read into a 512-byte buffer and replies are sent with no EDNS
+   handling and no truncation (TC) bit. A response that grows past 512 (or past
+   the client's advertised size) can break non-EDNS clients. Consider honoring
+   the query's EDNS payload size and setting TC when over the limit.
+ * The Eq/Hash of DnsDomainName should depend on lower case string of domain.
+ * dnscrypt-proxy reply with notes AAAA is disabled.
+ * Need better handling when certain domain resolve timeout, current we
+   check whether pending futures is emtpy but waiting queue is not. This will
+   be a problem when the pending futures never empty, so some user might
+   wait forever due to a failed DNS query. Add a timestamp fo a waiting client
+   wait queue might helps.
+ * DohResolvCache never refreshed

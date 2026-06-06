@@ -10,6 +10,7 @@ header:
     - '**/*.md'
     - 'CHANGELOG'
     - 'LICENSE'
+    - 'TODO'
     - '.gitignore'
     - 'mudz.service'
     - 'mudz.conf.example'

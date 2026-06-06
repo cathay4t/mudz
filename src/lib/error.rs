@@ -5,51 +5,35 @@ use std::fmt;
 /// DNS error kinds
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ErrorKind {
-    BufferTooShort,
-    InvalidCompressionPointer,
-    InvalidDomainName,
-    InvalidRecordType,
-    InvalidRdata,
-    LabelTooLong,
-    DomainNameTooLong,
-    CompressionPointerCycle,
-    IoError(String),
-    Timeout,
-    InvalidResponse,
+    Bug,
+    InvalidPacket,
     InvalidConfig,
+    InvalidArgument,
+    Timeout,
 }
 
 impl fmt::Display for ErrorKind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            ErrorKind::BufferTooShort => write!(f, "buffer_too_short"),
-            ErrorKind::InvalidCompressionPointer => {
-                write!(f, "invalid_compression_pointer")
+            ErrorKind::Bug => write!(f, "bug"),
+            ErrorKind::InvalidPacket => write!(f, "invalid_packet"),
+            ErrorKind::InvalidArgument => write!(f, "invalid_argument"),
+            ErrorKind::InvalidConfig => {
+                write!(f, "invalid_config")
             }
-            ErrorKind::InvalidDomainName => write!(f, "invalid_domain_name"),
-            ErrorKind::InvalidRecordType => write!(f, "invalid_record_type"),
-            ErrorKind::InvalidRdata => write!(f, "invalid_rdata"),
-            ErrorKind::LabelTooLong => write!(f, "label_too_long"),
-            ErrorKind::DomainNameTooLong => write!(f, "domain_name_too_long"),
-            ErrorKind::CompressionPointerCycle => {
-                write!(f, "compression_pointer_cycle")
-            }
-            ErrorKind::IoError(msg) => write!(f, "io_error: {msg}"),
             ErrorKind::Timeout => write!(f, "timeout"),
-            ErrorKind::InvalidResponse => write!(f, "invalid_response"),
-            ErrorKind::InvalidConfig => write!(f, "invalid_config"),
         }
     }
 }
 
 /// DNS parsing/serialization errors
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DnsError {
+pub struct MudzError {
     pub kind: ErrorKind,
     pub message: String,
 }
 
-impl DnsError {
+impl MudzError {
     pub fn new(kind: ErrorKind, message: impl Into<String>) -> Self {
         Self {
             kind,
@@ -58,10 +42,16 @@ impl DnsError {
     }
 }
 
-impl fmt::Display for DnsError {
+impl fmt::Display for MudzError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}: {}", self.kind, self.message)
     }
 }
 
-impl std::error::Error for DnsError {}
+impl std::error::Error for MudzError {}
+
+impl From<std::io::Error> for MudzError {
+    fn from(e: std::io::Error) -> Self {
+        Self::new(ErrorKind::InvalidConfig, format!("std::io::IoError: {e}"))
+    }
+}

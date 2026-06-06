@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
-use std::{collections::HashMap, fs, path::Path};
+use std::{collections::HashMap, fs, net::IpAddr, path::Path};
 
-use mudz::DnsError;
+use mudz::{ErrorKind, MudzError};
 use serde::Deserialize;
 
 const DEFAULT_MAX_CACHE_SIZE: usize = 4096;
@@ -11,17 +11,17 @@ const DEFAULT_UDP_BIND: &str = "127.0.0.1:53";
 /// Configuration for the main section
 #[derive(Debug, Deserialize, Clone)]
 #[serde(default, deny_unknown_fields)]
-pub(crate) struct MainConfig {
+pub(crate) struct MudzMainConfig {
     /// UDP socket bind address
-    pub udp_bind: String,
+    pub(crate) udp_bind: String,
     /// Maximum number of cache entries
-    pub max_cache_size: usize,
+    pub(crate) max_cache_size: usize,
     #[serde(default)]
     /// Log level (e.g., "info", "debug", "warn", "error")
-    pub log_level: String,
+    pub(crate) log_level: String,
 }
 
-impl Default for MainConfig {
+impl Default for MudzMainConfig {
     fn default() -> Self {
         Self {
             udp_bind: DEFAULT_UDP_BIND.to_string(),
@@ -32,31 +32,39 @@ impl Default for MainConfig {
 }
 
 /// Configuration for the fallback (default upstream) section
-#[derive(Debug, Deserialize, Clone)]
-#[serde(default, deny_unknown_fields)]
-pub(crate) struct FallbackConfig {
+#[derive(Debug, Deserialize, Clone, Default)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct MudzFallbackConfig {
     /// Upstream DNS servers for fallback
-    pub nameservers: Vec<String>,
+    pub(crate) nameservers: Vec<String>,
+    /// Disable AAAA queries for fallback servers
+    #[serde(default)]
+    pub(crate) disable_ipv6: bool,
 }
 
-impl Default for FallbackConfig {
-    fn default() -> Self {
-        Self {
-            nameservers: vec!["8.8.8.8".to_string()],
-        }
-    }
+/// Configuration for the [doh] section. Provides plain IP nameservers for
+/// resolving DoH server hostnames. Mandatory if any nameserver is a DoH URL.
+#[derive(Debug, Deserialize, Clone, Default)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct MudzDohConfig {
+    /// UDP nameservers for resolving DoH server hostnames
+    pub(crate) nameservers: Vec<IpAddr>,
+    /// Disable AAAA queries for DoH resolver
+    #[serde(default)]
+    pub(crate) disable_ipv6: bool,
 }
 
 /// Configuration for a named group of upstream DNS servers
 #[derive(Debug, Deserialize, Clone, Default)]
 #[serde(default, deny_unknown_fields)]
-pub(crate) struct UpstreamGroup {
+pub(crate) struct DnsUpstreamGroup {
     /// Nameservers in this group
-    pub nameservers: Vec<String>,
-    /// Domains that should be routed to this group
-    pub domains: Vec<String>,
+    pub(crate) nameservers: Vec<String>,
+    /// Domains that should be routed to this group, empty means reply NXDOMAIN
+    /// immediately without forwarding to fallback.
+    pub(crate) domains: Vec<String>,
     /// Disable AAAA queries for this group
-    pub disable_ipv6: bool,
+    pub(crate) disable_ipv6: bool,
 }
 
 /// Full mudz configuration
@@ -64,21 +72,25 @@ pub(crate) struct UpstreamGroup {
 #[serde(default, deny_unknown_fields)]
 pub(crate) struct MudzConfig {
     /// Main settings
-    pub main: MainConfig,
+    pub(crate) main: MudzMainConfig,
     /// Fallback (default upstream) settings
-    pub fallback: FallbackConfig,
+    pub(crate) fallback: MudzFallbackConfig,
+    /// DoH resolver settings (mandatory if any nameserver is a DoH URL)
+    pub(crate) doh: Option<MudzDohConfig>,
     /// Named upstream groups, keyed by group name (from [group.*] sections)
     #[serde(rename = "group")]
-    pub groups: HashMap<String, UpstreamGroup>,
+    pub(crate) groups: HashMap<String, DnsUpstreamGroup>,
 }
 
 impl MudzConfig {
     /// Load configuration from a TOML file
-    pub fn from_file<P: AsRef<Path>>(path: P) -> Result<Self, DnsError> {
+    pub(crate) fn from_file<P: AsRef<Path>>(
+        path: P,
+    ) -> Result<Self, MudzError> {
         let path_ref = path.as_ref();
         let content = fs::read_to_string(path_ref).map_err(|e| {
-            DnsError::new(
-                mudz::ErrorKind::IoError(e.to_string()),
+            MudzError::new(
+                ErrorKind::InvalidConfig,
                 format!(
                     "Config file '{}' not found or not readable: {}",
                     path_ref.display(),
@@ -88,8 +100,8 @@ impl MudzConfig {
         })?;
         Self::validate_unique_group_names(&content)?;
         let config = toml::from_str::<Self>(&content).map_err(|e| {
-            DnsError::new(
-                mudz::ErrorKind::InvalidConfig,
+            MudzError::new(
+                ErrorKind::InvalidConfig,
                 format!("Failed to parse config: {e}"),
             )
         })?;
@@ -98,37 +110,89 @@ impl MudzConfig {
     }
 
     /// Validate that group names are not empty
-    fn validate_group_names(&self) -> Result<(), DnsError> {
+    fn validate_group_names(&self) -> Result<(), MudzError> {
         for name in self.groups.keys() {
             if name.is_empty() {
-                return Err(DnsError::new(
+                return Err(MudzError::new(
                     mudz::ErrorKind::InvalidConfig,
-                    "dns-resolver.cache.groups.name cannot be empty"
-                        .to_string(),
+                    "group name cannot be empty",
                 ));
             }
         }
         Ok(())
     }
 
-    /// Validate the configuration
-    fn validate(&self) -> Result<(), DnsError> {
+    /// Validate the configuration:
+    /// 1. Group name cannot be empty
+    /// 2. Group domains cannot overlap
+    /// 3. If any nameserver uses DoH, [doh] section must be present with plain
+    ///    IP nameservers
+    pub(crate) fn validate(&self) -> Result<(), MudzError> {
         self.validate_group_names()?;
-        self.validate_doh_hostname_resolution()?;
+        self.validate_domain_overlap()?;
+        self.validate_doh_nameservers()?;
         Ok(())
+    }
+
+    /// Validate that no two groups have overlapping domains.
+    fn validate_domain_overlap(&self) -> Result<(), MudzError> {
+        let group_list: Vec<(&String, &DnsUpstreamGroup)> =
+            self.groups.iter().collect();
+        for i in 0..group_list.len() {
+            for j in (i + 1)..group_list.len() {
+                let (name_a, group_a) = group_list[i];
+                let (name_b, group_b) = group_list[j];
+                for da in &group_a.domains {
+                    for db in &group_b.domains {
+                        if domains_overlap(da, db) {
+                            return Err(MudzError::new(
+                                mudz::ErrorKind::InvalidConfig,
+                                format!(
+                                    "Domain '{da}' in group '{name_a}' \
+                                     overlaps with domain '{db}' in group \
+                                     '{name_b}'"
+                                ),
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn get_doh_hostnames(&self) -> Vec<String> {
+        let mut doh_hostnames = Vec::new();
+        for ns in &self.fallback.nameservers {
+            if ns.starts_with("https://")
+                && let Some(hostname) = extract_doh_hostname(ns)
+            {
+                doh_hostnames.push(hostname);
+            }
+        }
+        for group in self.groups.values() {
+            for ns in &group.nameservers {
+                if ns.starts_with("https://")
+                    && let Some(hostname) = extract_doh_hostname(ns)
+                {
+                    doh_hostnames.push(hostname);
+                }
+            }
+        }
+        doh_hostnames
     }
 
     /// Validate that there are no duplicate group names in the raw TOML
     /// content. serde's HashMap silently overwrites duplicates, so we check
     /// before parsing.
-    fn validate_unique_group_names(content: &str) -> Result<(), DnsError> {
+    fn validate_unique_group_names(content: &str) -> Result<(), MudzError> {
         let mut seen = std::collections::HashSet::new();
         for line in content.lines() {
             let trimmed = line.trim();
             if trimmed.starts_with("[group.") && trimmed.ends_with(']') {
                 let name = trimmed[7..trimmed.len() - 1].trim();
                 if !name.is_empty() && !seen.insert(name) {
-                    return Err(DnsError::new(
+                    return Err(MudzError::new(
                         mudz::ErrorKind::InvalidConfig,
                         format!("Duplicate DNS cache group name: {name}"),
                     ));
@@ -138,268 +202,61 @@ impl MudzConfig {
         Ok(())
     }
 
-    /// Validate that when all fallback servers are DoH, there's a dedicated
-    /// group with plain IP nameservers to resolve DoH server hostnames
-    fn validate_doh_hostname_resolution(&self) -> Result<(), DnsError> {
-        // Check if all fallback nameservers are DoH
-        let all_fallback_are_doh = self
+    /// Validate that if any nameserver uses DoH, a [doh] section with plain
+    /// IP nameservers is present
+    fn validate_doh_nameservers(&self) -> Result<(), MudzError> {
+        let has_doh = self
             .fallback
             .nameservers
             .iter()
-            .all(|ns| ns.starts_with("https://"));
+            .any(|ns| ns.starts_with("https://"))
+            || self.groups.values().any(|g| {
+                g.nameservers.iter().any(|ns| ns.starts_with("https://"))
+            });
 
-        if !all_fallback_are_doh {
+        if !has_doh {
             return Ok(());
         }
 
-        // Extract hostnames from DoH URLs in fallback
-        let doh_hostnames: Vec<String> = self
-            .fallback
-            .nameservers
-            .iter()
-            .filter_map(|url| extract_hostname_from_doh_url(url))
-            .collect();
-
-        if doh_hostnames.is_empty() {
-            return Ok(());
-        }
-
-        // Check if there's at least one group with plain IP nameservers that
-        // covers all DoH hostnames in its domains
-        let has_resolver_group = self.groups.values().any(|group| {
-            // Group must have at least one plain IP nameserver
-            let has_plain_ip_nameserver = group
-                .nameservers
-                .iter()
-                .any(|ns| !ns.starts_with("https://"));
-
-            if !has_plain_ip_nameserver {
-                return false;
+        match &self.doh {
+            None => {
+                return Err(MudzError::new(
+                    mudz::ErrorKind::InvalidConfig,
+                    "DoH servers are configured but no [doh] section found. \
+                     Please add a [doh] section with plain IP nameservers to \
+                     resolve DoH server hostnames",
+                ));
             }
-
-            // Group's domains should cover all DoH hostnames (or a superset)
-            // We check if each DoH hostname matches any domain in the group
-            doh_hostnames.iter().all(|hostname| {
-                group
-                    .domains
-                    .iter()
-                    .any(|domain| domain_matches(hostname, domain))
-            })
-        });
-
-        if !has_resolver_group {
-            return Err(DnsError::new(
-                mudz::ErrorKind::InvalidConfig,
-                format!(
-                    "All fallback servers are DoH servers, but no dedicated \
-                     group found to resolve DoH server hostnames ({:?}). \
-                     Please create a group with plain IP nameservers that \
-                     includes the DoH hostnames in its domains",
-                    doh_hostnames
-                ),
-            ));
+            Some(doh) => {
+                if doh.nameservers.is_empty() {
+                    return Err(MudzError::new(
+                        mudz::ErrorKind::InvalidConfig,
+                        "[doh] section must have at least one nameserver",
+                    ));
+                }
+            }
         }
 
         Ok(())
     }
 }
 
-/// Extract hostname from a DoH URL (e.g., "https://dns.alidns.com/dns-query" -> "dns.alidns.com")
-fn extract_hostname_from_doh_url(url: &str) -> Option<String> {
-    // Remove "https://" prefix
+/// Extract lowercase hostname from a DoH URL
+/// (e.g., "https://dns.alidns.com/dns-query" -> "dns.alidns.com")
+pub(crate) fn extract_doh_hostname(url: &str) -> Option<String> {
     let without_scheme = url.strip_prefix("https://")?;
-    // Get the hostname part (before the first '/')
     let hostname = without_scheme.split('/').next()?;
-    // Remove port if present
     let hostname_without_port = hostname.split(':').next()?;
     if hostname_without_port.is_empty() {
         return None;
     }
-    Some(hostname_without_port.to_string())
+    Some(hostname_without_port.to_lowercase())
 }
 
-/// Check if a domain pattern matches a hostname
-/// Supports exact match and subdomain matching
-/// e.g., "dns.alidns.com" matches domain "alidns.com" or "dns.alidns.com"
-fn domain_matches(hostname: &str, domain_pattern: &str) -> bool {
-    let hostname = hostname.to_lowercase();
-    let domain = domain_pattern.to_lowercase();
-
-    // Exact match
-    if hostname == domain {
-        return true;
-    }
-
-    // Subdomain match: hostname ends with .domain
-    if hostname.ends_with(&format!(".{domain}")) {
-        return true;
-    }
-
-    false
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_unknown_field_in_group_rejected() {
-        let config_str = r#"
-[fallback]
-nameservers = ["8.8.8.8"]
-
-[group.test]
-nameservers = ["1.1.1.1"]
-domains = ["example.com"]
-unknown_field = "bad"
-"#;
-        let result = toml::from_str::<MudzConfig>(config_str);
-        assert!(
-            result.is_err(),
-            "Expected error for unknown field in [group.*] section"
-        );
-        let err = result.unwrap_err();
-        assert!(
-            err.to_string().contains("unknown field `unknown_field`"),
-            "Error should mention unknown_field, got: {err}"
-        );
-    }
-
-    #[test]
-    fn test_valid_group_accepted() {
-        let config_str = r#"
-[fallback]
-nameservers = ["8.8.8.8"]
-
-[group.google]
-nameservers = ["8.8.4.4"]
-domains = ["google.com"]
-disable_ipv6 = true
-"#;
-        let result = toml::from_str::<MudzConfig>(config_str);
-        assert!(result.is_ok(), "Expected valid config, got: {result:?}");
-        let config = result.unwrap();
-        assert_eq!(config.groups.len(), 1);
-        assert!(config.groups.contains_key("google"));
-        let google_group = &config.groups["google"];
-        assert_eq!(google_group.nameservers, vec!["8.8.4.4"]);
-        assert_eq!(google_group.domains, vec!["google.com"]);
-        assert!(google_group.disable_ipv6);
-    }
-
-    #[test]
-    fn test_all_doh_fallback_without_resolver_group_rejected() {
-        let config_str = r#"
-[fallback]
-nameservers = ["https://dns.alidns.com/dns-query", "https://doh.pub/dns-query"]
-
-[group.other]
-nameservers = ["8.8.8.8"]
-domains = ["other.com"]
-"#;
-        let config: MudzConfig =
-            toml::from_str(config_str).expect("Should parse TOML successfully");
-        let result = config.validate();
-        assert!(
-            result.is_err(),
-            "Expected error when all fallbacks are DoH without resolver group"
-        );
-        let err = result.unwrap_err();
-        assert!(
-            err.to_string()
-                .contains("All fallback servers are DoH servers"),
-            "Error should mention DoH servers issue, got: {err}"
-        );
-    }
-
-    #[test]
-    fn test_all_doh_fallback_with_resolver_group_accepted() {
-        let config_str = r#"
-[fallback]
-nameservers = ["https://dns.alidns.com/dns-query", "https://doh.pub/dns-query"]
-
-[group.doh]
-nameservers = ["223.5.5.5", "119.29.29.29"]
-domains = [
-    "dns.alidns.com",
-    "doh.pub",
-]
-"#;
-        let config: MudzConfig =
-            toml::from_str(config_str).expect("Should parse TOML successfully");
-        let result = config.validate();
-        assert!(
-            result.is_ok(),
-            "Expected valid config with resolver group for DoH hostnames, \
-             got: {result:?}"
-        );
-    }
-
-    #[test]
-    fn test_all_doh_fallback_with_subdomain_resolver_accepted() {
-        let config_str = r#"
-[fallback]
-nameservers = ["https://dns.alidns.com/dns-query"]
-
-[group.doh]
-nameservers = ["223.5.5.5"]
-domains = ["alidns.com"]
-"#;
-        let config: MudzConfig =
-            toml::from_str(config_str).expect("Should parse TOML successfully");
-        let result = config.validate();
-        assert!(
-            result.is_ok(),
-            "Expected valid config with subdomain matcher for DoH hostnames, \
-             got: {result:?}"
-        );
-    }
-
-    #[test]
-    fn test_mixed_fallback_accepted() {
-        let config_str = r#"
-[fallback]
-nameservers = ["https://dns.alidns.com/dns-query", "8.8.8.8"]
-"#;
-        let result = toml::from_str::<MudzConfig>(config_str);
-        assert!(
-            result.is_ok(),
-            "Expected valid config with mixed fallback (DoH + plain IP), got: \
-             {result:?}"
-        );
-    }
-
-    #[test]
-    fn test_extract_hostname_from_doh_url() {
-        assert_eq!(
-            extract_hostname_from_doh_url("https://dns.alidns.com/dns-query"),
-            Some("dns.alidns.com".to_string())
-        );
-        assert_eq!(
-            extract_hostname_from_doh_url("https://doh.pub/dns-query"),
-            Some("doh.pub".to_string())
-        );
-        assert_eq!(
-            extract_hostname_from_doh_url("https://dns.google/dns-query"),
-            Some("dns.google".to_string())
-        );
-        assert_eq!(
-            extract_hostname_from_doh_url("https://dns.google:443/dns-query"),
-            Some("dns.google".to_string())
-        );
-        assert_eq!(extract_hostname_from_doh_url("invalid"), None);
-    }
-
-    #[test]
-    fn test_domain_matches() {
-        // Exact match
-        assert!(domain_matches("dns.alidns.com", "dns.alidns.com"));
-        // Subdomain match
-        assert!(domain_matches("dns.alidns.com", "alidns.com"));
-        // No match
-        assert!(!domain_matches("dns.alidns.com", "other.com"));
-        // Case insensitive
-        assert!(domain_matches("DNS.ALIDNS.COM", "alidns.com"));
-        assert!(domain_matches("dns.alidns.com", "ALIDNS.COM"));
-    }
+/// Check if two domain patterns overlap (one equals the other or is a
+/// subdomain of the other)
+fn domains_overlap(a: &str, b: &str) -> bool {
+    let a = a.to_lowercase();
+    let b = b.to_lowercase();
+    a == b || a.ends_with(&format!(".{b}")) || b.ends_with(&format!(".{a}"))
 }

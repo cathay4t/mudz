@@ -10,15 +10,14 @@ log_level = "info"
 # Send out DNS request to all nameservers simultaneously, and reply to user
 # once got any valid reply
 nameservers = ["https://dns.alidns.com/dns-query", "https://doh.pub/dns-query"]
+disable_ipv6 = false
 
-# When you use DoT only as fallback servers, make sure create a group
-# to resolve hostname of DoT server.
-[group.doh]
+# To resovle DoH server's domain name, use these UDP nameservers only.
+# Mandatory if DoH server is used.
+[doh]
 nameservers = ["223.5.5.5", "119.29.29.29"]
-domains = [
-    "dns.alidns.com",
-    "doh.pub",
-]
+# Do not resolve DoH server's domain name with IPv6
+disable_ipv6 = false
 
 # Redirect user's request on these domains to specified nameservers instead of
 # fallback ones
