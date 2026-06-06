@@ -2,10 +2,11 @@
 
 use std::{
     collections::HashMap,
-    fs,
     io::{BufRead, BufReader},
-    net::{Ipv4Addr, Ipv6Addr},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr},
 };
+
+use mudz::{DnsClass, DnsPacket, DnsResourceRecord, DnsType};
 
 /// Path to the hosts file
 const HOSTS_FILE: &str = "/etc/hosts";
@@ -21,11 +22,11 @@ pub(crate) struct HostsFile {
 
 impl HostsFile {
     /// Parse /etc/hosts and return the parsed entries
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let mut a_records: HashMap<String, Vec<Ipv4Addr>> = HashMap::new();
         let mut aaaa_records: HashMap<String, Vec<Ipv6Addr>> = HashMap::new();
 
-        if let Ok(file) = fs::File::open(HOSTS_FILE) {
+        if let Ok(file) = std::fs::File::open(HOSTS_FILE) {
             let reader = BufReader::new(file);
             for line in reader.lines().map_while(Result::ok) {
                 Self::parse_line(&line, &mut a_records, &mut aaaa_records);
@@ -87,13 +88,60 @@ impl HostsFile {
         }
     }
 
-    /// Look up A records for a domain
-    pub fn lookup_a(&self, domain: &str) -> Option<&Vec<Ipv4Addr>> {
-        self.a_records.get(&domain.to_lowercase())
+    pub(crate) fn get_ips(&self, hostname: &str) -> Vec<IpAddr> {
+        let mut ret = Vec::new();
+        if let Some(ips) = self.a_records.get(hostname) {
+            ret.extend(ips.iter().map(|ip| IpAddr::V4(*ip)));
+        }
+        if let Some(ips) = self.aaaa_records.get(hostname) {
+            ret.extend(ips.iter().map(|ip| IpAddr::V6(*ip)));
+        }
+        ret
     }
 
-    /// Look up AAAA records for a domain
-    pub fn lookup_aaaa(&self, domain: &str) -> Option<&Vec<Ipv6Addr>> {
-        self.aaaa_records.get(&domain.to_lowercase())
+    pub(crate) fn get(&self, packet: &DnsPacket) -> Option<DnsPacket> {
+        let query_type = packet.questions.first()?.kind;
+        let domain_obj = &packet.questions.first()?.domain;
+        let domain = packet.questions.first()?.domain.to_string();
+
+        let mut packet = packet.clone();
+
+        packet.header.set_response(true);
+
+        match query_type {
+            DnsType::A => {
+                let ips = self.a_records.get(&domain)?;
+                packet.header.ancount = ips.len() as u16;
+                packet.answers = ips
+                    .iter()
+                    .map(|ip| DnsResourceRecord {
+                        domain: domain_obj.clone(),
+                        kind: DnsType::A,
+                        class: DnsClass::IN,
+                        ttl: 300,
+                        rdlength: (Ipv4Addr::BITS / 8) as u16,
+                        rdata: ip.octets().to_vec(),
+                    })
+                    .collect();
+                Some(packet)
+            }
+            DnsType::AAAA => {
+                let ips = self.aaaa_records.get(&domain)?;
+                packet.header.ancount = ips.len() as u16;
+                packet.answers = ips
+                    .iter()
+                    .map(|ip| DnsResourceRecord {
+                        domain: domain_obj.clone(),
+                        kind: DnsType::AAAA,
+                        class: DnsClass::IN,
+                        ttl: 300,
+                        rdlength: (Ipv6Addr::BITS / 8) as u16,
+                        rdata: ip.octets().to_vec(),
+                    })
+                    .collect();
+                Some(packet)
+            }
+            _ => None,
+        }
     }
 }

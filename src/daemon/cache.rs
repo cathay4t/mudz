@@ -5,89 +5,122 @@ use std::{
     time::{Duration, Instant},
 };
 
-use mudz::DnsQueryType;
+use mudz::{DnsPacket, DnsType};
 
 /// Minimum TTL to cache (seconds)
-pub const MIN_CACHE_TTL: u32 = 60;
+const MIN_CACHE_TTL_SEC: u32 = 60;
 /// Maximum TTL to cache (seconds, 1 day)
-pub const MAX_CACHE_TTL: u32 = 86400;
+const MAX_CACHE_TTL_SEC: u32 = 86400;
 
 /// Cache entry for a DNS query result
-pub(crate) struct CacheEntry {
-    /// Cached DNS message bytes (response format)
-    pub response_bytes: Vec<u8>,
-    /// Expiry time based on record TTL
-    pub expires_at: Instant,
+struct CacheEntry {
+    packet: DnsPacket,
+    /// Time this entry was inserted into the cache
+    insertion_time: Instant,
+    /// Expiry time based on record TTL and clamped to MIN_CACHE_TTL_SEC and
+    /// MAX_CACHE_TTL_SEC
+    expires_at: Instant,
 }
 
-/// DNS cache storage
-pub(crate) struct DnsCache {
+pub(crate) struct DnsCacheStore {
     /// Map of (domain, query_type) -> cache entry
-    entries: HashMap<(String, DnsQueryType), CacheEntry>,
-    /// Maximum number of cache entries
+    entries: HashMap<(String, DnsType), CacheEntry>,
     max_size: usize,
 }
 
-impl DnsCache {
-    pub fn new(max_size: usize) -> Self {
+impl DnsCacheStore {
+    pub(crate) fn new(max_size: usize) -> Self {
         Self {
             entries: HashMap::with_capacity(max_size),
             max_size,
         }
     }
 
-    /// Get a cached response if it exists and hasn't expired
-    pub fn get(
-        &self,
-        domain: &str,
-        query_type: DnsQueryType,
-    ) -> Option<&CacheEntry> {
-        self.entries
-            .get(&(domain.to_lowercase(), query_type))
-            .filter(|entry| entry.expires_at > Instant::now())
-    }
-
-    /// Insert or update a cache entry
-    pub fn insert(
-        &mut self,
-        domain: String,
-        query_type: DnsQueryType,
-        response: Vec<u8>,
-        ttl: u32,
-    ) {
-        // Clamp TTL to reasonable bounds
-        let effective_ttl = ttl.clamp(MIN_CACHE_TTL, MAX_CACHE_TTL);
-
-        // Evict old entries if cache is full
-        if self.entries.len() >= self.max_size {
-            self.evict_expired();
-            // If still full, remove first entry
-            if let Some(oldest_key) = self.entries.keys().next().cloned()
-                && self.entries.len() >= self.max_size
-            {
-                self.entries.remove(&oldest_key);
-            }
-        }
-
-        self.entries.insert(
-            (domain, query_type),
-            CacheEntry {
-                response_bytes: response,
-                expires_at: Instant::now()
-                    + Duration::from_secs(effective_ttl as u64),
-            },
-        );
-    }
-
-    /// Remove all expired entries
-    pub fn evict_expired(&mut self) {
+    fn evict_expired(&mut self) {
         let now = Instant::now();
         self.entries.retain(|_, entry| entry.expires_at > now);
     }
 
-    /// Get current cache size
-    #[allow(dead_code)]
-    pub fn len(&self) -> usize {
-        self.entries.len()
+    fn dump_cache(&self) {
+        log::debug!("Cache dump:");
+        for ((domain, kind), entry) in &self.entries {
+            log::debug!(
+                "  {} {} (expires in {}s)",
+                domain,
+                kind,
+                entry
+                    .expires_at
+                    .saturating_duration_since(Instant::now())
+                    .as_secs()
+            );
+        }
+    }
+
+    pub(crate) fn get(&self, request: &DnsPacket) -> Option<DnsPacket> {
+        let domain = request.questions.first().map(|q| q.domain.to_string())?;
+        let kind = request.questions.first().map(|q| q.kind)?;
+
+        let now = Instant::now();
+        if let Some(entry) = self.entries.get(&(domain, kind))
+            && entry.expires_at > now
+        {
+            log::debug!("Cache hit for {}", request.display_brief());
+            let mut ret = entry.packet.clone();
+            ret.header.id = request.header.id;
+            let elapsed = now.saturating_duration_since(entry.insertion_time);
+            let ttl_sub = elapsed.as_secs() as u32;
+            for record in ret
+                .answers
+                .iter_mut()
+                .chain(ret.authorities.iter_mut())
+                .chain(ret.additionals.iter_mut())
+            {
+                record.ttl = record.ttl.saturating_sub(ttl_sub);
+            }
+            Some(ret)
+        } else {
+            log::debug!("Cache not hit for {}", request.display_brief());
+            None
+        }
+    }
+
+    pub(crate) fn insert(&mut self, response: DnsPacket) {
+        // Evict old entries if cache is full
+        if self.entries.len() >= self.max_size {
+            self.evict_expired();
+            if self.entries.len() >= self.max_size {
+                for _ in 0..(self.entries.len() - self.max_size + 1) {
+                    // TODO: Use LRU eviction instead of removing first entry
+                    if let Some(first_key) = self.entries.keys().next().cloned()
+                    {
+                        self.entries.remove(&first_key);
+                    }
+                }
+            }
+        }
+        let Some(domain) =
+            response.first_question().map(|q| q.domain.to_string())
+        else {
+            return;
+        };
+        let Some(kind) = response.first_question().map(|q| q.kind) else {
+            return;
+        };
+        let ttl_sec = response
+            .first_record()
+            .map(|q| q.ttl)
+            .unwrap_or(MIN_CACHE_TTL_SEC);
+        let ttl_sec = ttl_sec.clamp(MIN_CACHE_TTL_SEC, MAX_CACHE_TTL_SEC);
+
+        let now = Instant::now();
+        self.entries.insert(
+            (domain, kind),
+            CacheEntry {
+                insertion_time: now,
+                packet: response,
+                expires_at: now + Duration::from_secs(ttl_sec as u64),
+            },
+        );
+        self.dump_cache();
     }
 }
