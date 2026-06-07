@@ -30,6 +30,8 @@ pub enum DnsType {
     SRV,
     /// RFC 9460: HTTPS resource record
     HTTPS,
+    /// RFC 8482: Host information record
+    HINFO,
     Other(u16),
 }
 
@@ -46,6 +48,7 @@ impl From<DnsType> for u16 {
             DnsType::PTR => 12,
             DnsType::SRV => 33,
             DnsType::HTTPS => 65,
+            DnsType::HINFO => 13,
             DnsType::Other(t) => t,
         }
     }
@@ -64,6 +67,7 @@ impl From<u16> for DnsType {
             12 => DnsType::PTR,
             33 => DnsType::SRV,
             65 => DnsType::HTTPS,
+            13 => DnsType::HINFO,
             _ => DnsType::Other(value),
         }
     }
@@ -82,6 +86,7 @@ impl std::fmt::Display for DnsType {
             DnsType::PTR => write!(f, "PTR"),
             DnsType::SRV => write!(f, "SRV"),
             DnsType::HTTPS => write!(f, "HTTPS"),
+            DnsType::HINFO => write!(f, "HINFO"),
             DnsType::Other(t) => write!(f, "TYPE{}", t),
         }
     }

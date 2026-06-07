@@ -6,7 +6,10 @@ use std::{
 };
 
 use futures_util::{StreamExt, future::Either, stream::FuturesUnordered};
-use mudz::{DnsPacket, DnsResponseCode, DnsType, ErrorKind, MudzError};
+use mudz::{
+    DnsClass, DnsHeader, DnsPacket, DnsResourceRecord, DnsResponseCode,
+    DnsType, ErrorKind, MudzError,
+};
 use tokio::net::UdpSocket;
 
 use super::{
@@ -15,6 +18,11 @@ use super::{
 };
 
 const DNS_TIMEOUT_SEC: Duration = Duration::from_secs(5);
+const IPV6_BLOCKED_HINFO_CPU: &str =
+    "AAAA queries have been locally blocked by mudz";
+const IPV6_BLOCKED_HINFO_OS: &str =
+    "Set disable_ipv6 to false to allow IPv6 DNS queries";
+const IPV6_BLOCKED_HINFO_TTL: u32 = 86_400;
 
 pub(crate) struct DnsGroups {
     fallback: DnsGroup,
@@ -163,20 +171,15 @@ impl DnsGroup {
         &self,
         request: DnsPacket,
     ) -> Result<DnsPacket, MudzError> {
-        // Return NoError immediately if the request is for AAAA and IPv6 is
-        // disabled for this
         if self.disable_ipv6
             && request.first_question().map(|q| q.kind) == Some(DnsType::AAAA)
         {
             log::debug!(
                 "Received AAAA query but IPv6 is disabled for group '{}', \
-                 returning NOERROR",
+                 returning synthetic NOERROR with HINFO+SOA",
                 self.name
             );
-            let mut response = request;
-            response.header.set_response(true);
-            response.header.rcode = DnsResponseCode::NoError;
-            return Ok(response);
+            return Ok(make_ipv6_blocked_response(&request));
         }
 
         log::debug!("Sending DNS request to group '{}'", self.name);
@@ -210,6 +213,48 @@ impl DnsGroup {
             ErrorKind::InvalidPacket,
             "All DNS requests failed or returned invalid responses",
         ))
+    }
+}
+
+fn make_ipv6_blocked_response(request: &DnsPacket) -> DnsPacket {
+    let question = request
+        .questions
+        .first()
+        .expect("request has at least one question");
+    let domain = question.domain.clone();
+
+    let mut hinfo_rdata = Vec::new();
+    hinfo_rdata.push(IPV6_BLOCKED_HINFO_CPU.len() as u8);
+    hinfo_rdata.extend_from_slice(IPV6_BLOCKED_HINFO_CPU.as_bytes());
+    hinfo_rdata.push(IPV6_BLOCKED_HINFO_OS.len() as u8);
+    hinfo_rdata.extend_from_slice(IPV6_BLOCKED_HINFO_OS.as_bytes());
+    let hinfo = DnsResourceRecord {
+        domain: domain.clone(),
+        kind: DnsType::HINFO,
+        class: DnsClass::IN,
+        ttl: IPV6_BLOCKED_HINFO_TTL,
+        rdlength: hinfo_rdata.len() as u16,
+        rdata: hinfo_rdata,
+    };
+
+    DnsPacket {
+        header: DnsHeader {
+            id: request.header.id,
+            qr: true,
+            opcode: request.header.opcode,
+            rd: request.header.rd,
+            ra: true,
+            rcode: DnsResponseCode::NoError,
+            qdcount: 1,
+            ancount: 1,
+            nscount: 0,
+            arcount: 0,
+            ..Default::default()
+        },
+        questions: vec![question.clone()],
+        answers: vec![hinfo],
+        authorities: Vec::new(),
+        additionals: Vec::new(),
     }
 }
 
