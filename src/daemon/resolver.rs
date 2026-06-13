@@ -249,7 +249,7 @@ async fn resolve_doh_hostnames(
         let host_ips = hosts.get_ips(host_name);
 
         if !host_ips.is_empty() {
-            log::debug!(
+            log::info!(
                 "DoH hostname {} resolved to IPs from hosts file: {:?}",
                 host_name,
                 host_ips
