@@ -100,6 +100,18 @@ pub struct DnsResourceRecord {
     pub rdata: Vec<u8>,
 }
 
+fn kind_has_domain_names(kind: DnsType) -> bool {
+    matches!(
+        kind,
+        DnsType::CNAME
+            | DnsType::NS
+            | DnsType::PTR
+            | DnsType::MX
+            | DnsType::SOA
+            | DnsType::SRV
+    )
+}
+
 impl DnsResourceRecord {
     pub const HDR_LEN: usize = 10;
 
@@ -140,7 +152,7 @@ impl DnsResourceRecord {
 
         let kind_enum = DnsType::from(kind);
         let rdata =
-            Self::expand_rdata(buf, kind_enum, &raw_rdata, rdata_offset)?;
+            Self::expand_rdata(buf, kind_enum, raw_rdata, rdata_offset)?;
 
         Ok(DnsResourceRecord {
             domain,
@@ -158,9 +170,16 @@ impl DnsResourceRecord {
     fn expand_rdata(
         buf: &[u8],
         kind: DnsType,
-        rdata: &[u8],
+        rdata: Vec<u8>,
         rdata_offset: usize,
     ) -> Result<Vec<u8>, MudzError> {
+        let has_compression = kind_has_domain_names(kind)
+            && rdata.windows(2).any(|w| w[0] & 0xC0 == 0xC0);
+
+        if !has_compression {
+            return Ok(rdata);
+        }
+
         match kind {
             DnsType::CNAME | DnsType::NS | DnsType::PTR => {
                 let mut off = rdata_offset;
@@ -214,7 +233,7 @@ impl DnsResourceRecord {
                 name.emit_to(&mut out);
                 Ok(out)
             }
-            _ => Ok(rdata.to_vec()),
+            _ => Ok(rdata),
         }
     }
 

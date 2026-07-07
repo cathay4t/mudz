@@ -8,20 +8,15 @@ use std::{
 
 use mudz::{DnsClass, DnsPacket, DnsResourceRecord, DnsType};
 
-/// Path to the hosts file
 const HOSTS_FILE: &str = "/etc/hosts";
 
-/// Parsed /etc/hosts entries
 #[derive(Clone)]
 pub(crate) struct HostsFile {
-    /// Map of domain -> list of IPv4 addresses
     a_records: HashMap<String, Vec<Ipv4Addr>>,
-    /// Map of domain -> list of IPv6 addresses
     aaaa_records: HashMap<String, Vec<Ipv6Addr>>,
 }
 
 impl HostsFile {
-    /// Parse /etc/hosts and return the parsed entries
     pub(crate) fn new() -> Self {
         let mut a_records: HashMap<String, Vec<Ipv4Addr>> = HashMap::new();
         let mut aaaa_records: HashMap<String, Vec<Ipv6Addr>> = HashMap::new();
@@ -46,18 +41,15 @@ impl HostsFile {
         }
     }
 
-    /// Parse a single line from /etc/hosts
     fn parse_line(
         line: &str,
         a_records: &mut HashMap<String, Vec<Ipv4Addr>>,
         aaaa_records: &mut HashMap<String, Vec<Ipv6Addr>>,
     ) {
-        // Strip inline comments
         let line = match line.split('#').next() {
             Some(content) => content.trim(),
             None => return,
         };
-        // Skip empty lines and comments
         if line.is_empty() {
             return;
         }
@@ -70,7 +62,6 @@ impl HostsFile {
         let addr_str = parts[0];
         let hostnames = &parts[1..];
 
-        // Try to parse as IPv4 or IPv6 address
         if let Ok(ipv4) = addr_str.parse::<Ipv4Addr>() {
             for hostname in hostnames {
                 a_records
@@ -89,46 +80,51 @@ impl HostsFile {
     }
 
     pub(crate) fn get(&self, packet: &DnsPacket) -> Option<DnsPacket> {
-        let query_type = packet.questions.first()?.kind;
-        let domain_obj = &packet.questions.first()?.domain;
-        let domain = packet.questions.first()?.domain.to_string();
-
-        let mut packet = packet.clone();
-
-        packet.header.set_response(true);
+        let question = packet.questions.first()?;
+        let query_type = question.kind;
+        let domain_obj = &question.domain;
+        let domain = question.domain.to_string();
 
         match query_type {
             DnsType::A => {
                 let ips = self.a_records.get(&domain)?;
-                packet.header.ancount = ips.len() as u16;
-                packet.answers = ips
-                    .iter()
-                    .map(|ip| DnsResourceRecord {
-                        domain: domain_obj.clone(),
-                        kind: DnsType::A,
-                        class: DnsClass::IN,
-                        ttl: 300,
-                        rdlength: (Ipv4Addr::BITS / 8) as u16,
-                        rdata: ip.octets().to_vec(),
-                    })
-                    .collect();
-                Some(packet)
+                Some(DnsPacket {
+                    header: packet.header.to_response(ips.len() as u16),
+                    questions: vec![question.clone()],
+                    answers: ips
+                        .iter()
+                        .map(|ip| DnsResourceRecord {
+                            domain: domain_obj.clone(),
+                            kind: DnsType::A,
+                            class: DnsClass::IN,
+                            ttl: 300,
+                            rdlength: (Ipv4Addr::BITS / 8) as u16,
+                            rdata: ip.octets().to_vec(),
+                        })
+                        .collect(),
+                    authorities: Vec::new(),
+                    additionals: Vec::new(),
+                })
             }
             DnsType::AAAA => {
                 let ips = self.aaaa_records.get(&domain)?;
-                packet.header.ancount = ips.len() as u16;
-                packet.answers = ips
-                    .iter()
-                    .map(|ip| DnsResourceRecord {
-                        domain: domain_obj.clone(),
-                        kind: DnsType::AAAA,
-                        class: DnsClass::IN,
-                        ttl: 300,
-                        rdlength: (Ipv6Addr::BITS / 8) as u16,
-                        rdata: ip.octets().to_vec(),
-                    })
-                    .collect();
-                Some(packet)
+                Some(DnsPacket {
+                    header: packet.header.to_response(ips.len() as u16),
+                    questions: vec![question.clone()],
+                    answers: ips
+                        .iter()
+                        .map(|ip| DnsResourceRecord {
+                            domain: domain_obj.clone(),
+                            kind: DnsType::AAAA,
+                            class: DnsClass::IN,
+                            ttl: 300,
+                            rdlength: (Ipv6Addr::BITS / 8) as u16,
+                            rdata: ip.octets().to_vec(),
+                        })
+                        .collect(),
+                    authorities: Vec::new(),
+                    additionals: Vec::new(),
+                })
             }
             _ => None,
         }

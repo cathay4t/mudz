@@ -1,9 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! DNS over HTTPS (DoH) client implementation per RFC 8484.
-//!
-//! This module provides `DohClient` which performs DNS queries over HTTPS
-//! using the GET method with base64url-encoded DNS wire format queries.
 
 use std::{
     collections::HashMap,
@@ -16,37 +13,21 @@ use data_encoding::BASE64URL_NOPAD;
 use mudz::{DnsPacket, DnsResponseCode, ErrorKind, MudzError};
 use reqwest::{Client, Url};
 
-/// Default query timeout: 5 seconds
 const DEFAULT_TIMEOUT_SEC: Duration = Duration::from_secs(5);
-/// DNS media type per RFC 8484
 const DNS_MEDIA_TYPE: &str = "application/dns-message";
 
-/// DNS over HTTPS client per RFC 8484.
-///
-/// This client performs DNS queries over HTTPS using the GET method.
-/// The DNS query is base64url-encoded (without padding) and passed as
-/// the `dns` query parameter.
 #[derive(Clone)]
 pub(crate) struct DohClient {
-    /// DoH server URL (e.g., "https://dns.google/dns-query")
-    server_url: String,
-    /// HTTP client
+    url_prefix: String,
     http_client: Client,
-    /// Query timeout
     timeout: std::time::Duration,
 }
 
 impl DohClient {
-    /// Create a new DoH client with a specific server URL.
-    ///
-    /// # Arguments
-    /// * `server_url` - DoH server URL (e.g., "https://dns.google/dns-query",
-    ///   "https://cloudflare-dns.com/dns-query")
     pub(crate) fn new(
         server_url: &str,
         cache: Arc<DohResolvCache>,
     ) -> Result<Self, MudzError> {
-        // Validate URL format
         if !server_url.starts_with("https://") {
             return Err(MudzError::new(
                 ErrorKind::InvalidConfig,
@@ -65,8 +46,14 @@ impl DohClient {
                 )
             })?;
 
+        let url_prefix = if server_url.contains('?') {
+            format!("{server_url}&dns=")
+        } else {
+            format!("{server_url}?dns=")
+        };
+
         Ok(Self {
-            server_url: server_url.to_string(),
+            url_prefix,
             http_client,
             timeout: DEFAULT_TIMEOUT_SEC,
         })
@@ -76,19 +63,16 @@ impl DohClient {
         &self,
         packet: &DnsPacket,
     ) -> Result<DnsPacket, MudzError> {
-        // Base64url-encode without padding (RFC 8484 Section 4.1)
         let dns_param = BASE64URL_NOPAD.encode(&packet.to_bytes());
 
-        // Build URL with dns query parameter
-        let mut url = Url::parse(&self.server_url).map_err(|e| {
+        let url = format!("{}{}", self.url_prefix, dns_param);
+        let url = Url::parse(&url).map_err(|e| {
             MudzError::new(
                 ErrorKind::InvalidConfig,
                 format!("Invalid DoH server URL: {e}"),
             )
         })?;
-        url.query_pairs_mut().append_pair("dns", &dns_param);
 
-        // Send HTTP GET request
         let response = self
             .http_client
             .get(url)
@@ -103,7 +87,6 @@ impl DohClient {
                 )
             })?;
 
-        // Check HTTP status - 2xx means success
         let status = response.status();
         if !status.is_success() {
             return Err(MudzError::new(
@@ -116,7 +99,6 @@ impl DohClient {
             ));
         }
 
-        // Read response body
         let response_bytes = response
             .bytes()
             .await
@@ -128,7 +110,6 @@ impl DohClient {
             })?
             .to_vec();
 
-        // Validate response size
         if response_bytes.len() > DnsPacket::MAX_DOH_PACKET_SIZE {
             return Err(MudzError::new(
                 ErrorKind::InvalidPacket,
@@ -142,10 +123,6 @@ impl DohClient {
 
         let packet = DnsPacket::parse(&response_bytes)?;
 
-        // Return the response even if it contains NxDomain or other non-error
-        // rcodes. NxDomain is a valid DNS response meaning "this domain
-        // doesn't exist" and should be passed through to the client.
-        // Only treat FormErr and ServFail as actual errors.
         match packet.header.rcode {
             DnsResponseCode::FormErr => {
                 return Err(MudzError::new(
@@ -159,8 +136,7 @@ impl DohClient {
                     "DNS server returned error code: ServFail",
                 ));
             }
-            _ => {} /* NoError, NxDomain, NotImp, Refused, Other are all
-                     * valid responses to pass through */
+            _ => {}
         }
 
         Ok(packet)

@@ -168,6 +168,20 @@ impl DnsHeader {
     pub fn set_response(&mut self, value: bool) {
         self.qr = value;
     }
+
+    pub fn to_response(&self, ancount: u16) -> Self {
+        Self {
+            id: self.id,
+            qr: true,
+            opcode: self.opcode,
+            rd: self.rd,
+            ra: true,
+            rcode: DnsResponseCode::NoError,
+            qdcount: 1,
+            ancount,
+            ..Default::default()
+        }
+    }
 }
 
 impl Default for DnsHeader {

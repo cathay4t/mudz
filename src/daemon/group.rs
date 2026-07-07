@@ -200,8 +200,8 @@ impl DnsGroup {
         }
 
         log::warn!(
-            "All upstream requests failed for group '{}', freeing \
-             connections for retry on next query",
+            "All upstream requests failed for group '{}', freeing connections \
+             for retry on next query",
             self.name
         );
         *self.conns.write().unwrap() = None;
@@ -281,10 +281,7 @@ impl DnsGroup {
             ));
         }
 
-        Ok(DnsGroupConnections {
-            sockets,
-            doh_conns,
-        })
+        Ok(DnsGroupConnections { sockets, doh_conns })
     }
 }
 
@@ -488,10 +485,7 @@ async fn send_request_and_wait_first_reply(
         socket.connect((*nameserver, 53)).await.map_err(|e| {
             MudzError::new(
                 ErrorKind::InvalidConfig,
-                format!(
-                    "Failed to connect to nameserver {}: {e}",
-                    nameserver
-                ),
+                format!("Failed to connect to nameserver {}: {e}", nameserver),
             )
         })?;
         sockets.push(socket);

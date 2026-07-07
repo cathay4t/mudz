@@ -12,11 +12,8 @@ use mudz::{DnsDomainName, DnsPacket, DnsResponseCode, DnsType};
 use tokio::{net::UdpSocket, sync::mpsc::UnboundedReceiver};
 
 use super::{
-    cache::DnsCacheStore,
-    config::MudzConfig,
-    group::DnsGroups,
-    host::HostsFile,
-    server::DnsQueryPacket,
+    cache::DnsCacheStore, config::MudzConfig, group::DnsGroups,
+    host::HostsFile, server::DnsQueryPacket,
 };
 
 pub(crate) struct DnsResolver;
@@ -33,24 +30,25 @@ impl DnsResolver {
             HashMap::new();
 
         let doh_config = config.doh.clone();
-        let groups = match DnsGroups::new(config, doh_config, hosts.clone())
-            .await
-        {
-            Ok(groups) => groups,
-            Err(e) => {
-                log::error!("Failed to initialize DNS groups: {e}");
-                return;
-            }
-        };
+        let groups =
+            match DnsGroups::new(config, doh_config, hosts.clone()).await {
+                Ok(groups) => groups,
+                Err(e) => {
+                    log::error!("Failed to initialize DNS groups: {e}");
+                    return;
+                }
+            };
 
         let mut futures = FuturesUnordered::new();
         loop {
-            log::debug!("Pending DNS reply count {}", futures.len());
+            if log::log_enabled!(log::Level::Debug) {
+                log::debug!("Pending DNS reply count {}", futures.len());
+            }
             if futures.is_empty() && !cli_index.is_empty() {
+                let count: usize = cli_index.values().map(|v| v.len()).sum();
                 log::debug!(
                     "All pending DNS queries failed to resolve, replying \
-                     SERVFAIL to remaining {} clients",
-                    cli_index.values().map(|v| v.len()).sum::<usize>()
+                     SERVFAIL to remaining {count} clients",
                 );
                 for ((domain, kind), cli_addrs) in cli_index.drain() {
                     let Ok(domain_obj) = DnsDomainName::from_str(&domain)
@@ -62,15 +60,17 @@ impl DnsResolver {
                         );
                         continue;
                     };
-                    let mut packet = DnsPacket::new_reply(
+                    let packet = DnsPacket::new_reply(
                         0,
                         DnsResponseCode::ServFail,
                         domain_obj,
                         kind,
                     );
+                    let reply_bytes = packet.to_bytes();
                     for (cli_addr, id) in cli_addrs {
-                        packet.header.id = id;
-                        reply(&socket, &packet, cli_addr).await;
+                        let mut buf = reply_bytes.clone();
+                        buf[0..2].copy_from_slice(&id.to_be_bytes());
+                        send_bytes(&socket, &buf, cli_addr).await;
                     }
                 }
             }
@@ -80,36 +80,37 @@ impl DnsResolver {
                         let packet = query_packet.packet;
                         let cli_addr = query_packet.cli_addr;
                         if let Some(reply_packet) = hosts.get(&packet) {
-                                reply(
-                                    &socket,
-                                    &reply_packet,
-                                    cli_addr,
+                                let reply_bytes = reply_packet.to_bytes();
+                                send_bytes(
+                                    &socket, &reply_bytes, cli_addr,
                                 ).await;
                                 continue;
                         } else if let Some(reply_packet) = cache.get(&packet) {
-                            reply(
-                                &socket,
-                                &reply_packet,
-                                cli_addr,
+                            let reply_bytes = reply_packet.to_bytes();
+                            send_bytes(
+                                &socket, &reply_bytes, cli_addr,
                             ).await;
                         } else {
-                            let Some(domain) = packet
-                                .first_question()
-                                .map(|q|q.domain.to_string()) else {continue};
-                            let Some(dns_type) = packet
-                                .first_question()
-                                .map(|q|q.kind) else {continue};
-                            log::debug!(
-                                "Received DNS query from {}",
-                                packet.display_brief()
-                            );
+                            let question = packet.first_question();
+                            let Some(question) = question else { continue };
+                            let domain = question.domain.to_string();
+                            let dns_type = question.kind;
                             let id = packet.header.id;
+
+                            if log::log_enabled!(log::Level::Debug) {
+                                log::debug!(
+                                    "Received DNS query from {}",
+                                    packet.display_brief()
+                                );
+                            }
                             match cli_index.entry((domain, dns_type)) {
                                 Entry::Occupied(pending) => {
-                                    log::debug!(
-                                        "Already has pending request for {}",
-                                        packet.display_brief()
-                                    );
+                                    if log::log_enabled!(log::Level::Debug) {
+                                        log::debug!(
+                                            "Already has pending request for {}",
+                                            packet.display_brief()
+                                        );
+                                    }
                                     pending.into_mut().push((cli_addr, id));
                                 }
                                 Entry::Vacant(vacant) => {
@@ -119,31 +120,30 @@ impl DnsResolver {
                             }
                         }
                     } else {
-                        // DNS query channel closed, shutting down
                         break;
                     }
                 }
                 Some(result) = futures.next() => {
                     if let Ok(reply_packet) = result {
-                        log::debug!(
-                            "Got DNS reply from upstream for {}",
-                            reply_packet.display_brief());
+                        if log::log_enabled!(log::Level::Debug) {
+                            log::debug!(
+                                "Got DNS reply from upstream for {}",
+                                reply_packet.display_brief());
+                        }
                         cache.insert(reply_packet.clone());
-                        let Some(domain) = reply_packet
-                            .first_question()
-                            .map(|q|q.domain.to_string()) else {continue};
-                        let Some(dns_type) = reply_packet
-                            .first_question()
-                            .map(|q|q.kind) else {continue};
+                        let question = reply_packet.first_question();
+                        let Some(question) = question else { continue };
+                        let domain = question.domain.to_string();
+                        let dns_type = question.kind;
                         let Some(cli_addrs) = cli_index
-                            .remove(&(domain, dns_type)) else {continue};
+                            .remove(&(domain, dns_type)) else { continue };
+
+                        let reply_bytes = reply_packet.to_bytes();
                         for (cli_addr, id) in cli_addrs {
-                            let mut packet = reply_packet.clone();
-                            packet.header.id = id;
-                            reply(
-                                &socket,
-                                &packet,
-                                cli_addr,
+                            let mut buf = reply_bytes.clone();
+                            buf[0..2].copy_from_slice(&id.to_be_bytes());
+                            send_bytes(
+                                &socket, &buf, cli_addr,
                             ).await;
                         }
                     }
@@ -156,13 +156,8 @@ impl DnsResolver {
     }
 }
 
-async fn reply(
-    socket: &Arc<UdpSocket>,
-    packet: &DnsPacket,
-    cli_addr: SocketAddr,
-) {
-    if let Err(e) = socket.send_to(&packet.to_bytes(), cli_addr).await {
+async fn send_bytes(socket: &Arc<UdpSocket>, buf: &[u8], cli_addr: SocketAddr) {
+    if let Err(e) = socket.send_to(buf, cli_addr).await {
         log::warn!("Failed to send DNS reply to {}: {e}", cli_addr);
     }
-    log::debug!("Sent DNS {}", packet.display_brief());
 }
