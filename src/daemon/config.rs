@@ -161,27 +161,6 @@ impl MudzConfig {
         Ok(())
     }
 
-    pub(crate) fn get_doh_hostnames(&self) -> Vec<String> {
-        let mut doh_hostnames = Vec::new();
-        for ns in &self.fallback.nameservers {
-            if ns.starts_with("https://")
-                && let Some(hostname) = extract_doh_hostname(ns)
-            {
-                doh_hostnames.push(hostname);
-            }
-        }
-        for group in self.groups.values() {
-            for ns in &group.nameservers {
-                if ns.starts_with("https://")
-                    && let Some(hostname) = extract_doh_hostname(ns)
-                {
-                    doh_hostnames.push(hostname);
-                }
-            }
-        }
-        doh_hostnames
-    }
-
     /// Validate that there are no duplicate group names in the raw TOML
     /// content. serde's HashMap silently overwrites duplicates, so we check
     /// before parsing.

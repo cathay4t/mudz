@@ -88,17 +88,6 @@ impl HostsFile {
         }
     }
 
-    pub(crate) fn get_ips(&self, hostname: &str) -> Vec<IpAddr> {
-        let mut ret = Vec::new();
-        if let Some(ips) = self.a_records.get(hostname) {
-            ret.extend(ips.iter().map(|ip| IpAddr::V4(*ip)));
-        }
-        if let Some(ips) = self.aaaa_records.get(hostname) {
-            ret.extend(ips.iter().map(|ip| IpAddr::V6(*ip)));
-        }
-        ret
-    }
-
     pub(crate) fn get(&self, packet: &DnsPacket) -> Option<DnsPacket> {
         let query_type = packet.questions.first()?.kind;
         let domain_obj = &packet.questions.first()?.domain;
@@ -143,5 +132,16 @@ impl HostsFile {
             }
             _ => None,
         }
+    }
+
+    pub(crate) fn lookup_ips(&self, domain: &str) -> Vec<IpAddr> {
+        let mut ips = Vec::new();
+        if let Some(ipv4s) = self.a_records.get(domain) {
+            ips.extend(ipv4s.iter().map(|&ip| IpAddr::V4(ip)));
+        }
+        if let Some(ipv6s) = self.aaaa_records.get(domain) {
+            ips.extend(ipv6s.iter().map(|&ip| IpAddr::V6(ip)));
+        }
+        ips
     }
 }

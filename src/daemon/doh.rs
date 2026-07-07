@@ -181,19 +181,6 @@ impl DohResolvCache {
     pub(crate) fn insert(&mut self, domain: &str, ips: Vec<IpAddr>) {
         self.store.insert(domain.to_string(), ips);
     }
-
-    pub(crate) fn is_empty(&self) -> bool {
-        self.store.is_empty()
-    }
-
-    pub(crate) fn log(&self) {
-        if !self.is_empty() {
-            log::debug!("DoH resolve cache:");
-            for (domain, ips) in &self.store {
-                log::debug!("  {}: {:?}", domain, ips);
-            }
-        }
-    }
 }
 
 impl reqwest::dns::Resolve for DohResolvCache {
