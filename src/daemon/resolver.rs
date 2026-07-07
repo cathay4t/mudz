@@ -80,13 +80,12 @@ impl DnsResolver {
                         let packet = query_packet.packet;
                         let cli_addr = query_packet.cli_addr;
                         if let Some(reply_packet) = hosts.get(&packet) {
-                                let reply_bytes = reply_packet.to_bytes();
-                                send_bytes(
-                                    &socket, &reply_bytes, cli_addr,
-                                ).await;
-                                continue;
-                        } else if let Some(reply_packet) = cache.get(&packet) {
                             let reply_bytes = reply_packet.to_bytes();
+                            send_bytes(
+                                &socket, &reply_bytes, cli_addr,
+                            ).await;
+                            continue;
+                        } else if let Some(reply_bytes) = cache.get(&packet) {
                             send_bytes(
                                 &socket, &reply_bytes, cli_addr,
                             ).await;
@@ -130,15 +129,16 @@ impl DnsResolver {
                                 "Got DNS reply from upstream for {}",
                                 reply_packet.display_brief());
                         }
-                        cache.insert(reply_packet.clone());
+                        let Some(reply_bytes) = cache.insert(&reply_packet)
+                        else {
+                            continue;
+                        };
                         let question = reply_packet.first_question();
                         let Some(question) = question else { continue };
                         let domain = question.domain.to_string();
                         let dns_type = question.kind;
                         let Some(cli_addrs) = cli_index
                             .remove(&(domain, dns_type)) else { continue };
-
-                        let reply_bytes = reply_packet.to_bytes();
                         for (cli_addr, id) in cli_addrs {
                             let mut buf = reply_bytes.clone();
                             buf[0..2].copy_from_slice(&id.to_be_bytes());

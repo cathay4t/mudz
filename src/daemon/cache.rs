@@ -13,9 +13,10 @@ const MAX_CACHE_TTL_SEC: u32 = 86400;
 pub(crate) type CacheKey = (String, DnsType);
 
 struct CacheEntry {
-    packet: DnsPacket,
+    raw_bytes: Vec<u8>,
     insertion_time: Instant,
     expires_at: Instant,
+    ttl_positions: Vec<(usize, u32)>,
 }
 
 pub(crate) struct DnsCacheStore {
@@ -76,12 +77,12 @@ impl DnsCacheStore {
         }
     }
 
-    pub(crate) fn get(&mut self, request: &DnsPacket) -> Option<DnsPacket> {
+    pub(crate) fn get(&mut self, request: &DnsPacket) -> Option<Vec<u8>> {
         let domain = request.questions.first().map(|q| q.domain.to_string())?;
         let kind = request.questions.first().map(|q| q.kind)?;
 
         let now = Instant::now();
-        let (cached_packet, elapsed) = {
+        let (mut bytes, ttl_positions, elapsed) = {
             let entry = self.entries.get(&(domain.clone(), kind))?;
             if entry.expires_at <= now {
                 if log::log_enabled!(log::Level::Debug) {
@@ -93,40 +94,35 @@ impl DnsCacheStore {
                 return None;
             }
             (
-                entry.packet.clone(),
+                entry.raw_bytes.clone(),
+                entry.ttl_positions.clone(),
                 now.saturating_duration_since(entry.insertion_time),
             )
         };
 
         self.touch_lru(&(domain, kind));
-        log::debug!("Cache hit for {}", request.display_brief());
-        let mut ret = cached_packet;
-        ret.header.id = request.header.id;
-        let ttl_sub = elapsed.as_secs() as u32;
-        for record in ret
-            .answers
-            .iter_mut()
-            .chain(ret.authorities.iter_mut())
-            .chain(ret.additionals.iter_mut())
-        {
-            record.ttl = record.ttl.saturating_sub(ttl_sub);
+        if log::log_enabled!(log::Level::Debug) {
+            log::debug!("Cache hit for {}", request.display_brief());
         }
-        Some(ret)
+
+        let ttl_sub = elapsed.as_secs() as u32;
+        for &(offset, orig_ttl) in &ttl_positions {
+            let new_ttl = orig_ttl.saturating_sub(ttl_sub);
+            bytes[offset..offset + 4].copy_from_slice(&new_ttl.to_be_bytes());
+        }
+
+        bytes[0..2].copy_from_slice(&request.header.id.to_be_bytes());
+
+        Some(bytes)
     }
 
-    pub(crate) fn insert(&mut self, response: DnsPacket) {
+    pub(crate) fn insert(&mut self, response: &DnsPacket) -> Option<Vec<u8>> {
         if self.entries.len() >= self.max_size {
             self.evict_expired();
             self.evict_lru();
         }
-        let Some(domain) =
-            response.first_question().map(|q| q.domain.to_string())
-        else {
-            return;
-        };
-        let Some(kind) = response.first_question().map(|q| q.kind) else {
-            return;
-        };
+        let domain = response.first_question().map(|q| q.domain.to_string())?;
+        let kind = response.first_question().map(|q| q.kind)?;
         let ttl_sec = response
             .first_record()
             .map(|q| q.ttl)
@@ -134,16 +130,22 @@ impl DnsCacheStore {
         let ttl_sec = ttl_sec.clamp(MIN_CACHE_TTL_SEC, MAX_CACHE_TTL_SEC);
 
         let now = Instant::now();
+        let mut ttl_positions = Vec::new();
+        let raw_bytes = response.to_bytes_with_ttls(Some(&mut ttl_positions));
+
         let key = (domain, kind);
         self.lru_order.push_front(key.clone());
         self.entries.insert(
             key,
             CacheEntry {
+                raw_bytes: raw_bytes.clone(),
                 insertion_time: now,
-                packet: response,
+                ttl_positions,
                 expires_at: now + Duration::from_secs(ttl_sec as u64),
             },
         );
+
+        Some(raw_bytes)
     }
 
     #[allow(dead_code)]

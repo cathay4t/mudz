@@ -238,9 +238,20 @@ impl DnsResourceRecord {
     }
 
     pub fn emit_to(&self, buf: &mut Vec<u8>) {
+        self.emit_to_with_ttl(buf, &mut None);
+    }
+
+    pub fn emit_to_with_ttl(
+        &self,
+        buf: &mut Vec<u8>,
+        ttl_positions: &mut Option<&mut Vec<(usize, u32)>>,
+    ) {
         self.domain.emit_to(buf);
         buf.extend_from_slice(&u16::from(self.kind).to_be_bytes());
         buf.extend_from_slice(&u16::from(self.class).to_be_bytes());
+        if let Some(positions) = ttl_positions {
+            positions.push((buf.len(), self.ttl));
+        }
         buf.extend_from_slice(&self.ttl.to_be_bytes());
         let rdlength = self.rdata.len() as u16;
         buf.extend_from_slice(&rdlength.to_be_bytes());

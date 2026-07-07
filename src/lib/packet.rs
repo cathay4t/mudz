@@ -174,6 +174,13 @@ impl DnsPacket {
     }
 
     pub fn to_bytes(&self) -> Vec<u8> {
+        self.to_bytes_with_ttls(None)
+    }
+
+    pub fn to_bytes_with_ttls(
+        &self,
+        mut ttl_positions: Option<&mut Vec<(usize, u32)>>,
+    ) -> Vec<u8> {
         let mut buf = self.header.to_bytes();
 
         for question in &self.questions {
@@ -181,15 +188,15 @@ impl DnsPacket {
         }
 
         for answer in &self.answers {
-            answer.emit_to(&mut buf);
+            answer.emit_to_with_ttl(&mut buf, &mut ttl_positions);
         }
 
         for authority in &self.authorities {
-            authority.emit_to(&mut buf);
+            authority.emit_to_with_ttl(&mut buf, &mut ttl_positions);
         }
 
         for additional in &self.additionals {
-            additional.emit_to(&mut buf);
+            additional.emit_to_with_ttl(&mut buf, &mut ttl_positions);
         }
 
         buf
