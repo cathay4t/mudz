@@ -232,10 +232,10 @@ pub(crate) fn extract_doh_hostname(url: &str) -> Option<String> {
     Some(hostname_without_port.to_lowercase())
 }
 
-/// Check if two domain patterns overlap (one equals the other or is a
-/// subdomain of the other)
+/// Check if two domain patterns overlap (one equals the other).
+/// Subdomain relationships are NOT considered overlaps — the runtime uses
+/// longest-suffix matching, so `www.example.com` in one group and
+/// `example.com` in another is unambiguous.
 fn domains_overlap(a: &str, b: &str) -> bool {
-    let a = a.to_lowercase();
-    let b = b.to_lowercase();
-    a == b || a.ends_with(&format!(".{b}")) || b.ends_with(&format!(".{a}"))
+    a.eq_ignore_ascii_case(b)
 }
