@@ -4,7 +4,7 @@ use std::{
     collections::HashMap,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     str::FromStr as _,
-    sync::{Arc, RwLock},
+    sync::Arc,
     time::Duration,
 };
 
@@ -13,7 +13,10 @@ use mudz::{
     DnsClass, DnsHeader, DnsPacket, DnsResourceRecord, DnsResponseCode,
     DnsType, ErrorKind, MudzError,
 };
-use tokio::net::UdpSocket;
+use tokio::{
+    net::UdpSocket,
+    sync::{mpsc, oneshot},
+};
 
 use super::{
     config::MudzConfig,
@@ -46,7 +49,8 @@ impl DnsGroups {
             config.fallback.disable_ipv6,
             doh_config.clone(),
             hosts.clone(),
-        );
+        )
+        .await?;
 
         let mut groups = HashMap::new();
         let mut search_index = HashMap::new();
@@ -57,7 +61,15 @@ impl DnsGroups {
                 group_config.disable_ipv6,
                 doh_config.clone(),
                 hosts.clone(),
-            );
+            )
+            .await
+            .map_err(|e| {
+                log::error!(
+                    "Failed to initialize DNS group '{}': {e}",
+                    group_name
+                );
+                e
+            })?;
             groups.insert(group_name.to_string(), dns_group);
 
             for domain in group_config.domains {
@@ -120,40 +132,176 @@ impl DnsGroups {
     }
 }
 
-struct DnsGroupConnections {
-    sockets: Vec<UdpSocket>,
-    doh_conns: Vec<DohClient>,
+/// A per-upstream-server UDP transport that fans out responses to the
+/// correct caller via a background recv loop and oneshot channels.
+struct DnsUdpTransport {
+    socket: Arc<UdpSocket>,
+    cmd_tx: mpsc::UnboundedSender<Command>,
+}
+
+enum Command {
+    Register {
+        /// (domain, query-type) key for matching responses
+        key: (String, DnsType),
+        reply: oneshot::Sender<DnsPacket>,
+    },
+}
+
+impl DnsUdpTransport {
+    async fn new(server_addr: &str) -> Result<Self, MudzError> {
+        let socket = Arc::new(create_udp_socket(server_addr).await?);
+        let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+
+        let recv_socket = socket.clone();
+        tokio::spawn(Self::recv_loop(recv_socket, cmd_rx));
+
+        Ok(Self { socket, cmd_tx })
+    }
+
+    async fn send_query(&self, bytes: &[u8]) -> Result<(), MudzError> {
+        self.socket.send(bytes).await.map_err(|e| {
+            MudzError::new(
+                ErrorKind::Bug,
+                format!("Failed to send DNS query via UDP: {e}"),
+            )
+        })?;
+        Ok(())
+    }
+
+    fn register(&self, key: (String, DnsType)) -> oneshot::Receiver<DnsPacket> {
+        let (tx, rx) = oneshot::channel();
+        // Unbounded send never fails; ignore error if the recv loop has
+        // already exited (the socket is dead).
+        let _ = self.cmd_tx.send(Command::Register { key, reply: tx });
+        rx
+    }
+
+    async fn recv_loop(
+        socket: Arc<UdpSocket>,
+        mut cmd_rx: mpsc::UnboundedReceiver<Command>,
+    ) {
+        // Map from (domain, query-type) to senders waiting for a response.
+        let mut pending: HashMap<
+            (String, DnsType),
+            Vec<oneshot::Sender<DnsPacket>>,
+        > = HashMap::new();
+        let mut recv_buf = [0u8; DnsPacket::MAX_UDP_EDNS_PACKET_SIZE];
+        let mut cleanup = tokio::time::interval(Duration::from_secs(30));
+
+        loop {
+            tokio::select! {
+                cmd = cmd_rx.recv() => {
+                    match cmd {
+                        Some(Command::Register { key, reply }) => {
+                            pending.entry(key).or_default().push(reply);
+                        }
+                        None => break, // all senders dropped, shut down
+                    }
+                }
+                result = socket.recv(&mut recv_buf) => {
+                    let len = match result {
+                        Ok(n) => n,
+                        Err(e) => {
+                            log::debug!("UDP recv error on upstream socket: {e}");
+                            break;
+                        }
+                    };
+                    match DnsPacket::parse(&recv_buf[..len]) {
+                        Ok(packet) => {
+                            if let Some(question) = packet.first_question() {
+                                let key = (
+                                    question.domain.to_string(),
+                                    question.kind,
+                                );
+                                if let Some(senders) = pending.remove(&key) {
+                                    for sender in senders {
+                                        let _ = sender.send(packet.clone());
+                                    }
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            log::debug!(
+                                "Failed to parse upstream DNS response: {e}"
+                            );
+                        }
+                    }
+                }
+                _ = cleanup.tick() => {
+                    pending.retain(|_, senders| {
+                        senders.retain(|s| !s.is_closed());
+                        !senders.is_empty()
+                    });
+                }
+            }
+        }
+    }
 }
 
 struct DnsGroup {
     name: String,
-    srvs: Vec<String>,
-    conns: RwLock<Option<Arc<DnsGroupConnections>>>,
+    udp_transports: Vec<Arc<DnsUdpTransport>>,
+    doh_clients: Vec<DohClient>,
     disable_ipv6: bool,
-    doh_config: Option<super::config::MudzDohConfig>,
-    hosts: Arc<HostsFile>,
 }
 
 impl DnsGroup {
-    fn new(
+    async fn new(
         name: String,
         srvs: Vec<String>,
         disable_ipv6: bool,
         doh_config: Option<super::config::MudzDohConfig>,
         hosts: Arc<HostsFile>,
-    ) -> Self {
-        Self {
-            name,
-            srvs,
-            conns: RwLock::new(None),
-            disable_ipv6,
-            doh_config,
-            hosts,
+    ) -> Result<Self, MudzError> {
+        let mut udp_transports = Vec::new();
+        let mut doh_clients = Vec::new();
+
+        for srv in &srvs {
+            if srv.starts_with("https://") {
+                match create_doh_client(srv, &doh_config, &hosts).await {
+                    Ok(client) => doh_clients.push(client),
+                    Err(e) => log::warn!(
+                        "Failed to create DoH client for '{}' in group '{}': \
+                         {e}",
+                        srv,
+                        name
+                    ),
+                }
+            } else {
+                match DnsUdpTransport::new(srv).await {
+                    Ok(transport) => {
+                        udp_transports.push(Arc::new(transport));
+                    }
+                    Err(e) => log::warn!(
+                        "Failed to create UDP transport for '{}' in group \
+                         '{}': {e}",
+                        srv,
+                        name
+                    ),
+                }
+            }
         }
+
+        if udp_transports.is_empty() && doh_clients.is_empty() {
+            return Err(MudzError::new(
+                ErrorKind::Bug,
+                format!(
+                    "Failed to create any upstream connections for group \
+                     '{name}'"
+                ),
+            ));
+        }
+
+        Ok(Self {
+            name,
+            udp_transports,
+            doh_clients,
+            disable_ipv6,
+        })
     }
 
     fn is_blocking(&self) -> bool {
-        self.srvs.is_empty()
+        self.udp_transports.is_empty() && self.doh_clients.is_empty()
     }
 
     async fn request(
@@ -171,117 +319,66 @@ impl DnsGroup {
             return Ok(make_ipv6_blocked_response(&request));
         }
 
-        let conns = self.get_or_init_conns_async().await?;
-
-        log::debug!("Sending DNS request to group '{}'", self.name);
-        for socket in &conns.sockets {
-            if let Err(e) = socket.send(&request.to_bytes()).await {
-                log::debug!("Error sending DNS request to socket: {e}");
-            }
-        }
+        let question = request.first_question().ok_or_else(|| {
+            MudzError::new(
+                ErrorKind::InvalidArgument,
+                "DNS request has no question section",
+            )
+        })?;
+        let key = (question.domain.to_string(), question.kind);
+        let query_bytes = request.to_bytes();
 
         let mut futures = FuturesUnordered::new();
-        for socket in &conns.sockets {
-            futures.push(Either::Left(get_socket_reply(socket)));
+
+        // Send to all UDP transports, register for response dispatch
+        for transport in &self.udp_transports {
+            if let Err(e) = transport.send_query(&query_bytes).await {
+                log::debug!(
+                    "Error sending DNS query to group '{}': {e}",
+                    self.name
+                );
+                continue;
+            }
+            let rx = transport.register(key.clone());
+            let udp_future = async move {
+                rx.await.map_err(|_| {
+                    MudzError::new(
+                        ErrorKind::Timeout,
+                        "UDP response channel closed",
+                    )
+                })
+            };
+            futures.push(Either::Left(udp_future));
         }
-        for doh_conn in &conns.doh_conns {
-            futures.push(Either::Right(doh_conn.request(&request)));
+
+        // Send to all DoH clients
+        for doh_client in &self.doh_clients {
+            futures.push(Either::Right(doh_client.request(&request)));
+        }
+
+        if futures.is_empty() {
+            return Err(MudzError::new(
+                ErrorKind::Bug,
+                format!(
+                    "No upstream connections available for group '{}'",
+                    self.name
+                ),
+            ));
         }
 
         while let Some(result) = futures.next().await {
             match result {
-                Ok(response) => {
-                    return Ok(response);
-                }
+                Ok(response) => return Ok(response),
                 Err(e) => {
                     log::debug!("Error processing DNS response: {e}");
                 }
             }
         }
 
-        log::warn!(
-            "All upstream requests failed for group '{}', freeing connections \
-             for retry on next query",
-            self.name
-        );
-        *self.conns.write().unwrap() = None;
-        tokio::time::sleep(Duration::from_secs(1)).await;
         Err(MudzError::new(
-            ErrorKind::InvalidPacket,
-            "All DNS requests failed or returned invalid responses",
+            ErrorKind::Timeout,
+            "All upstream DNS requests failed or timed out",
         ))
-    }
-
-    async fn get_or_init_conns_async(
-        &self,
-    ) -> Result<Arc<DnsGroupConnections>, MudzError> {
-        // Check again under lock
-        if let Some(conns) = self.conns.read().unwrap().as_ref() {
-            return Ok(Arc::clone(conns));
-        }
-
-        // Create connections (I/O, no lock held)
-        let new_conns = self.create_connections().await?;
-        let new_arc = Arc::new(new_conns);
-
-        // Store (lock held for ~ns)
-        let mut guard = self.conns.write().unwrap();
-        match &*guard {
-            Some(existing) => {
-                // Race: another request initialized while we were creating.
-                // Use the existing connections, drop ours.
-                Ok(Arc::clone(existing))
-            }
-            None => {
-                *guard = Some(Arc::clone(&new_arc));
-                Ok(new_arc)
-            }
-        }
-    }
-
-    async fn create_connections(
-        &self,
-    ) -> Result<DnsGroupConnections, MudzError> {
-        let mut sockets = Vec::new();
-        let mut doh_conns = Vec::new();
-
-        for srv in &self.srvs {
-            if srv.starts_with("https://") {
-                match create_doh_client(srv, &self.doh_config, &self.hosts)
-                    .await
-                {
-                    Ok(client) => doh_conns.push(client),
-                    Err(e) => log::warn!(
-                        "Failed to create DoH client for '{}' in group '{}': \
-                         {e}",
-                        srv,
-                        self.name
-                    ),
-                }
-            } else {
-                match create_udp_socket(srv).await {
-                    Ok(socket) => sockets.push(socket),
-                    Err(e) => log::warn!(
-                        "Failed to create UDP socket for '{}' in group '{}': \
-                         {e}",
-                        srv,
-                        self.name
-                    ),
-                }
-            }
-        }
-
-        if sockets.is_empty() && doh_conns.is_empty() {
-            return Err(MudzError::new(
-                ErrorKind::Bug,
-                format!(
-                    "Failed to create any upstream connections for group '{}'",
-                    self.name
-                ),
-            ));
-        }
-
-        Ok(DnsGroupConnections { sockets, doh_conns })
     }
 }
 
@@ -574,20 +671,4 @@ async fn get_udp_dns_reply(socket: &UdpSocket) -> Result<DnsPacket, MudzError> {
     }
 }
 
-async fn get_socket_reply(socket: &UdpSocket) -> Result<DnsPacket, MudzError> {
-    let mut buf = [0u8; DnsPacket::MAX_UDP_EDNS_PACKET_SIZE];
-    match tokio::time::timeout(DNS_TIMEOUT_SEC, socket.recv(&mut buf)).await {
-        Ok(Ok(len)) => {
-            let packet = DnsPacket::parse(&buf[..len])?;
-            Ok(packet)
-        }
-        Ok(Err(e)) => Err(MudzError::new(
-            ErrorKind::Bug,
-            format!("Error receiving DNS response from socket: {e}"),
-        )),
-        Err(_) => Err(MudzError::new(
-            ErrorKind::Timeout,
-            "Timed out waiting for DNS response from socket",
-        )),
-    }
-}
+
