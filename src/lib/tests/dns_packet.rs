@@ -1,8 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 
+use std::str::FromStr;
+
 use mudz::{
-    DnsClass, DnsDomainName, DnsHeader, DnsPacket, DnsResponseCode, DnsType,
-    ErrorKind,
+    DnsClass, DnsDomainName, DnsHeader, DnsPacket, DnsQuestion,
+    DnsResourceRecord, DnsResponseCode, DnsType, ErrorKind,
 };
 
 #[test]
@@ -652,4 +654,128 @@ fn test_has_edns() {
     let packet =
         DnsPacket::parse(&plain_packet).expect("Failed to parse plain packet");
     assert!(!packet.has_edns());
+}
+
+/// Build an A response for example.com carrying a single OPT pseudo-record
+/// whose DO bit is controlled by `do_bit`.
+fn edns_response(do_bit: bool) -> DnsPacket {
+    let domain = DnsDomainName::from_str("example.com").unwrap();
+    let opt_ttl: u32 = if do_bit { 0x0000_8000 } else { 0 };
+    DnsPacket {
+        header: DnsHeader {
+            id: 0x1234,
+            qr: true,
+            rcode: DnsResponseCode::NoError,
+            qdcount: 1,
+            ancount: 1,
+            arcount: 1,
+            ..Default::default()
+        },
+        questions: vec![DnsQuestion {
+            domain: domain.clone(),
+            kind: DnsType::A,
+            class: DnsClass::IN,
+        }],
+        answers: vec![DnsResourceRecord {
+            domain: domain.clone(),
+            kind: DnsType::A,
+            class: DnsClass::IN,
+            ttl: 300,
+            rdlength: 4,
+            rdata: vec![1, 2, 3, 4],
+        }],
+        authorities: Vec::new(),
+        additionals: vec![DnsResourceRecord {
+            domain: DnsDomainName::default(),
+            kind: DnsType::Other(41),
+            class: DnsClass::Other(1232),
+            ttl: opt_ttl,
+            rdlength: 0,
+            rdata: Vec::new(),
+        }],
+    }
+}
+
+#[test]
+fn test_to_bytes_without_opt_strips_opt() {
+    let packet = edns_response(true);
+    assert!(packet.has_edns());
+
+    let mut positions = Vec::new();
+    let bytes = packet.to_bytes_without_opt(Some(&mut positions));
+
+    // The OPT record is gone: ARCOUNT drops from 1 to 0.
+    let reparsed = DnsPacket::parse(&bytes).expect("reparse neutral bytes");
+    assert_eq!(reparsed.header.arcount, 0);
+    assert!(reparsed.additionals.is_empty());
+    assert!(!reparsed.has_edns());
+    // The A answer survives intact.
+    assert_eq!(reparsed.answers.len(), 1);
+    assert_eq!(reparsed.answers[0].ttl, 300);
+    assert_eq!(reparsed.answers[0].rdata, vec![1, 2, 3, 4]);
+    // Only the A record's TTL is tracked for decrement, not the OPT's.
+    assert_eq!(positions.len(), 1);
+    assert_eq!(positions[0].1, 300);
+}
+
+#[test]
+fn test_append_opt_ack() {
+    let mut bytes = edns_response(false).to_bytes_without_opt(None);
+    // Sanity: the neutral response carries no OPT record.
+    assert_eq!(DnsPacket::parse(&bytes).unwrap().header.arcount, 0);
+
+    DnsPacket::append_opt_ack(&mut bytes, 4096, true);
+
+    let reparsed = DnsPacket::parse(&bytes).expect("reparse with OPT ack");
+    assert_eq!(reparsed.header.arcount, 1);
+    assert!(reparsed.has_edns());
+    assert!(reparsed.dnssec_ok());
+    assert_eq!(reparsed.edns_udp_payload_size(), Some(4096));
+    let opt = reparsed.opt_record().unwrap();
+    assert_eq!(opt.kind, DnsType::Other(41));
+    assert_eq!(opt.domain.labels.len(), 0); // root NAME
+    assert!(opt.rdata.is_empty());
+    // The A answer is untouched by the append.
+    assert_eq!(reparsed.answers.len(), 1);
+    assert_eq!(reparsed.answers[0].rdata, vec![1, 2, 3, 4]);
+}
+
+#[test]
+fn test_dnssec_ok_and_udp_size_accessors() {
+    let with_do = edns_response(true);
+    assert!(with_do.dnssec_ok());
+    assert_eq!(with_do.edns_udp_payload_size(), Some(1232));
+
+    let without_do = edns_response(false);
+    assert!(!without_do.dnssec_ok());
+    assert_eq!(without_do.edns_udp_payload_size(), Some(1232));
+
+    // No OPT record at all -> DO false and no payload size.
+    let mut no_opt = edns_response(false);
+    no_opt.additionals.clear();
+    assert!(!no_opt.has_edns());
+    assert!(!no_opt.dnssec_ok());
+    assert_eq!(no_opt.edns_udp_payload_size(), None);
+}
+
+#[test]
+fn test_add_opt_record() {
+    let mut query =
+        DnsPacket::new_query("example.com", DnsType::A).expect("build query");
+    assert!(!query.has_edns());
+    let arcount_before = query.header.arcount;
+
+    query.add_opt_record(1232, true);
+
+    assert!(query.has_edns());
+    assert!(query.dnssec_ok());
+    assert_eq!(query.edns_udp_payload_size(), Some(1232));
+    assert_eq!(query.header.arcount, arcount_before + 1);
+
+    // The OPT record survives a serialization round-trip.
+    let reparsed =
+        DnsPacket::parse(&query.to_bytes()).expect("reparse EDNS query");
+    assert!(reparsed.has_edns());
+    assert!(reparsed.dnssec_ok());
+    assert_eq!(reparsed.edns_udp_payload_size(), Some(1232));
 }

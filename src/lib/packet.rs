@@ -202,6 +202,43 @@ impl DnsPacket {
         buf
     }
 
+    /// Serialize this packet omitting any EDNS(0) OPT pseudo-records, with
+    /// the header ARCOUNT adjusted accordingly. RFC 6891 §6.2.1 mandates
+    /// that OPT records MUST NOT be cached, so this is the form stored in
+    /// the cache. TTL byte offsets are recorded in `ttl_positions` for later
+    /// in-place decrement (OPT records, having no real TTL, are excluded).
+    pub fn to_bytes_without_opt(
+        &self,
+        mut ttl_positions: Option<&mut Vec<(usize, u32)>>,
+    ) -> Vec<u8> {
+        let opt_count = self
+            .additionals
+            .iter()
+            .filter(|r| u16::from(r.kind) == 41)
+            .count() as u16;
+        let mut header = self.header.clone();
+        header.arcount = header.arcount.saturating_sub(opt_count);
+        let mut buf = header.to_bytes();
+
+        for question in &self.questions {
+            question.emit_to(&mut buf);
+        }
+        for answer in &self.answers {
+            answer.emit_to_with_ttl(&mut buf, &mut ttl_positions);
+        }
+        for authority in &self.authorities {
+            authority.emit_to_with_ttl(&mut buf, &mut ttl_positions);
+        }
+        for additional in &self.additionals {
+            if u16::from(additional.kind) == 41 {
+                continue;
+            }
+            additional.emit_to_with_ttl(&mut buf, &mut ttl_positions);
+        }
+
+        buf
+    }
+
     pub fn is_query(&self) -> bool {
         self.header.is_query()
     }
@@ -218,10 +255,69 @@ impl DnsPacket {
         self.questions.first()
     }
 
+    /// The EDNS(0) OPT pseudo-record (RFC 6891, type 41) from the additional
+    /// section, if present.
+    pub fn opt_record(&self) -> Option<&DnsResourceRecord> {
+        self.additionals.iter().find(|r| u16::from(r.kind) == 41)
+    }
+
     /// Whether the packet contains an EDNS OPT record (type 41) in the
     /// additional section.
     pub fn has_edns(&self) -> bool {
-        self.additionals.iter().any(|r| u16::from(r.kind) == 41)
+        self.opt_record().is_some()
+    }
+
+    /// The DNSSEC OK (DO) bit from the OPT record's flags (RFC 6891 §6.1.4,
+    /// RFC 3225). False when no OPT record is present.
+    pub fn dnssec_ok(&self) -> bool {
+        self.opt_record().is_some_and(|r| r.ttl & 0x0000_8000 != 0)
+    }
+
+    /// The UDP payload size advertised in the OPT record's CLASS field
+    /// (RFC 6891 §6.1.2), or None when no OPT record is present.
+    pub fn edns_udp_payload_size(&self) -> Option<u16> {
+        self.opt_record().map(|r| u16::from(r.class))
+    }
+
+    /// Append an EDNS(0) OPT pseudo-record (RFC 6891) to a serialized DNS
+    /// message and bump the header ARCOUNT. Used to acknowledge an EDNS
+    /// client when replaying a cached response that was stored without its
+    /// OPT record (RFC 6891 §6.1.1: a response to an EDNS query MUST carry
+    /// an OPT record). The OPT TTL field carries EXTENDED-RCODE=0, VERSION=0,
+    /// the supplied DO bit, and Z=0; no EDNS options are emitted.
+    pub fn append_opt_ack(
+        buf: &mut Vec<u8>,
+        udp_payload_size: u16,
+        dnssec_ok: bool,
+    ) {
+        buf.push(0x00); // NAME: root
+        buf.extend_from_slice(&u16::from(DnsType::Other(41)).to_be_bytes());
+        buf.extend_from_slice(&udp_payload_size.to_be_bytes()); // CLASS
+        let flags: u32 = if dnssec_ok { 0x0000_8000 } else { 0 };
+        buf.extend_from_slice(&flags.to_be_bytes()); // TTL: ext-RCODE|VER|DO|Z
+        buf.extend_from_slice(&0u16.to_be_bytes()); // RDLENGTH: no options
+        if buf.len() >= DnsHeader::LEN {
+            let arcount =
+                u16::from_be_bytes([buf[10], buf[11]]).saturating_add(1);
+            buf[10..12].copy_from_slice(&arcount.to_be_bytes());
+        }
+    }
+
+    /// Append an EDNS(0) OPT pseudo-record (RFC 6891) to this packet's
+    /// additional section and bump ARCOUNT. Used to turn a plain query into
+    /// an EDNS query. `udp_payload_size` is advertised in the OPT CLASS field
+    /// and `dnssec_ok` sets the DO flag (RFC 3225).
+    pub fn add_opt_record(&mut self, udp_payload_size: u16, dnssec_ok: bool) {
+        let ttl: u32 = if dnssec_ok { 0x0000_8000 } else { 0 };
+        self.additionals.push(DnsResourceRecord {
+            domain: DnsDomainName::default(),
+            kind: DnsType::Other(41),
+            class: DnsClass::Other(udp_payload_size),
+            ttl,
+            rdlength: 0,
+            rdata: Vec::new(),
+        });
+        self.header.arcount = self.header.arcount.saturating_add(1);
     }
 
     pub fn domain_name(&self) -> Option<String> {

@@ -51,6 +51,22 @@ impl DnsUdpServer {
     }
 
     pub(crate) async fn run(&self) -> Result<(), MudzError> {
+        self.run_with_shutdown(async {
+            let _ = tokio::signal::ctrl_c().await;
+        })
+        .await
+    }
+
+    /// Run the server until a spawned task exits or `shutdown` resolves.
+    /// [`Self::run`] wires `shutdown` to Ctrl-C; tests supply their own signal
+    /// so they can stop the server deterministically.
+    pub(crate) async fn run_with_shutdown<F>(
+        &self,
+        shutdown: F,
+    ) -> Result<(), MudzError>
+    where
+        F: std::future::Future<Output = ()>,
+    {
         let (sender, receiver) = mpsc::unbounded_channel::<DnsQueryPacket>();
 
         let socket = self.socket.clone();
@@ -82,7 +98,7 @@ impl DnsUdpServer {
                     ),
                 }
             }
-            _ = tokio::signal::ctrl_c() => {
+            _ = shutdown => {
                 log::info!("Received shutdown signal");
             }
         }

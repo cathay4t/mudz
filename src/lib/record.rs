@@ -257,7 +257,12 @@ impl DnsResourceRecord {
         self.domain.emit_to(buf);
         buf.extend_from_slice(&u16::from(self.kind).to_be_bytes());
         buf.extend_from_slice(&u16::from(self.class).to_be_bytes());
-        if let Some(positions) = ttl_positions {
+        // The OPT pseudo-record (RFC 6891, type 41) reuses the TTL field to
+        // carry the extended RCODE, version, and flags (including the DNSSEC
+        // DO bit), so it is not a real TTL and must never be decremented.
+        if let Some(positions) = ttl_positions
+            && u16::from(self.kind) != 41
+        {
             positions.push((buf.len(), self.ttl));
         }
         buf.extend_from_slice(&self.ttl.to_be_bytes());

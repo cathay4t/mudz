@@ -10,7 +10,11 @@ use mudz::{DnsClass, DnsPacket, DnsType};
 const MIN_CACHE_TTL_SEC: u32 = 5;
 const MAX_CACHE_TTL_SEC: u32 = 86400;
 
-pub(crate) type CacheKey = (String, DnsType, DnsClass);
+/// Cache key: (domain, query-type, query-class, DNSSEC-OK bit). The DO bit
+/// is part of the key because a DO=1 response may carry RRSIGs that a DO=0
+/// client never asked for (and a DO=0 response lacks them for a validator),
+/// so the two flavours must not share an entry.
+pub(crate) type CacheKey = (String, DnsType, DnsClass, bool);
 
 struct CacheEntry {
     raw_bytes: Vec<u8>,
@@ -64,7 +68,7 @@ impl DnsCacheStore {
             return;
         }
         log::debug!("Cache dump:");
-        for ((domain, kind, class), entry) in &self.entries {
+        for ((domain, kind, class, _dnssec_ok), entry) in &self.entries {
             log::debug!(
                 "  {} {}, {:?} (expires in {}s)",
                 domain,
@@ -79,10 +83,13 @@ impl DnsCacheStore {
     }
 
     pub(crate) fn get(&mut self, request: &DnsPacket) -> Option<Vec<u8>> {
-        let domain = request.questions.first().map(|q| q.domain.to_string())?;
-        let kind = request.questions.first().map(|q| q.kind)?;
-        let class = request.questions.first().map(|q| q.class)?;
-        let key = (domain, kind, class);
+        let question = request.questions.first()?;
+        let key = (
+            question.domain.to_string(),
+            question.kind,
+            question.class,
+            request.dnssec_ok(),
+        );
         let now = Instant::now();
 
         let expires_at = self.entries.get(&key)?.expires_at;
@@ -118,14 +125,16 @@ impl DnsCacheStore {
         Some(bytes)
     }
 
-    pub(crate) fn insert(&mut self, response: &DnsPacket) -> Option<Vec<u8>> {
+    pub(crate) fn insert(
+        &mut self,
+        response: &DnsPacket,
+        dnssec_ok: bool,
+    ) -> Option<Vec<u8>> {
         if self.entries.len() >= self.max_size {
             self.evict_expired();
             self.evict_lru();
         }
-        let domain = response.first_question().map(|q| q.domain.to_string())?;
-        let kind = response.first_question().map(|q| q.kind)?;
-        let class = response.first_question().map(|q| q.class)?;
+        let question = response.first_question()?;
         let ttl_sec = response
             .answers
             .iter()
@@ -139,9 +148,16 @@ impl DnsCacheStore {
 
         let now = Instant::now();
         let mut ttl_positions = Vec::new();
-        let raw_bytes = response.to_bytes_with_ttls(Some(&mut ttl_positions));
+        // Store the response without any OPT record (RFC 6891 §6.2.1); the
+        // resolver synthesizes a per-client OPT ack on the way out.
+        let raw_bytes = response.to_bytes_without_opt(Some(&mut ttl_positions));
 
-        let key = (domain, kind, class);
+        let key = (
+            question.domain.to_string(),
+            question.kind,
+            question.class,
+            dnssec_ok,
+        );
         self.lru_order.push_front(key.clone());
         self.entries.insert(
             key,

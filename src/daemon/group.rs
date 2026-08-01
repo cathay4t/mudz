@@ -167,7 +167,12 @@ struct DnsUdpTransport {
     pending: Arc<Mutex<PendingMap>>,
 }
 
-type PendingKey = (String, DnsType, DnsClass);
+/// Key for matching an upstream UDP response to its waiter: the question's
+/// (domain, type, class) plus the DNS transaction ID. The ID — echoed by every
+/// compliant response (RFC 1035 §4.1.1) — disambiguates concurrent in-flight
+/// queries for the same name/type/class (e.g. a DO=0 and a DO=1 resolution),
+/// so they are never cross-delivered.
+type PendingKey = (String, DnsType, DnsClass, u16);
 type PendingMap = HashMap<PendingKey, Vec<oneshot::Sender<DnsPacket>>>;
 
 impl DnsUdpTransport {
@@ -234,6 +239,7 @@ impl DnsUdpTransport {
                                     question.domain.to_string(),
                                     question.kind,
                                     question.class,
+                                    packet.header.id,
                                 );
                                 let senders = pending
                                     .lock()
@@ -476,7 +482,12 @@ impl DnsGroup {
                 "DNS request has no question section",
             )
         })?;
-        let key = (question.domain.to_string(), question.kind, question.class);
+        let key = (
+            question.domain.to_string(),
+            question.kind,
+            question.class,
+            request.header.id,
+        );
         let query_bytes = request.to_bytes();
 
         let state = self.state.read().await;

@@ -16,9 +16,17 @@ use super::{
     host::HostsFile, server::DnsQueryPacket,
 };
 
-/// Pending client: (address, transaction ID, RD flag).
-type PendingClient = (SocketAddr, u16, bool);
-type CliIndexKey = (String, DnsType, DnsClass);
+/// Pending client: (address, transaction ID, RD flag, query carried EDNS).
+type PendingClient = (SocketAddr, u16, bool, bool);
+/// (domain, query-type, query-class, DNSSEC-OK bit). The DO bit is part of
+/// the key so DO=0 and DO=1 resolutions stay separate (see `CacheKey`).
+type CliIndexKey = (String, DnsType, DnsClass, bool);
+
+/// UDP payload size advertised in synthesized OPT acks (RFC 6891 §6.2.4).
+/// Matches the listener's receive buffer so we never promise more than we can
+/// deliver over UDP.
+const EDNS_RESPONDER_PAYLOAD_SIZE: u16 =
+    DnsPacket::MAX_UDP_EDNS_PACKET_SIZE as u16;
 
 pub(crate) struct DnsResolver;
 
@@ -54,7 +62,9 @@ impl DnsResolver {
                     "All pending DNS queries failed to resolve, replying \
                      SERVFAIL to remaining {count} clients",
                 );
-                for ((domain, kind, class), cli_addrs) in cli_index.drain() {
+                for ((domain, kind, class, dnssec_ok), cli_addrs) in
+                    cli_index.drain()
+                {
                     let Ok(domain_obj) = DnsDomainName::from_str(&domain)
                     else {
                         log::warn!(
@@ -72,11 +82,11 @@ impl DnsResolver {
                         class,
                         true,
                     );
-                    let reply_bytes = packet.to_bytes();
-                    for (cli_addr, id, rd) in cli_addrs {
-                        let mut buf = reply_bytes.clone();
-                        buf[0..2].copy_from_slice(&id.to_be_bytes());
-                        set_rd_bit(&mut buf, rd);
+                    let neutral = packet.to_bytes();
+                    for (cli_addr, id, rd, has_edns) in cli_addrs {
+                        let buf = build_client_reply(
+                            &neutral, id, rd, has_edns, dnssec_ok,
+                        );
                         send_bytes(&socket, &buf, cli_addr).await;
                     }
                 }
@@ -87,10 +97,15 @@ impl DnsResolver {
                         let packet = query_packet.packet;
                         let cli_addr = query_packet.cli_addr;
                         if let Some(reply_packet) = hosts.get(&packet) {
-                            let reply_bytes = reply_packet.to_bytes();
-                            send_bytes(
-                                &socket, &reply_bytes, cli_addr,
-                            ).await;
+                            let neutral = reply_packet.to_bytes();
+                            let buf = build_client_reply(
+                                &neutral,
+                                packet.header.id,
+                                packet.header.rd,
+                                packet.has_edns(),
+                                packet.dnssec_ok(),
+                            );
+                            send_bytes(&socket, &buf, cli_addr).await;
                             continue;
                         }
 
@@ -102,13 +117,13 @@ impl DnsResolver {
                         let id = packet.header.id;
                         let rd = packet.header.rd;
                         let has_edns = packet.has_edns();
+                        let dnssec_ok = packet.dnssec_ok();
 
-                        if !has_edns
-                            && let Some(reply_bytes) = cache.get(&packet)
-                        {
-                            send_bytes(
-                                &socket, &reply_bytes, cli_addr,
-                            ).await;
+                        if let Some(neutral) = cache.get(&packet) {
+                            let buf = build_client_reply(
+                                &neutral, id, rd, has_edns, dnssec_ok,
+                            );
+                            send_bytes(&socket, &buf, cli_addr).await;
                             continue;
                         }
 
@@ -119,9 +134,12 @@ impl DnsResolver {
                             );
                         }
                         let domain_key = domain.clone();
-                        match cli_index
-                            .entry((domain_key, dns_type, dns_class))
-                        {
+                        match cli_index.entry((
+                            domain_key,
+                            dns_type,
+                            dns_class,
+                            dnssec_ok,
+                        )) {
                             Entry::Occupied(pending) => {
                                 if log::log_enabled!(log::Level::Debug) {
                                     log::debug!(
@@ -129,22 +147,26 @@ impl DnsResolver {
                                         packet.display_brief()
                                     );
                                 }
-                                pending.into_mut().push((cli_addr, id, rd));
+                                pending
+                                    .into_mut()
+                                    .push((cli_addr, id, rd, has_edns));
                             }
                             Entry::Vacant(vacant) => {
-                                vacant.insert(vec![(cli_addr, id, rd)]);
+                                vacant.insert(vec![(
+                                    cli_addr, id, rd, has_edns,
+                                )]);
                                 let groups = Arc::clone(&groups);
                                 futures.push(async move {
                                     match groups.request(packet).await {
                                         Ok(reply) => (domain,
                                                       dns_type,
                                                       dns_class,
-                                                      has_edns,
+                                                      dnssec_ok,
                                                       Ok(reply)),
                                         Err(e) => (domain,
                                                    dns_type,
                                                    dns_class,
-                                                   has_edns,
+                                                   dnssec_ok,
                                                    Err(e)),
                                     }
                                 });
@@ -154,7 +176,7 @@ impl DnsResolver {
                         break;
                     }
                 }
-                Some((domain, dns_type, dns_class, has_edns, result)) =
+                Some((domain, dns_type, dns_class, dnssec_ok, result)) =
                     futures.next() =>
                 {
                     let reply_packet = match result {
@@ -203,13 +225,14 @@ impl DnsResolver {
                                  invalid format",
                                 domain,
                             );
-                            let _ = cli_index
-                                .remove(&(domain, dns_type, dns_class));
+                            let _ = cli_index.remove(&(
+                                domain, dns_type, dns_class, dnssec_ok,
+                            ));
                             continue;
                         };
-                        let Some(cli_addrs) = cli_index
-                            .remove(&(domain, dns_type, dns_class))
-                        else {
+                        let Some(cli_addrs) = cli_index.remove(&(
+                            domain, dns_type, dns_class, dnssec_ok,
+                        )) else {
                             continue;
                         };
                         let packet = DnsPacket::new_reply(
@@ -220,44 +243,38 @@ impl DnsResolver {
                             dns_class,
                             true,
                         );
-                        let reply_bytes = packet.to_bytes();
-                        for (cli_addr, id, rd) in cli_addrs {
-                            let mut buf = reply_bytes.clone();
-                            buf[0..2].copy_from_slice(&id.to_be_bytes());
-                            set_rd_bit(&mut buf, rd);
+                        let neutral = packet.to_bytes();
+                        for (cli_addr, id, rd, has_edns) in cli_addrs {
+                            let buf = build_client_reply(
+                                &neutral, id, rd, has_edns, dnssec_ok,
+                            );
                             send_bytes(&socket, &buf, cli_addr).await;
                         }
                         continue;
                     };
 
-                    let reply_bytes = if has_edns {
-                        reply_packet.to_bytes()
-                    } else {
-                        match cache.insert(&reply_packet)
-                        {
-                            Some(bytes) => bytes,
-                            None => {
-                                log::debug!(
-                                    "Cache insert failed for {}, \
-                                     forwarding without caching",
-                                    reply_packet.display_brief(),
-                                );
-                                reply_packet.to_bytes()
-                            }
+                    let neutral = match cache.insert(&reply_packet, dnssec_ok)
+                    {
+                        Some(bytes) => bytes,
+                        None => {
+                            log::debug!(
+                                "Cache insert failed for {}, \
+                                 forwarding without caching",
+                                reply_packet.display_brief(),
+                            );
+                            reply_packet.to_bytes_without_opt(None)
                         }
                     };
-                    let Some(cli_addrs) = cli_index
-                        .remove(&(domain, dns_type, dns_class))
-                    else {
+                    let Some(cli_addrs) = cli_index.remove(&(
+                        domain, dns_type, dns_class, dnssec_ok,
+                    )) else {
                         continue;
                     };
-                    for (cli_addr, id, rd) in cli_addrs {
-                        let mut buf = reply_bytes.clone();
-                        buf[0..2].copy_from_slice(&id.to_be_bytes());
-                        set_rd_bit(&mut buf, rd);
-                        send_bytes(
-                            &socket, &buf, cli_addr,
-                        ).await;
+                    for (cli_addr, id, rd, has_edns) in cli_addrs {
+                        let buf = build_client_reply(
+                            &neutral, id, rd, has_edns, dnssec_ok,
+                        );
+                        send_bytes(&socket, &buf, cli_addr).await;
                     }
                 }
                 else => {
@@ -285,4 +302,31 @@ fn set_rd_bit(buf: &mut [u8], rd: bool) {
             buf[2] &= !0x01;
         }
     }
+}
+
+/// Turn neutral response bytes (no OPT record, as stored in the cache or
+/// synthesized for SERVFAIL) into the final reply for a single client:
+/// rewrite the transaction ID and RD bit, and append an EDNS(0) OPT ack when
+/// the client queried with EDNS. RFC 6891 §6.1.1 requires a response to an
+/// EDNS query to carry an OPT record; a non-EDNS client gets none (§6.1.1).
+fn build_client_reply(
+    neutral: &[u8],
+    id: u16,
+    rd: bool,
+    has_edns: bool,
+    dnssec_ok: bool,
+) -> Vec<u8> {
+    let mut buf = neutral.to_vec();
+    if buf.len() >= 2 {
+        buf[0..2].copy_from_slice(&id.to_be_bytes());
+    }
+    set_rd_bit(&mut buf, rd);
+    if has_edns {
+        DnsPacket::append_opt_ack(
+            &mut buf,
+            EDNS_RESPONDER_PAYLOAD_SIZE,
+            dnssec_ok,
+        );
+    }
+    buf
 }
