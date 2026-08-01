@@ -4,7 +4,7 @@ use std::str::FromStr;
 
 use crate::{DnsType, ErrorKind, MudzError};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum DnsClass {
     IN,
     CS,

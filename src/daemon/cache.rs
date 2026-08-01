@@ -5,12 +5,12 @@ use std::{
     time::{Duration, Instant},
 };
 
-use mudz::{DnsPacket, DnsType};
+use mudz::{DnsClass, DnsPacket, DnsType};
 
 const MIN_CACHE_TTL_SEC: u32 = 5;
 const MAX_CACHE_TTL_SEC: u32 = 86400;
 
-pub(crate) type CacheKey = (String, DnsType);
+pub(crate) type CacheKey = (String, DnsType, DnsClass);
 
 struct CacheEntry {
     raw_bytes: Vec<u8>,
@@ -64,11 +64,12 @@ impl DnsCacheStore {
             return;
         }
         log::debug!("Cache dump:");
-        for ((domain, kind), entry) in &self.entries {
+        for ((domain, kind, class), entry) in &self.entries {
             log::debug!(
-                "  {} {} (expires in {}s)",
+                "  {} {}, {:?} (expires in {}s)",
                 domain,
                 kind,
+                class,
                 entry
                     .expires_at
                     .saturating_duration_since(Instant::now())
@@ -80,7 +81,8 @@ impl DnsCacheStore {
     pub(crate) fn get(&mut self, request: &DnsPacket) -> Option<Vec<u8>> {
         let domain = request.questions.first().map(|q| q.domain.to_string())?;
         let kind = request.questions.first().map(|q| q.kind)?;
-        let key = (domain, kind);
+        let class = request.questions.first().map(|q| q.class)?;
+        let key = (domain, kind, class);
         let now = Instant::now();
 
         let expires_at = self.entries.get(&key)?.expires_at;
@@ -123,6 +125,7 @@ impl DnsCacheStore {
         }
         let domain = response.first_question().map(|q| q.domain.to_string())?;
         let kind = response.first_question().map(|q| q.kind)?;
+        let class = response.first_question().map(|q| q.class)?;
         let ttl_sec = response
             .first_record()
             .map(|q| q.ttl)
@@ -133,7 +136,7 @@ impl DnsCacheStore {
         let mut ttl_positions = Vec::new();
         let raw_bytes = response.to_bytes_with_ttls(Some(&mut ttl_positions));
 
-        let key = (domain, kind);
+        let key = (domain, kind, class);
         self.lru_order.push_front(key.clone());
         self.entries.insert(
             key,
