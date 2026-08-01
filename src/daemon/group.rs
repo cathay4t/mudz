@@ -330,8 +330,12 @@ impl DnsGroup {
 
         let mut futures = FuturesUnordered::new();
 
-        // Send to all UDP transports, register for response dispatch
+        // Register for response dispatch first, then send query.
+        // If send_query is called before register and the upstream DNS
+        // responds before the Register command is processed by recv_loop,
+        // the response is silently dropped because no sender exists yet.
         for transport in &self.udp_transports {
+            let rx = transport.register(key.clone());
             if let Err(e) = transport.send_query(&query_bytes).await {
                 log::debug!(
                     "Error sending DNS query to group '{}': {e}",
@@ -339,7 +343,6 @@ impl DnsGroup {
                 );
                 continue;
             }
-            let rx = transport.register(key.clone());
             let udp_future = async move {
                 rx.await.map_err(|_| {
                     MudzError::new(
