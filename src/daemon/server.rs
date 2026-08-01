@@ -54,15 +54,38 @@ impl DnsUdpServer {
         let (sender, receiver) = mpsc::unbounded_channel::<DnsQueryPacket>();
 
         let socket = self.socket.clone();
-        tokio::spawn(async move { DnsUdpListener::run(sender, socket).await });
+        let listener_handle =
+            tokio::spawn(
+                async move { DnsUdpListener::run(sender, socket).await },
+            );
 
         let config = self.config.clone();
         let socket = self.socket.clone();
-        tokio::spawn(async move {
+        let resolver_handle = tokio::spawn(async move {
             DnsResolver::run(receiver, config, socket).await
         });
 
-        tokio::signal::ctrl_c().await.ok();
+        tokio::select! {
+            result = listener_handle => {
+                match result {
+                    Ok(()) => log::info!("DNS listener task exited"),
+                    Err(e) => log::error!(
+                        "DNS listener task panicked: {e}"
+                    ),
+                }
+            }
+            result = resolver_handle => {
+                match result {
+                    Ok(()) => log::info!("DNS resolver task exited"),
+                    Err(e) => log::error!(
+                        "DNS resolver task panicked: {e}"
+                    ),
+                }
+            }
+            _ = tokio::signal::ctrl_c() => {
+                log::info!("Received shutdown signal");
+            }
+        }
 
         log::info!("Shutting down");
         Ok(())
