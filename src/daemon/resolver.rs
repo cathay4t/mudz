@@ -151,40 +151,31 @@ impl DnsResolver {
                 Some((domain, dns_type, dns_class, has_edns, result)) =
                     futures.next() =>
                 {
-                    match result {
-                        Ok(reply_packet) => {
-                            if log::log_enabled!(log::Level::Debug) {
-                                log::debug!(
-                                    "Got DNS reply from upstream for {}",
-                                    reply_packet.display_brief());
-                            }
-                            let reply_bytes = if has_edns {
-                                reply_packet.to_bytes()
-                            } else {
-                                match cache.insert(&reply_packet)
-                                {
-                                    Some(bytes) => bytes,
-                                    None => {
-                                        log::debug!(
-                                            "Cache insert failed for {}, \
-                                             forwarding without caching",
-                                            reply_packet.display_brief(),
-                                        );
-                                        reply_packet.to_bytes()
-                                    }
+                    let reply_packet = match result {
+                        Ok(packet) => {
+                            let question_ok =
+                                packet.first_question().is_some_and(|q| {
+                                    q.domain.to_string() == domain
+                                        && q.kind == dns_type
+                                        && q.class == dns_class
+                                });
+                            if question_ok {
+                                if log::log_enabled!(log::Level::Debug) {
+                                    log::debug!(
+                                        "Got DNS reply from upstream for {}",
+                                        packet.display_brief()
+                                    );
                                 }
-                            };
-                            let Some(cli_addrs) = cli_index
-                                .remove(&(domain, dns_type, dns_class))
-                            else {
-                                continue;
-                            };
-                            for (cli_addr, id) in cli_addrs {
-                                let mut buf = reply_bytes.clone();
-                                buf[0..2].copy_from_slice(&id.to_be_bytes());
-                                send_bytes(
-                                    &socket, &buf, cli_addr,
-                                ).await;
+                                Some(packet)
+                            } else {
+                                log::warn!(
+                                    "Upstream response question mismatch \
+                                     for {}/{}/{:?}",
+                                    domain,
+                                    dns_type,
+                                    dns_class,
+                                );
+                                None
                             }
                         }
                         Err(e) => {
@@ -193,36 +184,70 @@ impl DnsResolver {
                                 domain,
                                 dns_type,
                             );
-                            let Ok(domain_obj) =
-                                DnsDomainName::from_str(&domain)
-                            else {
-                                log::warn!(
-                                    "Failed to parse domain name {}: \
-                                     invalid format",
-                                    domain,
-                                );
-                                let _ = cli_index
-                                    .remove(&(domain, dns_type, dns_class));
-                                continue;
-                            };
-                            let Some(cli_addrs) = cli_index
-                                .remove(&(domain, dns_type, dns_class))
-                            else {
-                                continue;
-                            };
-                            let packet = DnsPacket::new_reply(
-                                0,
-                                DnsResponseCode::ServFail,
-                                domain_obj,
-                                dns_type,
+                            None
+                        }
+                    };
+
+                    let Some(reply_packet) = reply_packet else {
+                        let Ok(domain_obj) =
+                            DnsDomainName::from_str(&domain)
+                        else {
+                            log::warn!(
+                                "Failed to parse domain name {}: \
+                                 invalid format",
+                                domain,
                             );
-                            let reply_bytes = packet.to_bytes();
-                            for (cli_addr, id) in cli_addrs {
-                                let mut buf = reply_bytes.clone();
-                                buf[0..2].copy_from_slice(&id.to_be_bytes());
-                                send_bytes(&socket, &buf, cli_addr).await;
+                            let _ = cli_index
+                                .remove(&(domain, dns_type, dns_class));
+                            continue;
+                        };
+                        let Some(cli_addrs) = cli_index
+                            .remove(&(domain, dns_type, dns_class))
+                        else {
+                            continue;
+                        };
+                        let packet = DnsPacket::new_reply(
+                            0,
+                            DnsResponseCode::ServFail,
+                            domain_obj,
+                            dns_type,
+                        );
+                        let reply_bytes = packet.to_bytes();
+                        for (cli_addr, id) in cli_addrs {
+                            let mut buf = reply_bytes.clone();
+                            buf[0..2].copy_from_slice(&id.to_be_bytes());
+                            send_bytes(&socket, &buf, cli_addr).await;
+                        }
+                        continue;
+                    };
+
+                    let reply_bytes = if has_edns {
+                        reply_packet.to_bytes()
+                    } else {
+                        match cache.insert(&reply_packet)
+                        {
+                            Some(bytes) => bytes,
+                            None => {
+                                log::debug!(
+                                    "Cache insert failed for {}, \
+                                     forwarding without caching",
+                                    reply_packet.display_brief(),
+                                );
+                                reply_packet.to_bytes()
                             }
                         }
+                    };
+                    let Some(cli_addrs) = cli_index
+                        .remove(&(domain, dns_type, dns_class))
+                    else {
+                        continue;
+                    };
+                    for (cli_addr, id) in cli_addrs {
+                        let mut buf = reply_bytes.clone();
+                        buf[0..2].copy_from_slice(&id.to_be_bytes());
+                        send_bytes(
+                            &socket, &buf, cli_addr,
+                        ).await;
                     }
                 }
                 else => {
