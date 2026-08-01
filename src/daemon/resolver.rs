@@ -32,7 +32,7 @@ impl DnsResolver {
         let doh_config = config.doh.clone();
         let groups =
             match DnsGroups::new(config, doh_config, hosts.clone()).await {
-                Ok(groups) => groups,
+                Ok(groups) => Arc::new(groups),
                 Err(e) => {
                     log::error!("Failed to initialize DNS groups: {e}");
                     return;
@@ -102,7 +102,8 @@ impl DnsResolver {
                                     packet.display_brief()
                                 );
                             }
-                            match cli_index.entry((domain, dns_type)) {
+                            let domain_key = domain.clone();
+                            match cli_index.entry((domain_key, dns_type)) {
                                 Entry::Occupied(pending) => {
                                     if log::log_enabled!(log::Level::Debug) {
                                         log::debug!(
@@ -114,7 +115,17 @@ impl DnsResolver {
                                 }
                                 Entry::Vacant(vacant) => {
                                     vacant.insert(vec![(cli_addr, id)]);
-                                    futures.push(groups.request(packet));
+                                    let groups = Arc::clone(&groups);
+                                    futures.push(async move {
+                                        match groups.request(packet).await {
+                                            Ok(reply) => (domain,
+                                                          dns_type,
+                                                          Ok(reply)),
+                                            Err(e) => (domain,
+                                                       dns_type,
+                                                       Err(e)),
+                                        }
+                                    });
                                 }
                             }
                         }
@@ -122,29 +133,66 @@ impl DnsResolver {
                         break;
                     }
                 }
-                Some(result) = futures.next() => {
-                    if let Ok(reply_packet) = result {
-                        if log::log_enabled!(log::Level::Debug) {
-                            log::debug!(
-                                "Got DNS reply from upstream for {}",
-                                reply_packet.display_brief());
+                Some((domain, dns_type, result)) = futures.next() => {
+                    match result {
+                        Ok(reply_packet) => {
+                            if log::log_enabled!(log::Level::Debug) {
+                                log::debug!(
+                                    "Got DNS reply from upstream for {}",
+                                    reply_packet.display_brief());
+                            }
+                            let Some(reply_bytes) = cache.insert(
+                                &reply_packet,
+                            ) else {
+                                let _ = cli_index.remove(&(domain, dns_type));
+                                continue;
+                            };
+                            let Some(cli_addrs) = cli_index
+                                .remove(&(domain, dns_type)) else {
+                                continue;
+                            };
+                            for (cli_addr, id) in cli_addrs {
+                                let mut buf = reply_bytes.clone();
+                                buf[0..2].copy_from_slice(&id.to_be_bytes());
+                                send_bytes(
+                                    &socket, &buf, cli_addr,
+                                ).await;
+                            }
                         }
-                        let Some(reply_bytes) = cache.insert(&reply_packet)
-                        else {
-                            continue;
-                        };
-                        let question = reply_packet.first_question();
-                        let Some(question) = question else { continue };
-                        let domain = question.domain.to_string();
-                        let dns_type = question.kind;
-                        let Some(cli_addrs) = cli_index
-                            .remove(&(domain, dns_type)) else { continue };
-                        for (cli_addr, id) in cli_addrs {
-                            let mut buf = reply_bytes.clone();
-                            buf[0..2].copy_from_slice(&id.to_be_bytes());
-                            send_bytes(
-                                &socket, &buf, cli_addr,
-                            ).await;
+                        Err(e) => {
+                            log::debug!(
+                                "Upstream DNS query for {}/{} failed: {e}",
+                                domain,
+                                dns_type,
+                            );
+                            let Ok(domain_obj) =
+                                DnsDomainName::from_str(&domain)
+                            else {
+                                log::warn!(
+                                    "Failed to parse domain name {}: \
+                                     invalid format",
+                                    domain,
+                                );
+                                let _ = cli_index
+                                    .remove(&(domain, dns_type));
+                                continue;
+                            };
+                            let Some(cli_addrs) = cli_index
+                                .remove(&(domain, dns_type)) else {
+                                continue;
+                            };
+                            let packet = DnsPacket::new_reply(
+                                0,
+                                DnsResponseCode::ServFail,
+                                domain_obj,
+                                dns_type,
+                            );
+                            let reply_bytes = packet.to_bytes();
+                            for (cli_addr, id) in cli_addrs {
+                                let mut buf = reply_bytes.clone();
+                                buf[0..2].copy_from_slice(&id.to_be_bytes());
+                                send_bytes(&socket, &buf, cli_addr).await;
+                            }
                         }
                     }
                 }

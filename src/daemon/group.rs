@@ -670,5 +670,3 @@ async fn get_udp_dns_reply(socket: &UdpSocket) -> Result<DnsPacket, MudzError> {
         )),
     }
 }
-
-
