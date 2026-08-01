@@ -4,7 +4,7 @@ use std::{
     collections::HashMap,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     str::FromStr as _,
-    sync::Arc,
+    sync::{Arc, Mutex},
     time::Duration,
 };
 
@@ -13,10 +13,7 @@ use mudz::{
     DnsClass, DnsHeader, DnsPacket, DnsResourceRecord, DnsResponseCode,
     DnsType, ErrorKind, MudzError,
 };
-use tokio::{
-    net::UdpSocket,
-    sync::{mpsc, oneshot},
-};
+use tokio::{net::UdpSocket, sync::oneshot};
 
 use super::{
     config::MudzConfig,
@@ -136,26 +133,23 @@ impl DnsGroups {
 /// correct caller via a background recv loop and oneshot channels.
 struct DnsUdpTransport {
     socket: Arc<UdpSocket>,
-    cmd_tx: mpsc::UnboundedSender<Command>,
+    pending: Arc<Mutex<PendingMap>>,
 }
 
-enum Command {
-    Register {
-        /// (domain, query-type, query-class) key for matching responses
-        key: (String, DnsType, DnsClass),
-        reply: oneshot::Sender<DnsPacket>,
-    },
-}
+type PendingKey = (String, DnsType, DnsClass);
+type PendingMap = HashMap<PendingKey, Vec<oneshot::Sender<DnsPacket>>>;
 
 impl DnsUdpTransport {
     async fn new(server_addr: &str) -> Result<Self, MudzError> {
         let socket = Arc::new(create_udp_socket(server_addr).await?);
-        let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+        let pending: Arc<Mutex<PendingMap>> =
+            Arc::new(Mutex::new(HashMap::new()));
 
         let recv_socket = socket.clone();
-        tokio::spawn(Self::recv_loop(recv_socket, cmd_rx));
+        let recv_pending = pending.clone();
+        tokio::spawn(Self::recv_loop(recv_socket, recv_pending));
 
-        Ok(Self { socket, cmd_tx })
+        Ok(Self { socket, pending })
     }
 
     async fn send_query(&self, bytes: &[u8]) -> Result<(), MudzError> {
@@ -168,40 +162,29 @@ impl DnsUdpTransport {
         Ok(())
     }
 
-    fn register(
-        &self,
-        key: (String, DnsType, DnsClass),
-    ) -> oneshot::Receiver<DnsPacket> {
+    /// Register interest in a response matching `key`. The sender is
+    /// inserted synchronously under a lock, so it is guaranteed to be
+    /// visible to `recv_loop` before `send_query` can complete.
+    fn register(&self, key: PendingKey) -> oneshot::Receiver<DnsPacket> {
         let (tx, rx) = oneshot::channel();
-        // Unbounded send never fails; ignore error if the recv loop has
-        // already exited (the socket is dead).
-        let _ = self.cmd_tx.send(Command::Register { key, reply: tx });
+        self.pending
+            .lock()
+            .expect("pending map lock poisoned")
+            .entry(key)
+            .or_default()
+            .push(tx);
         rx
     }
 
     async fn recv_loop(
         socket: Arc<UdpSocket>,
-        mut cmd_rx: mpsc::UnboundedReceiver<Command>,
+        pending: Arc<Mutex<PendingMap>>,
     ) {
-        // Map from (domain, query-type, query-class) to senders waiting for
-        // a response.
-        let mut pending: HashMap<
-            (String, DnsType, DnsClass),
-            Vec<oneshot::Sender<DnsPacket>>,
-        > = HashMap::new();
         let mut recv_buf = [0u8; DnsPacket::MAX_UDP_EDNS_PACKET_SIZE];
         let mut cleanup = tokio::time::interval(Duration::from_secs(30));
 
         loop {
             tokio::select! {
-                cmd = cmd_rx.recv() => {
-                    match cmd {
-                        Some(Command::Register { key, reply }) => {
-                            pending.entry(key).or_default().push(reply);
-                        }
-                        None => break, // all senders dropped, shut down
-                    }
-                }
                 result = socket.recv(&mut recv_buf) => {
                     let len = match result {
                         Ok(n) => n,
@@ -216,12 +199,16 @@ impl DnsUdpTransport {
                     match DnsPacket::parse(&recv_buf[..len]) {
                         Ok(packet) => {
                             if let Some(question) = packet.first_question() {
-                                let key = (
+                                let key: PendingKey = (
                                     question.domain.to_string(),
                                     question.kind,
                                     question.class,
                                 );
-                                if let Some(senders) = pending.remove(&key) {
+                                let senders = pending
+                                    .lock()
+                                    .expect("pending map lock poisoned")
+                                    .remove(&key);
+                                if let Some(senders) = senders {
                                     for sender in senders {
                                         let _ = sender.send(packet.clone());
                                     }
@@ -236,10 +223,13 @@ impl DnsUdpTransport {
                     }
                 }
                 _ = cleanup.tick() => {
-                    pending.retain(|_, senders| {
-                        senders.retain(|s| !s.is_closed());
-                        !senders.is_empty()
-                    });
+                    pending
+                        .lock()
+                        .expect("pending map lock poisoned")
+                        .retain(|_, senders| {
+                            senders.retain(|s| !s.is_closed());
+                            !senders.is_empty()
+                        });
                 }
             }
         }
@@ -338,10 +328,8 @@ impl DnsGroup {
 
         let mut futures = FuturesUnordered::new();
 
-        // Register for response dispatch first, then send query.
-        // If send_query is called before register and the upstream DNS
-        // responds before the Register command is processed by recv_loop,
-        // the response is silently dropped because no sender exists yet.
+        // Register synchronously before sending so the pending map is
+        // guaranteed to contain our sender before any response can arrive.
         for transport in &self.udp_transports {
             let rx = transport.register(key.clone());
             if let Err(e) = transport.send_query(&query_bytes).await {
