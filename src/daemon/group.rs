@@ -415,15 +415,15 @@ fn make_ipv6_blocked_response(request: &DnsPacket) -> DnsPacket {
             ra: true,
             rcode: DnsResponseCode::NoError,
             qdcount: 1,
-            ancount: 1,
+            ancount: 0,
             nscount: 0,
-            arcount: 0,
+            arcount: 1,
             ..Default::default()
         },
         questions: vec![question.clone()],
-        answers: vec![hinfo],
+        answers: Vec::new(),
         authorities: Vec::new(),
-        additionals: Vec::new(),
+        additionals: vec![hinfo],
     }
 }
 
