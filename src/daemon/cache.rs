@@ -80,27 +80,27 @@ impl DnsCacheStore {
     pub(crate) fn get(&mut self, request: &DnsPacket) -> Option<Vec<u8>> {
         let domain = request.questions.first().map(|q| q.domain.to_string())?;
         let kind = request.questions.first().map(|q| q.kind)?;
-
+        let key = (domain, kind);
         let now = Instant::now();
-        let (mut bytes, ttl_positions, elapsed) = {
-            let entry = self.entries.get(&(domain.clone(), kind))?;
-            if entry.expires_at <= now {
-                if log::log_enabled!(log::Level::Debug) {
-                    log::debug!(
-                        "Cache not hit for {}",
-                        request.display_brief()
-                    );
-                }
-                return None;
-            }
-            (
-                entry.raw_bytes.clone(),
-                entry.ttl_positions.clone(),
-                now.saturating_duration_since(entry.insertion_time),
-            )
-        };
 
-        self.touch_lru(&(domain, kind));
+        let expires_at = self.entries.get(&key)?.expires_at;
+        if expires_at <= now {
+            if log::log_enabled!(log::Level::Debug) {
+                log::debug!("Cache expired for {}", request.display_brief());
+            }
+            self.entries.remove(&key);
+            self.lru_order.retain(|k| k != &key);
+            return None;
+        }
+
+        let entry = self.entries.get(&key)?;
+        let (mut bytes, ttl_positions, elapsed) = (
+            entry.raw_bytes.clone(),
+            entry.ttl_positions.clone(),
+            now.saturating_duration_since(entry.insertion_time),
+        );
+
+        self.touch_lru(&key);
         if log::log_enabled!(log::Level::Debug) {
             log::debug!("Cache hit for {}", request.display_brief());
         }
