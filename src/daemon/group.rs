@@ -4,8 +4,11 @@ use std::{
     collections::HashMap,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     str::FromStr as _,
-    sync::{Arc, Mutex},
-    time::Duration,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use futures_util::{StreamExt, future::Either, stream::FuturesUnordered};
@@ -22,6 +25,7 @@ use super::{
 };
 
 const DNS_TIMEOUT_SEC: Duration = Duration::from_secs(5);
+const DNS_RETRY_COOLDOWN: Duration = Duration::from_secs(5);
 const IPV6_BLOCKED_HINFO_CPU: &str =
     "AAAA queries have been locally blocked by mudz";
 const IPV6_BLOCKED_HINFO_OS: &str =
@@ -44,29 +48,25 @@ impl DnsGroups {
             "fallback".to_string(),
             config.fallback.nameservers,
             config.fallback.disable_ipv6,
+            false, // fallback is never intentionally blocking
             doh_config.clone(),
             hosts.clone(),
         )
-        .await?;
+        .await;
 
         let mut groups = HashMap::new();
         let mut search_index = HashMap::new();
         for (group_name, group_config) in config.groups.drain() {
+            let blocking = group_config.nameservers.is_empty();
             let dns_group = DnsGroup::new(
                 group_name.to_string(),
                 group_config.nameservers,
                 group_config.disable_ipv6,
+                blocking,
                 doh_config.clone(),
                 hosts.clone(),
             )
-            .await
-            .map_err(|e| {
-                log::error!(
-                    "Failed to initialize DNS group '{}': {e}",
-                    group_name
-                );
-                e
-            })?;
+            .await;
             groups.insert(group_name.to_string(), dns_group);
 
             for domain in group_config.domains {
@@ -124,9 +124,29 @@ impl DnsGroups {
                             question.class,
                             request.header.rd,
                         ));
-                    } else {
-                        return group.request(request).await;
                     }
+
+                    if !group.ensure_transports().await {
+                        // All transports failed and cooldown hasn't
+                        // elapsed — reply SERVFAIL so the client will
+                        // retry rather than silently timing out.
+                        let question =
+                            request.first_question().ok_or_else(|| {
+                                MudzError::new(
+                                    ErrorKind::InvalidArgument,
+                                    "DNS request has no question section",
+                                )
+                            })?;
+                        return Ok(DnsPacket::new_reply(
+                            request.header.id,
+                            DnsResponseCode::ServFail,
+                            question.domain.clone(),
+                            question.kind,
+                            question.class,
+                            request.header.rd,
+                        ));
+                    }
+                    return group.request(request).await;
                 }
             }
             // fallback
@@ -249,31 +269,77 @@ impl DnsUdpTransport {
 
 struct DnsGroup {
     name: String,
+    state: tokio::sync::RwLock<GroupState>,
+    /// Unix timestamp (seconds) of the last transport-retry attempt.
+    /// Used for the [`DNS_RETRY_COOLDOWN`] gap between recreations.
+    last_attempt: AtomicU64,
+    disable_ipv6: bool,
+    /// `true` when the group was explicitly configured with an empty
+    /// nameserver list — callers should return NXDOMAIN.
+    blocking: bool,
+    /// Configuration for recreating transports at runtime.
+    nameservers: Vec<String>,
+    doh_config: Option<super::config::MudzDohConfig>,
+    hosts: Arc<HostsFile>,
+}
+
+struct GroupState {
     udp_transports: Vec<Arc<DnsUdpTransport>>,
     doh_clients: Vec<DohClient>,
-    disable_ipv6: bool,
 }
 
 impl DnsGroup {
     async fn new(
         name: String,
-        srvs: Vec<String>,
+        nameservers: Vec<String>,
         disable_ipv6: bool,
+        blocking: bool,
         doh_config: Option<super::config::MudzDohConfig>,
         hosts: Arc<HostsFile>,
-    ) -> Result<Self, MudzError> {
+    ) -> Self {
+        let state = Self::create_state(
+            &nameservers,
+            &doh_config,
+            &hosts,
+            &name,
+            blocking,
+        )
+        .await;
+
+        Self {
+            name,
+            state: tokio::sync::RwLock::new(state),
+            last_attempt: AtomicU64::new(0),
+            disable_ipv6,
+            blocking,
+            nameservers,
+            doh_config,
+            hosts,
+        }
+    }
+
+    /// Build `GroupState` from the given nameserver list.  When
+    /// `blocking` is false and all connections fail, a warning is
+    /// logged and an empty state is returned — the caller will retry.
+    async fn create_state(
+        nameservers: &[String],
+        doh_config: &Option<super::config::MudzDohConfig>,
+        hosts: &HostsFile,
+        group_name: &str,
+        blocking: bool,
+    ) -> GroupState {
         let mut udp_transports = Vec::new();
         let mut doh_clients = Vec::new();
 
-        for srv in &srvs {
+        for srv in nameservers {
             if srv.starts_with("https://") {
-                match create_doh_client(srv, &doh_config, &hosts).await {
+                match create_doh_client(srv, doh_config, hosts).await {
                     Ok(client) => doh_clients.push(client),
                     Err(e) => log::warn!(
                         "Failed to create DoH client for '{}' in group '{}': \
                          {e}",
                         srv,
-                        name
+                        group_name
                     ),
                 }
             } else {
@@ -285,32 +351,90 @@ impl DnsGroup {
                         "Failed to create UDP transport for '{}' in group \
                          '{}': {e}",
                         srv,
-                        name
+                        group_name
                     ),
                 }
             }
         }
 
-        if udp_transports.is_empty() && doh_clients.is_empty() {
-            return Err(MudzError::new(
-                ErrorKind::Bug,
-                format!(
-                    "Failed to create any upstream connections for group \
-                     '{name}'"
-                ),
-            ));
+        if udp_transports.is_empty() && doh_clients.is_empty() && !blocking {
+            log::warn!(
+                "No upstream connections available for group '{}', will retry \
+                 on next request",
+                group_name
+            );
         }
 
-        Ok(Self {
-            name,
+        GroupState {
             udp_transports,
             doh_clients,
-            disable_ipv6,
-        })
+        }
+    }
+
+    /// Ensure this group has working transports.  If they were
+    /// previously empty (e.g. the p2p interface was not up at startup),
+    /// try to recreate them — but only if at least
+    /// [`DNS_RETRY_COOLDOWN`] have passed since the last attempt.
+    ///
+    /// Returns `true` if one or more transports are now available.
+    async fn ensure_transports(&self) -> bool {
+        if self.blocking {
+            return false;
+        }
+
+        // Fast path: already ready — just a read-lock.
+        {
+            let state = self.state.read().await;
+            if !state.udp_transports.is_empty() || !state.doh_clients.is_empty()
+            {
+                return true;
+            }
+        }
+
+        // Cooldown check.
+        let now = now_secs();
+        let prev = self.last_attempt.load(Ordering::Acquire);
+        if now.wrapping_sub(prev) < DNS_RETRY_COOLDOWN.as_secs() {
+            log::debug!(
+                "Group '{}' transport retry cooldown ({:.1}s remaining)",
+                self.name,
+                (DNS_RETRY_COOLDOWN.as_secs() - now.wrapping_sub(prev)) as f32
+            );
+            return false;
+        }
+        let _ = self.last_attempt.compare_exchange(
+            prev,
+            now,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+
+        let mut state = self.state.write().await;
+        // Double-check: another request may have recreated them already.
+        if !state.udp_transports.is_empty() || !state.doh_clients.is_empty() {
+            return true;
+        }
+        *state = Self::create_state(
+            &self.nameservers,
+            &self.doh_config,
+            &self.hosts,
+            &self.name,
+            false,
+        )
+        .await;
+        let ok =
+            !state.udp_transports.is_empty() || !state.doh_clients.is_empty();
+        if !ok {
+            log::debug!(
+                "Group '{}' transport recreation failed, will retry later",
+                self.name
+            );
+        }
+        ok
     }
 
     fn is_blocking(&self) -> bool {
-        self.udp_transports.is_empty() && self.doh_clients.is_empty()
+        self.blocking
     }
 
     async fn request(
@@ -355,11 +479,10 @@ impl DnsGroup {
         let key = (question.domain.to_string(), question.kind, question.class);
         let query_bytes = request.to_bytes();
 
+        let state = self.state.read().await;
         let mut futures = FuturesUnordered::new();
 
-        // Register synchronously before sending so the pending map is
-        // guaranteed to contain our sender before any response can arrive.
-        for transport in &self.udp_transports {
+        for transport in &state.udp_transports {
             let rx = transport.register(key.clone());
             if let Err(e) = transport.send_query(&query_bytes).await {
                 log::debug!(
@@ -385,7 +508,7 @@ impl DnsGroup {
         }
 
         // Send to all DoH clients
-        for doh_client in &self.doh_clients {
+        for doh_client in &state.doh_clients {
             futures.push(Either::Right(doh_client.request(&request)));
         }
 
@@ -735,6 +858,13 @@ async fn get_udp_dns_reply(socket: &UdpSocket) -> Result<DnsPacket, MudzError> {
             "Timed out waiting for DNS response",
         )),
     }
+}
+
+fn now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
 }
 
 fn is_fatal_io_error(e: &std::io::Error) -> bool {
