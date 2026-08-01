@@ -6,7 +6,7 @@ use std::{
     collections::HashMap,
     net::{IpAddr, SocketAddr},
     sync::Arc,
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 use data_encoding::BASE64URL_NOPAD;
@@ -143,10 +143,8 @@ impl DohClient {
     }
 }
 
-const DOH_CACHE_TTL: Duration = Duration::from_secs(3600);
-
 pub(crate) struct DohResolvCache {
-    store: HashMap<String, (Vec<IpAddr>, Instant)>,
+    store: HashMap<String, Vec<IpAddr>>,
 }
 
 impl DohResolvCache {
@@ -157,24 +155,13 @@ impl DohResolvCache {
     }
 
     pub(crate) fn insert(&mut self, domain: &str, ips: Vec<IpAddr>) {
-        self.store.insert(domain.to_string(), (ips, Instant::now()));
+        self.store.insert(domain.to_string(), ips);
     }
 }
 
 impl reqwest::dns::Resolve for DohResolvCache {
     fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
-        if let Some((ips, inserted)) = self.store.get(name.as_str()) {
-            if inserted.elapsed() > DOH_CACHE_TTL {
-                // Cache expired, let reqwest's built-in resolver
-                // re-resolve the hostname.
-                return Box::pin(async move {
-                    Err(Box::new(std::io::Error::new(
-                        std::io::ErrorKind::NotFound,
-                        "DoH cache entry expired",
-                    ))
-                        as Box<dyn std::error::Error + Send + Sync>)
-                });
-            }
+        if let Some(ips) = self.store.get(name.as_str()) {
             let addrs: Vec<SocketAddr> =
                 ips.iter().map(|ip| SocketAddr::new(*ip, 0)).collect();
             Box::pin(async move {

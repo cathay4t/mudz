@@ -347,12 +347,17 @@ impl DnsGroup {
                 continue;
             }
             let udp_future = async move {
-                rx.await.map_err(|_| {
-                    MudzError::new(
+                match tokio::time::timeout(DNS_TIMEOUT_SEC, rx).await {
+                    Ok(Ok(packet)) => Ok(packet),
+                    Ok(Err(_)) => Err(MudzError::new(
                         ErrorKind::Timeout,
                         "UDP response channel closed",
-                    )
-                })
+                    )),
+                    Err(_) => Err(MudzError::new(
+                        ErrorKind::Timeout,
+                        "UDP DNS query timed out",
+                    )),
+                }
             };
             futures.push(Either::Left(udp_future));
         }

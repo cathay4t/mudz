@@ -173,11 +173,19 @@ impl DnsResourceRecord {
         rdata: Vec<u8>,
         rdata_offset: usize,
     ) -> Result<Vec<u8>, MudzError> {
-        let has_compression = kind_has_domain_names(kind)
-            && rdata.windows(2).any(|w| w[0] & 0xC0 == 0xC0);
-
-        if !has_compression {
+        if !kind_has_domain_names(kind) {
             return Ok(rdata);
+        }
+
+        // For types where rdata is entirely a domain name, we can safely
+        // check for compression pointers to skip unnecessary expansion.
+        // For SOA/MX/SRV, the rdata also contains numeric fields, so a
+        // byte-level scan would produce false positives — always expand.
+        if matches!(kind, DnsType::CNAME | DnsType::NS | DnsType::PTR) {
+            let has_compression = rdata.windows(2).any(|w| w[0] & 0xC0 == 0xC0);
+            if !has_compression {
+                return Ok(rdata);
+            }
         }
 
         match kind {
