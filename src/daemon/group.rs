@@ -317,6 +317,24 @@ impl DnsGroup {
         &self,
         request: DnsPacket,
     ) -> Result<DnsPacket, MudzError> {
+        // Wrap the entire request with a timeout.  A stuck UDP transport
+        // (e.g. a connected socket on a point-to-point interface whose
+        // send never completes) would otherwise stall the request
+        // indefinitely because `send_query` is called outside the
+        // per-future timeout that only protects the receive side.
+        tokio::time::timeout(DNS_TIMEOUT_SEC, self.request_inner(request))
+            .await
+            .unwrap_or_else(|_elapsed| {
+                Err(MudzError::new(ErrorKind::Timeout, "DNS request timed out"))
+            })
+    }
+
+    /// Implementation of [`Self::request`] – the actual work, called inside
+    /// a timeout guard.
+    async fn request_inner(
+        &self,
+        request: DnsPacket,
+    ) -> Result<DnsPacket, MudzError> {
         if self.disable_ipv6
             && request.first_question().map(|q| q.kind) == Some(DnsType::AAAA)
         {
@@ -608,9 +626,20 @@ async fn send_request_and_wait_first_reply(
         sockets.push(socket);
     }
 
+    // Send queries with a timeout so a stuck UDP socket cannot
+    // block startup indefinitely.
     for socket in &sockets {
-        if let Err(e) = socket.send(&query_packet.to_bytes()).await {
-            log::warn!("Failed to send DNS query to nameserver: {e}");
+        let send_bytes = query_packet.to_bytes();
+        match tokio::time::timeout(DNS_TIMEOUT_SEC, socket.send(&send_bytes))
+            .await
+        {
+            Ok(Ok(_n)) => {}
+            Ok(Err(e)) => {
+                log::warn!("Failed to send DNS query to nameserver: {e}");
+            }
+            Err(_) => {
+                log::warn!("Timed out sending DNS query to nameserver");
+            }
         }
     }
 
