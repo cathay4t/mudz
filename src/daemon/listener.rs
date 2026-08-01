@@ -23,6 +23,11 @@ impl DnsUdpListener {
                 }
                 Err(e) => {
                     log::error!("Error receiving DNS query: {e}");
+                    if is_listener_fatal_error(&e) {
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(100))
+                        .await;
                 }
             }
         }
@@ -99,4 +104,12 @@ async fn send_formerr(
     if let Err(e) = socket.send_to(&reply_bytes, cli_addr).await {
         log::warn!("Failed to send FormErr reply to {}: {}", cli_addr, e,);
     }
+}
+
+fn is_listener_fatal_error(e: &std::io::Error) -> bool {
+    use std::io::ErrorKind;
+    matches!(
+        e.kind(),
+        ErrorKind::BrokenPipe | ErrorKind::ConnectionRefused
+    )
 }
