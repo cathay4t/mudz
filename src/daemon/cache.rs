@@ -127,8 +127,13 @@ impl DnsCacheStore {
         let kind = response.first_question().map(|q| q.kind)?;
         let class = response.first_question().map(|q| q.class)?;
         let ttl_sec = response
-            .first_record()
-            .map(|q| q.ttl)
+            .answers
+            .iter()
+            .chain(response.authorities.iter())
+            .chain(response.additionals.iter())
+            .filter(|r| u16::from(r.kind) != 41)
+            .map(|r| r.ttl)
+            .min()
             .unwrap_or(MIN_CACHE_TTL_SEC);
         let ttl_sec = ttl_sec.clamp(MIN_CACHE_TTL_SEC, MAX_CACHE_TTL_SEC);
 
