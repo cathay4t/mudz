@@ -141,11 +141,17 @@ impl DnsResolver {
                                     "Got DNS reply from upstream for {}",
                                     reply_packet.display_brief());
                             }
-                            let Some(reply_bytes) = cache.insert(
-                                &reply_packet,
-                            ) else {
-                                let _ = cli_index.remove(&(domain, dns_type));
-                                continue;
+                            let reply_bytes = match cache.insert(&reply_packet)
+                            {
+                                Some(bytes) => bytes,
+                                None => {
+                                    log::debug!(
+                                        "Cache insert failed for {}, \
+                                         forwarding without caching",
+                                        reply_packet.display_brief(),
+                                    );
+                                    reply_packet.to_bytes()
+                                }
                             };
                             let Some(cli_addrs) = cli_index
                                 .remove(&(domain, dns_type)) else {
