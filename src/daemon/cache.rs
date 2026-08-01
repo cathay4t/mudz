@@ -7,7 +7,7 @@ use std::{
 
 use mudz::{DnsPacket, DnsType};
 
-const MIN_CACHE_TTL_SEC: u32 = 60;
+const MIN_CACHE_TTL_SEC: u32 = 5;
 const MAX_CACHE_TTL_SEC: u32 = 86400;
 
 pub(crate) type CacheKey = (String, DnsType);
