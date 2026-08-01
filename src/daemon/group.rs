@@ -203,7 +203,10 @@ impl DnsUdpTransport {
                         Ok(n) => n,
                         Err(e) => {
                             log::debug!("UDP recv error on upstream socket: {e}");
-                            break;
+                            if is_fatal_io_error(&e) {
+                                break;
+                            }
+                            continue;
                         }
                     };
                     match DnsPacket::parse(&recv_buf[..len]) {
@@ -672,4 +675,14 @@ async fn get_udp_dns_reply(socket: &UdpSocket) -> Result<DnsPacket, MudzError> {
             "Timed out waiting for DNS response",
         )),
     }
+}
+
+fn is_fatal_io_error(e: &std::io::Error) -> bool {
+    use std::io::ErrorKind;
+    matches!(
+        e.kind(),
+        ErrorKind::BrokenPipe
+            | ErrorKind::ConnectionRefused
+            | ErrorKind::NotConnected
+    )
 }
