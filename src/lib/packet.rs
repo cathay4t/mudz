@@ -266,13 +266,15 @@ impl DnsPacket {
         code: DnsResponseCode,
         domain: DnsDomainName,
         kind: DnsType,
+        class: DnsClass,
+        rd: bool,
     ) -> Self {
         DnsPacket {
-            header: DnsHeader::new_response(id, code),
+            header: DnsHeader::new_response(id, code, rd),
             questions: vec![DnsQuestion {
                 domain,
                 kind,
-                class: DnsClass::IN,
+                class,
             }],
             answers: Vec::new(),
             authorities: Vec::new(),

@@ -145,11 +145,12 @@ impl DnsHeader {
         buf
     }
 
-    pub fn new_response(id: u16, rcode: DnsResponseCode) -> Self {
+    pub fn new_response(id: u16, rcode: DnsResponseCode, rd: bool) -> Self {
         Self {
             id,
             qr: true,
             rcode,
+            rd,
             qdcount: 1,
             ..Default::default()
         }

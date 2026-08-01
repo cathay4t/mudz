@@ -16,6 +16,10 @@ use super::{
     host::HostsFile, server::DnsQueryPacket,
 };
 
+/// Pending client: (address, transaction ID, RD flag).
+type PendingClient = (SocketAddr, u16, bool);
+type CliIndexKey = (String, DnsType, DnsClass);
+
 pub(crate) struct DnsResolver;
 
 impl DnsResolver {
@@ -26,10 +30,8 @@ impl DnsResolver {
     ) {
         let hosts = Arc::new(HostsFile::new());
         let mut cache = DnsCacheStore::new(config.main.max_cache_size);
-        let mut cli_index: HashMap<
-            (String, DnsType, DnsClass),
-            Vec<(SocketAddr, u16)>,
-        > = HashMap::new();
+        let mut cli_index: HashMap<CliIndexKey, Vec<PendingClient>> =
+            HashMap::new();
 
         let doh_config = config.doh.clone();
         let groups =
@@ -52,7 +54,7 @@ impl DnsResolver {
                     "All pending DNS queries failed to resolve, replying \
                      SERVFAIL to remaining {count} clients",
                 );
-                for ((domain, kind, _class), cli_addrs) in cli_index.drain() {
+                for ((domain, kind, class), cli_addrs) in cli_index.drain() {
                     let Ok(domain_obj) = DnsDomainName::from_str(&domain)
                     else {
                         log::warn!(
@@ -67,11 +69,14 @@ impl DnsResolver {
                         DnsResponseCode::ServFail,
                         domain_obj,
                         kind,
+                        class,
+                        true,
                     );
                     let reply_bytes = packet.to_bytes();
-                    for (cli_addr, id) in cli_addrs {
+                    for (cli_addr, id, rd) in cli_addrs {
                         let mut buf = reply_bytes.clone();
                         buf[0..2].copy_from_slice(&id.to_be_bytes());
+                        set_rd_bit(&mut buf, rd);
                         send_bytes(&socket, &buf, cli_addr).await;
                     }
                 }
@@ -95,6 +100,7 @@ impl DnsResolver {
                         let dns_type = question.kind;
                         let dns_class = question.class;
                         let id = packet.header.id;
+                        let rd = packet.header.rd;
                         let has_edns = packet.has_edns();
 
                         if !has_edns
@@ -123,10 +129,10 @@ impl DnsResolver {
                                         packet.display_brief()
                                     );
                                 }
-                                pending.into_mut().push((cli_addr, id));
+                                pending.into_mut().push((cli_addr, id, rd));
                             }
                             Entry::Vacant(vacant) => {
-                                vacant.insert(vec![(cli_addr, id)]);
+                                vacant.insert(vec![(cli_addr, id, rd)]);
                                 let groups = Arc::clone(&groups);
                                 futures.push(async move {
                                     match groups.request(packet).await {
@@ -211,11 +217,14 @@ impl DnsResolver {
                             DnsResponseCode::ServFail,
                             domain_obj,
                             dns_type,
+                            dns_class,
+                            true,
                         );
                         let reply_bytes = packet.to_bytes();
-                        for (cli_addr, id) in cli_addrs {
+                        for (cli_addr, id, rd) in cli_addrs {
                             let mut buf = reply_bytes.clone();
                             buf[0..2].copy_from_slice(&id.to_be_bytes());
+                            set_rd_bit(&mut buf, rd);
                             send_bytes(&socket, &buf, cli_addr).await;
                         }
                         continue;
@@ -242,9 +251,10 @@ impl DnsResolver {
                     else {
                         continue;
                     };
-                    for (cli_addr, id) in cli_addrs {
+                    for (cli_addr, id, rd) in cli_addrs {
                         let mut buf = reply_bytes.clone();
                         buf[0..2].copy_from_slice(&id.to_be_bytes());
+                        set_rd_bit(&mut buf, rd);
                         send_bytes(
                             &socket, &buf, cli_addr,
                         ).await;
@@ -261,5 +271,18 @@ impl DnsResolver {
 async fn send_bytes(socket: &Arc<UdpSocket>, buf: &[u8], cli_addr: SocketAddr) {
     if let Err(e) = socket.send_to(buf, cli_addr).await {
         log::warn!("Failed to send DNS reply to {}: {e}", cli_addr);
+    }
+}
+
+/// Set or clear the RD (Recursion Desired) bit in a serialized DNS
+/// packet header. RD is bit 8 of the 16-bit flags field (byte 2,
+/// bit 0). RFC 1035 §4.1.1: the response copies the query's RD.
+fn set_rd_bit(buf: &mut [u8], rd: bool) {
+    if buf.len() > 2 {
+        if rd {
+            buf[2] |= 0x01;
+        } else {
+            buf[2] &= !0x01;
+        }
     }
 }
