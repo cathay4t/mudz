@@ -628,6 +628,23 @@ async fn send_request_and_wait_first_reply(
         };
         log::debug!("Received DNS reply: {}", packet.display_brief());
 
+        if packet.header.id != query_packet.header.id {
+            log::debug!(
+                "DNS reply TXID mismatch: expected {:#06x}, got {:#06x}",
+                query_packet.header.id,
+                packet.header.id,
+            );
+            continue;
+        }
+        if !packet.header.qr {
+            log::debug!("Ignoring non-response DNS packet");
+            continue;
+        }
+        if packet.header.rcode != DnsResponseCode::NoError {
+            log::debug!("DNS reply rcode {:?}, ignoring", packet.header.rcode,);
+            continue;
+        }
+
         for record in packet
             .answers
             .into_iter()
