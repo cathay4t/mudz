@@ -109,10 +109,21 @@ impl DnsGroups {
                             group_name,
                             domain
                         );
-                        let mut packet = request;
-                        packet.header.set_response(true);
-                        packet.header.rcode = DnsResponseCode::NxDomain;
-                        return Ok(packet);
+                        let question =
+                            request.first_question().ok_or_else(|| {
+                                MudzError::new(
+                                    ErrorKind::InvalidArgument,
+                                    "DNS request has no question section",
+                                )
+                            })?;
+                        return Ok(DnsPacket::new_reply(
+                            request.header.id,
+                            DnsResponseCode::NxDomain,
+                            question.domain.clone(),
+                            question.kind,
+                            question.class,
+                            request.header.rd,
+                        ));
                     } else {
                         return group.request(request).await;
                     }
