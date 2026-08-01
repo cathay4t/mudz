@@ -440,12 +440,6 @@ fn make_ipv6_blocked_response(request: &DnsPacket) -> DnsPacket {
 }
 
 async fn create_udp_socket(srv: &str) -> Result<UdpSocket, MudzError> {
-    let socket = UdpSocket::bind("0.0.0.0:0").await.map_err(|e| {
-        MudzError::new(
-            ErrorKind::Bug,
-            format!("Failed to bind UDP socket: {e}"),
-        )
-    })?;
     let addr = if srv.contains(':') {
         SocketAddr::from_str(srv)
     } else {
@@ -455,6 +449,17 @@ async fn create_udp_socket(srv: &str) -> Result<UdpSocket, MudzError> {
         MudzError::new(
             ErrorKind::InvalidConfig,
             format!("Invalid nameserver address '{srv}': {e}"),
+        )
+    })?;
+    let bind_addr = if addr.is_ipv6() {
+        "[::]:0"
+    } else {
+        "0.0.0.0:0"
+    };
+    let socket = UdpSocket::bind(bind_addr).await.map_err(|e| {
+        MudzError::new(
+            ErrorKind::Bug,
+            format!("Failed to bind UDP socket: {e}"),
         )
     })?;
     socket.connect(addr).await.map_err(|e| {
