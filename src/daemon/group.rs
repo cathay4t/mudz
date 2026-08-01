@@ -141,8 +141,8 @@ struct DnsUdpTransport {
 
 enum Command {
     Register {
-        /// (domain, query-type) key for matching responses
-        key: (String, DnsType),
+        /// (domain, query-type, query-class) key for matching responses
+        key: (String, DnsType, DnsClass),
         reply: oneshot::Sender<DnsPacket>,
     },
 }
@@ -168,7 +168,10 @@ impl DnsUdpTransport {
         Ok(())
     }
 
-    fn register(&self, key: (String, DnsType)) -> oneshot::Receiver<DnsPacket> {
+    fn register(
+        &self,
+        key: (String, DnsType, DnsClass),
+    ) -> oneshot::Receiver<DnsPacket> {
         let (tx, rx) = oneshot::channel();
         // Unbounded send never fails; ignore error if the recv loop has
         // already exited (the socket is dead).
@@ -180,9 +183,10 @@ impl DnsUdpTransport {
         socket: Arc<UdpSocket>,
         mut cmd_rx: mpsc::UnboundedReceiver<Command>,
     ) {
-        // Map from (domain, query-type) to senders waiting for a response.
+        // Map from (domain, query-type, query-class) to senders waiting for
+        // a response.
         let mut pending: HashMap<
-            (String, DnsType),
+            (String, DnsType, DnsClass),
             Vec<oneshot::Sender<DnsPacket>>,
         > = HashMap::new();
         let mut recv_buf = [0u8; DnsPacket::MAX_UDP_EDNS_PACKET_SIZE];
@@ -215,6 +219,7 @@ impl DnsUdpTransport {
                                 let key = (
                                     question.domain.to_string(),
                                     question.kind,
+                                    question.class,
                                 );
                                 if let Some(senders) = pending.remove(&key) {
                                     for sender in senders {
@@ -328,7 +333,7 @@ impl DnsGroup {
                 "DNS request has no question section",
             )
         })?;
-        let key = (question.domain.to_string(), question.kind);
+        let key = (question.domain.to_string(), question.kind, question.class);
         let query_bytes = request.to_bytes();
 
         let mut futures = FuturesUnordered::new();

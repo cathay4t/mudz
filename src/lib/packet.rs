@@ -218,6 +218,12 @@ impl DnsPacket {
         self.questions.first()
     }
 
+    /// Whether the packet contains an EDNS OPT record (type 41) in the
+    /// additional section.
+    pub fn has_edns(&self) -> bool {
+        self.additionals.iter().any(|r| u16::from(r.kind) == 41)
+    }
+
     pub fn domain_name(&self) -> Option<String> {
         if let Some(record) = self.first_question() {
             Some(record.domain.to_string())
