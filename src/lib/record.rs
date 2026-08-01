@@ -271,6 +271,9 @@ pub struct DnsDomainName {
 
 impl std::fmt::Display for DnsDomainName {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.labels.is_empty() {
+            return write!(f, ".");
+        }
         write!(
             f,
             "{}",
@@ -421,6 +424,15 @@ impl FromStr for DnsDomainName {
                 ErrorKind::InvalidArgument,
                 "Domain name cannot be empty",
             ));
+        }
+
+        // Root domain: "." is a single zero-length label
+        if name == "." {
+            return Ok(DnsDomainName {
+                labels: Vec::new(),
+                raw_offset: 0,
+                compression_pointer: None,
+            });
         }
 
         let mut labels = Vec::new();
