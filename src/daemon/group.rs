@@ -210,32 +210,31 @@ impl DnsUdpTransport {
         // client's ID — carry distinct wire IDs and can never be
         // cross-delivered. The response echoes the rewritten ID and is
         // matched against it; the caller restores the client's original ID.
-        let wire_id = rand::random::<u16>();
         let mut buf = bytes.to_vec();
-        buf[0..2].copy_from_slice(&wire_id.to_be_bytes());
-        let wire_key = (key.0.clone(), key.1, key.2, wire_id);
-        let rx = self.register(wire_key);
+        let mut wire_key: PendingKey = (key.0.clone(), key.1, key.2, 0);
+        let mut rx = None;
+        while rx.is_none() {
+            wire_key.3 = rand::random::<u16>();
+            // Check-and-insert under one lock: if another in-flight query
+            // already uses this wire ID, re-roll instead of registering a
+            // duplicate key, which would cross-deliver both responses.
+            let mut pending =
+                self.pending.lock().expect("pending map lock poisoned");
+            if pending.contains_key(&wire_key) {
+                continue;
+            }
+            let (tx, receiver) = oneshot::channel();
+            pending.entry(wire_key.clone()).or_default().push(tx);
+            rx = Some(receiver);
+        }
+        buf[0..2].copy_from_slice(&wire_key.3.to_be_bytes());
         self.socket.send(&buf).await.map_err(|e| {
             MudzError::new(
                 ErrorKind::Bug,
                 format!("Failed to send DNS query via UDP: {e}"),
             )
         })?;
-        Ok(rx)
-    }
-
-    /// Register interest in a response matching `key`. The sender is
-    /// inserted synchronously under a lock, so it is guaranteed to be
-    /// visible to `recv_loop` before `send_query` can complete.
-    fn register(&self, key: PendingKey) -> oneshot::Receiver<DnsPacket> {
-        let (tx, rx) = oneshot::channel();
-        self.pending
-            .lock()
-            .expect("pending map lock poisoned")
-            .entry(key)
-            .or_default()
-            .push(tx);
-        rx
+        Ok(rx.expect("wire key registered"))
     }
 
     async fn recv_loop(
