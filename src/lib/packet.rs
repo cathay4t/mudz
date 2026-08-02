@@ -157,7 +157,7 @@ impl DnsPacket {
         let remaining = data.len().saturating_sub(offset);
         let mut additionals = Vec::with_capacity(std::cmp::min(
             header.arcount as usize,
-            remaining,
+            remaining / DnsResourceRecord::HDR_LEN,
         ));
         for _ in 0..header.arcount {
             let record = DnsResourceRecord::parse_from(data, &mut offset)?;
