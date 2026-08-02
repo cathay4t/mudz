@@ -109,47 +109,36 @@ impl DnsGroups {
                             group_name,
                             domain
                         );
-                        let question =
-                            request.first_question().ok_or_else(|| {
-                                MudzError::new(
-                                    ErrorKind::InvalidArgument,
-                                    "DNS request has no question section",
-                                )
-                            })?;
-                        return Ok(DnsPacket::new_reply(
-                            request.header.id,
+                        return synthetic_reply(
+                            &request,
                             DnsResponseCode::NxDomain,
-                            question.domain.clone(),
-                            question.kind,
-                            question.class,
-                            request.header.rd,
-                        ));
+                        );
                     }
 
                     if !group.ensure_transports().await {
                         // All transports failed and cooldown hasn't
                         // elapsed — reply SERVFAIL so the client will
                         // retry rather than silently timing out.
-                        let question =
-                            request.first_question().ok_or_else(|| {
-                                MudzError::new(
-                                    ErrorKind::InvalidArgument,
-                                    "DNS request has no question section",
-                                )
-                            })?;
-                        return Ok(DnsPacket::new_reply(
-                            request.header.id,
+                        return synthetic_reply(
+                            &request,
                             DnsResponseCode::ServFail,
-                            question.domain.clone(),
-                            question.kind,
-                            question.class,
-                            request.header.rd,
-                        ));
+                        );
                     }
                     return group.request(request).await;
                 }
             }
             // fallback
+            if !self.fallback.ensure_transports().await {
+                // The fallback group follows the same retry policy as named
+                // groups: if its transports failed at startup (e.g. the
+                // network was not up yet), try to recreate them, and reply
+                // SERVFAIL while they are unavailable.
+                log::debug!(
+                    "Fallback group has no available transports, replying \
+                     SERVFAIL"
+                );
+                return synthetic_reply(&request, DnsResponseCode::ServFail);
+            }
             self.fallback.request(request).await
         } else {
             Err(MudzError::new(
@@ -158,6 +147,28 @@ impl DnsGroups {
             ))
         }
     }
+}
+
+/// Build a synthetic response for `request` with the given RCODE, echoing
+/// the question section and the request's ID and RD bit.
+fn synthetic_reply(
+    request: &DnsPacket,
+    code: DnsResponseCode,
+) -> Result<DnsPacket, MudzError> {
+    let question = request.first_question().ok_or_else(|| {
+        MudzError::new(
+            ErrorKind::InvalidArgument,
+            "DNS request has no question section",
+        )
+    })?;
+    Ok(DnsPacket::new_reply(
+        request.header.id,
+        code,
+        question.domain.clone(),
+        question.kind,
+        question.class,
+        request.header.rd,
+    ))
 }
 
 /// A per-upstream-server UDP transport that fans out responses to the
@@ -886,4 +897,87 @@ fn is_fatal_io_error(e: &std::io::Error) -> bool {
             | ErrorKind::ConnectionRefused
             | ErrorKind::NotConnected
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{collections::HashMap, sync::atomic::Ordering};
+
+    use mudz::{DnsPacket, DnsResponseCode, DnsType};
+
+    use super::*;
+    use crate::config::{MudzConfig, MudzFallbackConfig, MudzMainConfig};
+
+    fn test_config(fallback_ns: &str) -> MudzConfig {
+        MudzConfig {
+            main: MudzMainConfig::default(),
+            fallback: MudzFallbackConfig {
+                nameservers: vec![fallback_ns.to_string()],
+                disable_ipv6: false,
+            },
+            doh: None,
+            groups: HashMap::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_fallback_servfail_when_no_transports() {
+        // An unparseable nameserver address always fails transport creation,
+        // leaving the fallback group with no upstream connections.
+        let config = test_config("not-an-address");
+        let groups = DnsGroups::new(config, None, Arc::new(HostsFile::new()))
+            .await
+            .expect("create groups");
+        let query = DnsPacket::new_query("example.com", DnsType::A)
+            .expect("build query");
+
+        // Must be a SERVFAIL reply, not an error: the resolver turns the
+        // former into a reply to the client.
+        let resp = groups
+            .request(query)
+            .await
+            .expect("request must return a reply");
+        assert_eq!(resp.header.rcode, DnsResponseCode::ServFail);
+        assert!(resp.header.qr);
+        assert_eq!(resp.questions[0].domain.to_string(), "example.com");
+    }
+
+    #[tokio::test]
+    async fn test_ensure_transports_recovers_after_cooldown() {
+        let probe = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr = probe.local_addr().unwrap();
+        drop(probe);
+
+        let group = DnsGroup::new(
+            "test".to_string(),
+            vec![addr.to_string()],
+            false,
+            false,
+            None,
+            Arc::new(HostsFile::new()),
+        )
+        .await;
+        assert!(group.ensure_transports().await);
+
+        // Simulate a failed startup: no transports and a recent retry
+        // attempt, so ensure_transports must respect the cooldown.
+        *group.state.write().await = GroupState {
+            udp_transports: Vec::new(),
+            doh_clients: Vec::new(),
+        };
+        group.last_attempt.store(now_secs(), Ordering::Release);
+        assert!(
+            !group.ensure_transports().await,
+            "retry must be refused during the cooldown window"
+        );
+
+        // Once the cooldown has elapsed, the transports are recreated.
+        group.last_attempt.store(0, Ordering::Release);
+        assert!(
+            group.ensure_transports().await,
+            "transports must be recreated after the cooldown"
+        );
+        let state = group.state.read().await;
+        assert_eq!(state.udp_transports.len(), 1);
+    }
 }
