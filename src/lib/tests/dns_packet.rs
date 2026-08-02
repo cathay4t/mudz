@@ -947,3 +947,51 @@ fn test_dns_udp_client_times_out_without_valid_response() {
     assert_eq!(err.kind, ErrorKind::Timeout);
     server_thread.join().unwrap();
 }
+
+#[test]
+fn test_unterminated_domain_name_rejected() {
+    // Header with qdcount=1, then a label "com" but the buffer ends
+    // before the zero-length root label terminator. RFC 1035 §3.1
+    // requires every wire-format name to end with a zero-length label.
+    let truncated: Vec<u8> = vec![
+        0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, // header
+        0x03, b'c', b'o', b'm', // label "com" — buffer ends here
+    ];
+    let result = DnsPacket::parse(&truncated);
+    assert!(
+        result.is_err(),
+        "domain name without root label terminator must be rejected"
+    );
+    assert_eq!(result.unwrap_err().kind, ErrorKind::InvalidPacket);
+
+    // A properly terminated "com" with qtype/qclass parses fine.
+    let valid: Vec<u8> = vec![
+        0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, // header
+        0x03, b'c', b'o', b'm', 0x00, // "com" + root label
+        0x00, 0x01, // qtype A
+        0x00, 0x01, // qclass IN
+    ];
+    let packet = DnsPacket::parse(&valid).expect("valid packet must parse");
+    assert_eq!(packet.questions[0].domain.to_string(), "com");
+}
+
+#[test]
+fn test_unterminated_domain_name_label_at_buffer_end() {
+    // A label whose data reaches the exact end of the buffer, with no
+    // room for the zero-length terminator.
+    let raw_packet: Vec<u8> = vec![
+        0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, // header
+        0x07, b'e', b'x', b'a', b'm', b'p', b'l', b'e', // "example"
+        0x03, b'c', b'o', b'm', // "com" — no 0x00 after
+    ];
+    let result = DnsPacket::parse(&raw_packet);
+    assert!(
+        result.is_err(),
+        "domain name ending at buffer boundary without root label must be \
+         rejected"
+    );
+    assert_eq!(result.unwrap_err().kind, ErrorKind::InvalidPacket);
+}

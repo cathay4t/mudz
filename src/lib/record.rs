@@ -341,6 +341,7 @@ impl DnsDomainName {
         let mut compression_pointer: Option<usize> = None;
         let mut total_length: usize = 0;
         let mut pointer_count: usize = 0;
+        let mut terminated = false;
         const MAX_POINTER_CHAIN: usize = 10; // Prevent excessive chaining
 
         while *offset < buf.len() {
@@ -349,6 +350,7 @@ impl DnsDomainName {
             // Check for end of domain name
             if len_byte == 0 {
                 *offset += 1;
+                terminated = true;
                 break;
             }
 
@@ -433,6 +435,16 @@ impl DnsDomainName {
             }
             labels.push(buf[*offset..*offset + len].to_vec());
             *offset += len;
+        }
+
+        // RFC 1035 §3.1: every wire-format domain name must end with a
+        // zero-length label (the root). If the buffer ran out before the
+        // terminator, the name is malformed.
+        if !terminated {
+            return Err(MudzError::new(
+                ErrorKind::InvalidPacket,
+                "Domain name not terminated by a zero-length label",
+            ));
         }
 
         // After parsing the name (possibly following compression pointers),
