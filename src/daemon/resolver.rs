@@ -353,23 +353,37 @@ fn build_client_reply(
 /// `opt_len` bytes of a trailing OPT record are accounted for, setting the
 /// TC bit as required by RFC 6891 §6.2.5. The header and question section
 /// are kept; all answer, authority, and additional records are dropped and
-/// their counts zeroed. Returns whether truncation was needed.
+/// their counts zeroed. If the message cannot be parsed or the question
+/// would not fit even on its own, a header-only reply (QDCOUNT 0) is
+/// emitted rather than a corrupt message. Returns whether truncation was
+/// needed.
 fn truncate_response(buf: &mut Vec<u8>, limit: usize, opt_len: usize) -> bool {
-    if buf.len() + opt_len <= limit {
+    if buf.len() < DnsHeader::LEN || buf.len() + opt_len <= limit {
         return false;
     }
     let mut question_bytes = Vec::new();
+    let mut qdcount = 0u16;
     if let Ok(packet) = DnsPacket::parse(buf) {
+        qdcount = packet.questions.len() as u16;
         for question in &packet.questions {
             question.emit_to(&mut question_bytes);
         }
     }
-    let mut new_buf = buf[..DnsHeader::LEN.min(buf.len())].to_vec();
-    new_buf.extend_from_slice(&question_bytes);
+    let mut new_buf = buf[..DnsHeader::LEN].to_vec();
     // Set the TC bit (flags byte 2, bit 1) and zero the record counts
     // (ANCOUNT, NSCOUNT, ARCOUNT at bytes 6..12).
     new_buf[2] |= 0x02;
     new_buf[6..12].fill(0);
+    let keep_question =
+        qdcount > 0 && new_buf.len() + question_bytes.len() + opt_len <= limit;
+    if keep_question {
+        new_buf.extend_from_slice(&question_bytes);
+        new_buf[4..6].copy_from_slice(&qdcount.to_be_bytes());
+    } else {
+        // When the question is dropped, QDCOUNT must be zeroed too, or the
+        // reply would claim questions that are not present.
+        new_buf[4..6].fill(0);
+    }
     *buf = new_buf;
     true
 }
@@ -559,6 +573,41 @@ mod tests {
         assert!(parsed.answers.is_empty());
         // An EDNS client still gets its OPT ack.
         assert!(parsed.has_edns());
+    }
+
+    #[test]
+    fn test_build_client_reply_tiny_advertised_payload() {
+        // A client advertising an absurdly small payload (below the 512
+        // octet EDNS minimum) must still receive a reply that fits, even if
+        // that means dropping the question section entirely.
+        let reply = build_client_reply(
+            &large_response(),
+            0x4444,
+            false,
+            Some(40),
+            false,
+        );
+        assert!(
+            reply.len() <= 40,
+            "reply must fit within the tiny advertised payload, got {}",
+            reply.len()
+        );
+        let parsed = DnsPacket::parse(&reply).unwrap();
+        assert!(parsed.header.tc, "TC bit must be set on truncation");
+        assert_eq!(parsed.header.id, 0x4444);
+    }
+
+    #[test]
+    fn test_build_client_reply_malformed_neutral() {
+        // Garbage neutral bytes: must not panic and must yield a parseable
+        // header-only reply with TC set instead of a corrupt message.
+        let garbage = vec![0xAA; 600];
+        let reply = build_client_reply(&garbage, 0x5555, true, None, false);
+        assert!(reply.len() <= 512);
+        let parsed = DnsPacket::parse(&reply).unwrap();
+        assert!(parsed.header.tc);
+        assert_eq!(parsed.header.id, 0x5555);
+        assert!(parsed.questions.is_empty());
     }
 
     #[test]
