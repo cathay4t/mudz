@@ -8,7 +8,9 @@ use std::{
 };
 
 use futures_util::{StreamExt, stream::FuturesUnordered};
-use mudz::{DnsClass, DnsDomainName, DnsPacket, DnsResponseCode, DnsType};
+use mudz::{
+    DnsClass, DnsDomainName, DnsHeader, DnsPacket, DnsResponseCode, DnsType,
+};
 use tokio::{net::UdpSocket, sync::mpsc::UnboundedReceiver};
 
 use super::{
@@ -16,8 +18,10 @@ use super::{
     host::HostsFile, server::DnsQueryPacket,
 };
 
-/// Pending client: (address, transaction ID, RD flag, query carried EDNS).
-type PendingClient = (SocketAddr, u16, bool, bool);
+/// Pending client: (address, transaction ID, RD flag, EDNS payload size).
+/// The payload size is `None` for non-EDNS clients, which are limited to
+/// 512 bytes per RFC 1035 §4.2.1.
+type PendingClient = (SocketAddr, u16, bool, Option<u16>);
 /// (domain, query-type, query-class, DNSSEC-OK bit). The DO bit is part of
 /// the key so DO=0 and DO=1 resolutions stay separate (see `CacheKey`).
 type CliIndexKey = (String, DnsType, DnsClass, bool);
@@ -27,6 +31,11 @@ type CliIndexKey = (String, DnsType, DnsClass, bool);
 /// deliver over UDP.
 const EDNS_RESPONDER_PAYLOAD_SIZE: u16 =
     DnsPacket::MAX_UDP_EDNS_PACKET_SIZE as u16;
+/// Non-EDNS UDP response size limit (RFC 1035 §4.2.1).
+const NON_EDNS_UDP_LIMIT: usize = 512;
+/// Serialized size of the OPT ack appended by `build_client_reply`
+/// (1 byte root name + 2 type + 2 class + 4 TTL + 2 RDLENGTH).
+const OPT_ACK_LEN: usize = 11;
 
 pub(crate) struct DnsResolver;
 
@@ -83,9 +92,13 @@ impl DnsResolver {
                         true,
                     );
                     let neutral = packet.to_bytes();
-                    for (cli_addr, id, rd, has_edns) in cli_addrs {
+                    for (cli_addr, id, rd, edns_payload) in cli_addrs {
                         let buf = build_client_reply(
-                            &neutral, id, rd, has_edns, dnssec_ok,
+                            &neutral,
+                            id,
+                            rd,
+                            edns_payload,
+                            dnssec_ok,
                         );
                         send_bytes(&socket, &buf, cli_addr).await;
                     }
@@ -102,7 +115,7 @@ impl DnsResolver {
                                 &neutral,
                                 packet.header.id,
                                 packet.header.rd,
-                                packet.has_edns(),
+                                packet.edns_udp_payload_size(),
                                 packet.dnssec_ok(),
                             );
                             send_bytes(&socket, &buf, cli_addr).await;
@@ -116,12 +129,12 @@ impl DnsResolver {
                         let dns_class = question.class;
                         let id = packet.header.id;
                         let rd = packet.header.rd;
-                        let has_edns = packet.has_edns();
+                        let edns_payload = packet.edns_udp_payload_size();
                         let dnssec_ok = packet.dnssec_ok();
 
                         if let Some(neutral) = cache.get(&packet) {
                             let buf = build_client_reply(
-                                &neutral, id, rd, has_edns, dnssec_ok,
+                                &neutral, id, rd, edns_payload, dnssec_ok,
                             );
                             send_bytes(&socket, &buf, cli_addr).await;
                             continue;
@@ -149,11 +162,11 @@ impl DnsResolver {
                                 }
                                 pending
                                     .into_mut()
-                                    .push((cli_addr, id, rd, has_edns));
+                                    .push((cli_addr, id, rd, edns_payload));
                             }
                             Entry::Vacant(vacant) => {
                                 vacant.insert(vec![(
-                                    cli_addr, id, rd, has_edns,
+                                    cli_addr, id, rd, edns_payload,
                                 )]);
                                 let groups = Arc::clone(&groups);
                                 futures.push(async move {
@@ -240,9 +253,9 @@ impl DnsResolver {
                             true,
                         );
                         let neutral = packet.to_bytes();
-                        for (cli_addr, id, rd, has_edns) in cli_addrs {
+                        for (cli_addr, id, rd, edns_payload) in cli_addrs {
                             let buf = build_client_reply(
-                                &neutral, id, rd, has_edns, dnssec_ok,
+                                &neutral, id, rd, edns_payload, dnssec_ok,
                             );
                             send_bytes(&socket, &buf, cli_addr).await;
                         }
@@ -266,9 +279,9 @@ impl DnsResolver {
                     )) else {
                         continue;
                     };
-                    for (cli_addr, id, rd, has_edns) in cli_addrs {
+                    for (cli_addr, id, rd, edns_payload) in cli_addrs {
                         let buf = build_client_reply(
-                            &neutral, id, rd, has_edns, dnssec_ok,
+                            &neutral, id, rd, edns_payload, dnssec_ok,
                         );
                         send_bytes(&socket, &buf, cli_addr).await;
                     }
@@ -302,14 +315,16 @@ fn set_rd_bit(buf: &mut [u8], rd: bool) {
 
 /// Turn neutral response bytes (no OPT record, as stored in the cache or
 /// synthesized for SERVFAIL) into the final reply for a single client:
-/// rewrite the transaction ID and RD bit, and append an EDNS(0) OPT ack when
-/// the client queried with EDNS. RFC 6891 §6.1.1 requires a response to an
-/// EDNS query to carry an OPT record; a non-EDNS client gets none (§6.1.1).
+/// rewrite the transaction ID and RD bit, truncate to the client's
+/// advertised UDP payload size (setting TC as required by RFC 6891 §6.2.5),
+/// and append an EDNS(0) OPT ack when the client queried with EDNS. RFC 6891
+/// §6.1.1 requires a response to an EDNS query to carry an OPT record; a
+/// non-EDNS client gets none (§6.1.1).
 fn build_client_reply(
     neutral: &[u8],
     id: u16,
     rd: bool,
-    has_edns: bool,
+    edns_payload: Option<u16>,
     dnssec_ok: bool,
 ) -> Vec<u8> {
     let mut buf = neutral.to_vec();
@@ -317,7 +332,14 @@ fn build_client_reply(
         buf[0..2].copy_from_slice(&id.to_be_bytes());
     }
     set_rd_bit(&mut buf, rd);
-    if has_edns {
+    let opt_len = if edns_payload.is_some() {
+        OPT_ACK_LEN
+    } else {
+        0
+    };
+    let limit = edns_payload.map_or(NON_EDNS_UDP_LIMIT, usize::from);
+    truncate_response(&mut buf, limit, opt_len);
+    if edns_payload.is_some() {
         DnsPacket::append_opt_ack(
             &mut buf,
             EDNS_RESPONDER_PAYLOAD_SIZE,
@@ -325,6 +347,31 @@ fn build_client_reply(
         );
     }
     buf
+}
+
+/// Truncate a serialized DNS message to fit within `limit` bytes once
+/// `opt_len` bytes of a trailing OPT record are accounted for, setting the
+/// TC bit as required by RFC 6891 §6.2.5. The header and question section
+/// are kept; all answer, authority, and additional records are dropped and
+/// their counts zeroed. Returns whether truncation was needed.
+fn truncate_response(buf: &mut Vec<u8>, limit: usize, opt_len: usize) -> bool {
+    if buf.len() + opt_len <= limit {
+        return false;
+    }
+    let mut question_bytes = Vec::new();
+    if let Ok(packet) = DnsPacket::parse(buf) {
+        for question in &packet.questions {
+            question.emit_to(&mut question_bytes);
+        }
+    }
+    let mut new_buf = buf[..DnsHeader::LEN.min(buf.len())].to_vec();
+    new_buf.extend_from_slice(&question_bytes);
+    // Set the TC bit (flags byte 2, bit 1) and zero the record counts
+    // (ANCOUNT, NSCOUNT, ARCOUNT at bytes 6..12).
+    new_buf[2] |= 0x02;
+    new_buf[6..12].fill(0);
+    *buf = new_buf;
+    true
 }
 
 /// Validate an upstream response against the query we sent: the question
@@ -355,7 +402,7 @@ mod tests {
         DnsResourceRecord, DnsResponseCode, DnsType,
     };
 
-    use super::validate_upstream_response;
+    use super::{build_client_reply, validate_upstream_response};
 
     /// A NOERROR response to `example.com A` carrying an OPT record whose
     /// TTL encodes the given extended RCODE in its high byte.
@@ -436,5 +483,129 @@ mod tests {
             DnsType::AAAA,
             DnsClass::IN,
         ));
+    }
+
+    /// A NOERROR response to `example.com A` with 100 answers, serialized to
+    /// well over 512 bytes.
+    fn large_response() -> Vec<u8> {
+        let domain = DnsDomainName::from_str("example.com").unwrap();
+        let packet = DnsPacket {
+            header: DnsHeader {
+                id: 0x1234,
+                qr: true,
+                rcode: DnsResponseCode::NoError,
+                qdcount: 1,
+                ancount: 100,
+                ..Default::default()
+            },
+            questions: vec![DnsQuestion {
+                domain: domain.clone(),
+                kind: DnsType::A,
+                class: DnsClass::IN,
+            }],
+            answers: (0..100u8)
+                .map(|i| DnsResourceRecord {
+                    domain: domain.clone(),
+                    kind: DnsType::A,
+                    class: DnsClass::IN,
+                    ttl: 300,
+                    rdlength: 4,
+                    rdata: vec![10, 0, 0, i],
+                })
+                .collect(),
+            authorities: Vec::new(),
+            additionals: Vec::new(),
+        };
+        let bytes = packet.to_bytes();
+        assert!(bytes.len() > 512, "test response must exceed 512 bytes");
+        bytes
+    }
+
+    #[test]
+    fn test_build_client_reply_truncates_large_response_for_non_edns() {
+        let reply =
+            build_client_reply(&large_response(), 0x1111, true, None, false);
+        assert!(
+            reply.len() <= 512,
+            "non-EDNS reply must fit in 512 bytes, got {}",
+            reply.len()
+        );
+        let parsed = DnsPacket::parse(&reply).unwrap();
+        assert!(parsed.header.tc, "TC bit must be set on truncation");
+        assert_eq!(parsed.header.id, 0x1111);
+        assert_eq!(parsed.questions[0].domain.to_string(), "example.com");
+        assert!(parsed.answers.is_empty());
+        assert!(!parsed.has_edns());
+    }
+
+    #[test]
+    fn test_build_client_reply_truncates_to_edns_payload() {
+        let reply = build_client_reply(
+            &large_response(),
+            0x2222,
+            false,
+            Some(512),
+            false,
+        );
+        assert!(
+            reply.len() <= 512,
+            "reply must fit within the advertised payload, got {}",
+            reply.len()
+        );
+        let parsed = DnsPacket::parse(&reply).unwrap();
+        assert!(parsed.header.tc, "TC bit must be set on truncation");
+        assert_eq!(parsed.header.id, 0x2222);
+        assert_eq!(parsed.questions[0].domain.to_string(), "example.com");
+        assert!(parsed.answers.is_empty());
+        // An EDNS client still gets its OPT ack.
+        assert!(parsed.has_edns());
+    }
+
+    #[test]
+    fn test_build_client_reply_keeps_small_response() {
+        let domain = DnsDomainName::from_str("example.com").unwrap();
+        let packet = DnsPacket {
+            header: DnsHeader {
+                id: 0x3333,
+                qr: true,
+                rcode: DnsResponseCode::NoError,
+                qdcount: 1,
+                ancount: 1,
+                ..Default::default()
+            },
+            questions: vec![DnsQuestion {
+                domain: domain.clone(),
+                kind: DnsType::A,
+                class: DnsClass::IN,
+            }],
+            answers: vec![DnsResourceRecord {
+                domain: domain.clone(),
+                kind: DnsType::A,
+                class: DnsClass::IN,
+                ttl: 300,
+                rdlength: 4,
+                rdata: vec![1, 2, 3, 4],
+            }],
+            authorities: Vec::new(),
+            additionals: Vec::new(),
+        };
+        let neutral = packet.to_bytes();
+
+        // Small response for a non-EDNS client: no truncation, no OPT ack.
+        let reply = build_client_reply(&neutral, 0x3333, true, None, false);
+        let parsed = DnsPacket::parse(&reply).unwrap();
+        assert!(!parsed.header.tc);
+        assert_eq!(parsed.answers.len(), 1);
+        assert!(!parsed.has_edns());
+
+        // Small response for an EDNS client with DO=1: intact, with OPT ack
+        // echoing the DO bit.
+        let reply =
+            build_client_reply(&neutral, 0x3333, true, Some(4096), true);
+        let parsed = DnsPacket::parse(&reply).unwrap();
+        assert!(!parsed.header.tc);
+        assert_eq!(parsed.answers.len(), 1);
+        assert!(parsed.has_edns());
+        assert!(parsed.dnssec_ok());
     }
 }
