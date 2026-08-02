@@ -279,6 +279,15 @@ impl DnsPacket {
         self.opt_record().map(|r| u16::from(r.class))
     }
 
+    /// The extended RCODE from the OPT record's TTL field (RFC 6891 §6.1.3),
+    /// i.e. the high 8 bits of the 12-bit RCODE. Zero when no OPT record is
+    /// present. An extended RCODE such as BADVERS (16) or BADCOOKIE (23)
+    /// would otherwise be masked by the header's low 4 RCODE bits and look
+    /// like NoError.
+    pub fn extended_rcode(&self) -> u8 {
+        self.opt_record().map_or(0, |r| (r.ttl >> 24) as u8)
+    }
+
     /// Append an EDNS(0) OPT pseudo-record (RFC 6891) to a serialized DNS
     /// message and bump the header ARCOUNT. Used to acknowledge an EDNS
     /// client when replaying a cached response that was stored without its

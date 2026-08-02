@@ -759,6 +759,34 @@ fn test_dnssec_ok_and_udp_size_accessors() {
 }
 
 #[test]
+fn test_extended_rcode_accessor() {
+    // No OPT record -> extended RCODE is zero.
+    let plain = edns_response(false);
+    assert_eq!(plain.extended_rcode(), 0);
+
+    // OPT TTL high byte carries the extended RCODE (RFC 6891 §6.1.3):
+    // BADVERS = 16 -> ext-rcode 1.
+    let mut badvers = edns_response(false);
+    let opt = badvers
+        .additionals
+        .iter_mut()
+        .find(|r| r.kind == DnsType::Other(41))
+        .unwrap();
+    opt.ttl = 0x01_00_00_00;
+    assert_eq!(badvers.extended_rcode(), 1);
+    // The low 4 header bits still read NoError.
+    assert_eq!(badvers.header.rcode, DnsResponseCode::NoError);
+    // BADCOOKIE = 23 -> ext-rcode 1, cookie bit 8 (bit 0x0100) set.
+    badvers
+        .additionals
+        .iter_mut()
+        .find(|r| r.kind == DnsType::Other(41))
+        .unwrap()
+        .ttl = 0x01_00_01_00;
+    assert_eq!(badvers.extended_rcode(), 1);
+}
+
+#[test]
 fn test_add_opt_record() {
     let mut query =
         DnsPacket::new_query("example.com", DnsType::A).expect("build query");

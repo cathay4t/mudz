@@ -181,13 +181,9 @@ impl DnsResolver {
                 {
                     let reply_packet = match result {
                         Ok(packet) => {
-                            let question_ok =
-                                packet.first_question().is_some_and(|q| {
-                                    q.domain.to_string() == domain
-                                        && q.kind == dns_type
-                                        && q.class == dns_class
-                                });
-                            if question_ok {
+                            if validate_upstream_response(
+                                &packet, &domain, dns_type, dns_class,
+                            ) {
                                 if log::log_enabled!(log::Level::Debug) {
                                     log::debug!(
                                         "Got DNS reply from upstream for {}",
@@ -329,4 +325,116 @@ fn build_client_reply(
         );
     }
     buf
+}
+
+/// Validate an upstream response against the query we sent: the question
+/// must match (domain/type/class, case-insensitively), and the server must
+/// not have signalled an extended RCODE (RFC 6891 §6.1.3) — BADVERS,
+/// BADCOOKIE, etc. — which the header's low 4 RCODE bits would otherwise
+/// mask as NoError.
+fn validate_upstream_response(
+    packet: &DnsPacket,
+    domain: &str,
+    dns_type: DnsType,
+    dns_class: DnsClass,
+) -> bool {
+    packet.extended_rcode() == 0
+        && packet.first_question().is_some_and(|q| {
+            q.domain.to_string() == domain
+                && q.kind == dns_type
+                && q.class == dns_class
+        })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::str::FromStr;
+
+    use mudz::{
+        DnsClass, DnsDomainName, DnsHeader, DnsPacket, DnsQuestion,
+        DnsResourceRecord, DnsResponseCode, DnsType,
+    };
+
+    use super::validate_upstream_response;
+
+    /// A NOERROR response to `example.com A` carrying an OPT record whose
+    /// TTL encodes the given extended RCODE in its high byte.
+    fn response_with_ext_rcode(ext_rcode: u8) -> DnsPacket {
+        let domain = DnsDomainName::from_str("example.com").unwrap();
+        let opt_ttl: u32 = (ext_rcode as u32) << 24;
+        DnsPacket {
+            header: DnsHeader {
+                id: 0x1234,
+                qr: true,
+                rcode: DnsResponseCode::NoError,
+                qdcount: 1,
+                arcount: 1,
+                ..Default::default()
+            },
+            questions: vec![DnsQuestion {
+                domain: domain.clone(),
+                kind: DnsType::A,
+                class: DnsClass::IN,
+            }],
+            answers: vec![DnsResourceRecord {
+                domain: domain.clone(),
+                kind: DnsType::A,
+                class: DnsClass::IN,
+                ttl: 300,
+                rdlength: 4,
+                rdata: vec![1, 2, 3, 4],
+            }],
+            authorities: Vec::new(),
+            additionals: vec![DnsResourceRecord {
+                domain: DnsDomainName::default(),
+                kind: DnsType::Other(41),
+                class: DnsClass::Other(1232),
+                ttl: opt_ttl,
+                rdlength: 0,
+                rdata: Vec::new(),
+            }],
+        }
+    }
+
+    #[test]
+    fn test_validate_accepts_matching_response() {
+        let packet = response_with_ext_rcode(0);
+        assert!(validate_upstream_response(
+            &packet,
+            "example.com",
+            DnsType::A,
+            DnsClass::IN,
+        ));
+    }
+
+    #[test]
+    fn test_validate_rejects_extended_rcode() {
+        // BADVERS = 16 (ext-rcode 1): the header says NoError, but the
+        // response is an error and must not be treated as a valid answer.
+        let packet = response_with_ext_rcode(1);
+        assert_eq!(packet.extended_rcode(), 1);
+        assert!(!validate_upstream_response(
+            &packet,
+            "example.com",
+            DnsType::A,
+            DnsClass::IN,
+        ));
+    }
+
+    #[test]
+    fn test_validate_rejects_question_mismatch() {
+        let packet = response_with_ext_rcode(0);
+        assert!(!validate_upstream_response(
+            &packet,
+            "other.com",
+            DnsType::A,
+            DnsClass::IN,
+        ));
+        assert!(!validate_upstream_response(
+            &packet,
+            "example.com",
+            DnsType::AAAA,
+            DnsClass::IN,
+        ));
+    }
 }
