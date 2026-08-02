@@ -112,7 +112,12 @@ impl DnsUdpClient {
                     ));
                 }
             };
-            let packet = DnsPacket::parse(&buf[..n])?;
+            // Skip datagrams that are not a valid response to our query: a
+            // mismatched transaction ID, a non-response, or garbage that
+            // does not parse as DNS.
+            let Ok(packet) = DnsPacket::parse(&buf[..n]) else {
+                continue;
+            };
             if packet.header.id == query.header.id && packet.header.qr {
                 return Ok(packet);
             }

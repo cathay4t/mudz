@@ -898,6 +898,31 @@ fn test_dns_udp_client_skips_mismatched_response() {
 }
 
 #[test]
+fn test_dns_udp_client_skips_unparseable_datagram() {
+    let server = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    let server_addr = server.local_addr().unwrap();
+    let server_thread = std::thread::spawn(move || {
+        let mut buf = [0u8; 512];
+        let (n, peer) = server.recv_from(&mut buf).unwrap();
+        let query = DnsPacket::parse(&buf[..n]).unwrap();
+        // First a datagram that does not parse as DNS at all...
+        server.send_to(&[0xde, 0xad, 0xbe, 0xef], peer).unwrap();
+        // ...then the genuine response.
+        server
+            .send_to(&reply_for(&query, query.header.id).to_bytes(), peer)
+            .unwrap();
+    });
+
+    let client =
+        DnsUdpClient::new(&server_addr.to_string()).expect("create client");
+    let query = DnsPacket::new_query("example.com", DnsType::A).unwrap();
+    let resp = client.query(&query).expect("query failed");
+    assert_eq!(resp.header.id, query.header.id);
+    assert!(resp.header.qr);
+    server_thread.join().unwrap();
+}
+
+#[test]
 fn test_dns_udp_client_times_out_without_valid_response() {
     let server = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
     let server_addr = server.local_addr().unwrap();
