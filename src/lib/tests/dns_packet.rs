@@ -4,7 +4,7 @@ use std::str::FromStr;
 
 use mudz::{
     DnsClass, DnsDomainName, DnsHeader, DnsPacket, DnsQuestion,
-    DnsResourceRecord, DnsResponseCode, DnsType, ErrorKind,
+    DnsResourceRecord, DnsResponseCode, DnsType, DnsUdpClient, ErrorKind,
 };
 
 #[test]
@@ -822,4 +822,75 @@ fn test_domain_name_eq_different_names() {
     let a = DnsDomainName::from_str("example.com").expect("parse domain a");
     let b = DnsDomainName::from_str("example.org").expect("parse domain b");
     assert_ne!(a, b);
+}
+
+/// Build a single-question response for `query` with the given transaction
+/// ID, echoing the question section.
+fn reply_for(query: &DnsPacket, id: u16) -> DnsPacket {
+    DnsPacket::new_reply(
+        id,
+        DnsResponseCode::NoError,
+        query.questions[0].domain.clone(),
+        query.questions[0].kind,
+        query.questions[0].class,
+        true,
+    )
+}
+
+#[test]
+fn test_dns_udp_client_skips_mismatched_response() {
+    let server = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    let server_addr = server.local_addr().unwrap();
+    let server_thread = std::thread::spawn(move || {
+        let mut buf = [0u8; 512];
+        let (n, peer) = server.recv_from(&mut buf).unwrap();
+        let query = DnsPacket::parse(&buf[..n]).unwrap();
+        // A stale/spoofed response with a mismatched transaction ID...
+        server
+            .send_to(
+                &reply_for(&query, query.header.id.wrapping_add(1)).to_bytes(),
+                peer,
+            )
+            .unwrap();
+        // ...followed by the genuine response with the matching ID.
+        server
+            .send_to(&reply_for(&query, query.header.id).to_bytes(), peer)
+            .unwrap();
+    });
+
+    let client =
+        DnsUdpClient::new(&server_addr.to_string()).expect("create client");
+    let query = DnsPacket::new_query("example.com", DnsType::A).unwrap();
+    let resp = client.query(&query).expect("query failed");
+    // The mismatched response must have been skipped.
+    assert_eq!(resp.header.id, query.header.id);
+    assert!(resp.header.qr);
+    assert_eq!(resp.questions[0].domain.to_string(), "example.com");
+    server_thread.join().unwrap();
+}
+
+#[test]
+fn test_dns_udp_client_times_out_without_valid_response() {
+    let server = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    let server_addr = server.local_addr().unwrap();
+    // The server acknowledges receipt but never sends a valid response.
+    let server_thread = std::thread::spawn(move || {
+        let mut buf = [0u8; 512];
+        let (n, peer) = server.recv_from(&mut buf).unwrap();
+        let query = DnsPacket::parse(&buf[..n]).unwrap();
+        // Only a mismatched datagram arrives; the matching one never comes.
+        server
+            .send_to(
+                &reply_for(&query, query.header.id.wrapping_add(1)).to_bytes(),
+                peer,
+            )
+            .unwrap();
+    });
+
+    let client =
+        DnsUdpClient::new(&server_addr.to_string()).expect("create client");
+    let query = DnsPacket::new_query("example.com", DnsType::A).unwrap();
+    let err = client.query(&query).expect_err("query must time out");
+    assert_eq!(err.kind, ErrorKind::Timeout);
+    server_thread.join().unwrap();
 }
