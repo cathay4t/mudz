@@ -75,6 +75,18 @@ async fn handle_dns_query(
         return;
     }
 
+    // RFC 1035 §4.1.1: a query must contain at least one question. A
+    // qdcount=0 query cannot be answered, so reject it with FORMERR instead
+    // of silently dropping it and letting the client time out.
+    if packet.questions.is_empty() {
+        log::warn!(
+            "Received DNS query without question section from {}",
+            cli_addr
+        );
+        send_formerr(packet.header.id, socket, cli_addr).await;
+        return;
+    }
+
     let query = DnsQueryPacket { packet, cli_addr };
 
     if let Err(e) = sender.send(query) {
@@ -112,4 +124,59 @@ fn is_listener_fatal_error(e: &std::io::Error) -> bool {
         e.kind(),
         ErrorKind::BrokenPipe | ErrorKind::ConnectionRefused
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use mudz::{DnsPacket, DnsResponseCode};
+    use tokio::{net::UdpSocket, sync::mpsc};
+
+    use crate::server::DnsQueryPacket;
+
+    use super::DnsUdpListener;
+
+    #[tokio::test]
+    async fn test_query_without_question_gets_formerr() {
+        let (tx, mut rx) = mpsc::unbounded_channel::<DnsQueryPacket>();
+        let socket = Arc::new(
+            UdpSocket::bind("127.0.0.1:0").await.expect("bind listener"),
+        );
+        let listen_socket = socket.clone();
+        let handle = tokio::spawn(async move {
+            DnsUdpListener::run(tx, listen_socket).await;
+        });
+
+        // A well-formed 12-byte header with qdcount = 0: not parseable into a
+        // question, but a perfectly valid DNS packet otherwise.
+        let query = vec![
+            0x12, 0x34, // id
+            0x01, 0x00, // flags: QR=0, opcode=0, RD=1
+            0x00, 0x00, // qdcount = 0
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // an/ns/ar = 0
+        ];
+        let client = UdpSocket::bind("127.0.0.1:0").await.expect("bind client");
+        client
+            .send_to(&query, socket.local_addr().unwrap())
+            .await
+            .expect("send query");
+
+        let mut buf = [0u8; 512];
+        let (n, _) = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            client.recv_from(&mut buf),
+        )
+        .await
+        .expect("no FORMERR reply received")
+        .expect("recv failed");
+        let resp = DnsPacket::parse(&buf[..n]).expect("parse FORMERR reply");
+        assert!(resp.header.qr);
+        assert_eq!(resp.header.id, 0x1234);
+        assert_eq!(resp.header.rcode, DnsResponseCode::FormErr);
+
+        // The malformed query must not reach the resolver.
+        assert!(rx.try_recv().is_err());
+        handle.abort();
+    }
 }
