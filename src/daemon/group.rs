@@ -199,14 +199,29 @@ impl DnsUdpTransport {
         Ok(Self { socket, pending })
     }
 
-    async fn send_query(&self, bytes: &[u8]) -> Result<(), MudzError> {
-        self.socket.send(bytes).await.map_err(|e| {
+    async fn send_query(
+        &self,
+        bytes: &[u8],
+        key: &PendingKey,
+    ) -> Result<oneshot::Receiver<DnsPacket>, MudzError> {
+        // Rewrite the transaction ID to a fresh random value so that
+        // concurrent queries for the same (domain, type, class) — e.g. a
+        // DO=0 and a DO=1 resolution, or a retried query reusing the
+        // client's ID — carry distinct wire IDs and can never be
+        // cross-delivered. The response echoes the rewritten ID and is
+        // matched against it; the caller restores the client's original ID.
+        let wire_id = rand::random::<u16>();
+        let mut buf = bytes.to_vec();
+        buf[0..2].copy_from_slice(&wire_id.to_be_bytes());
+        let wire_key = (key.0.clone(), key.1, key.2, wire_id);
+        let rx = self.register(wire_key);
+        self.socket.send(&buf).await.map_err(|e| {
             MudzError::new(
                 ErrorKind::Bug,
                 format!("Failed to send DNS query via UDP: {e}"),
             )
         })?;
-        Ok(())
+        Ok(rx)
     }
 
     /// Register interest in a response matching `key`. The sender is
@@ -505,17 +520,25 @@ impl DnsGroup {
         let mut futures = FuturesUnordered::new();
 
         for transport in &state.udp_transports {
-            let rx = transport.register(key.clone());
-            if let Err(e) = transport.send_query(&query_bytes).await {
-                log::debug!(
-                    "Error sending DNS query to group '{}': {e}",
-                    self.name
-                );
-                continue;
-            }
+            let rx = match transport.send_query(&query_bytes, &key).await {
+                Ok(rx) => rx,
+                Err(e) => {
+                    log::debug!(
+                        "Error sending DNS query to group '{}': {e}",
+                        self.name
+                    );
+                    continue;
+                }
+            };
+            let client_id = key.3;
             let udp_future = async move {
                 match tokio::time::timeout(DNS_TIMEOUT_SEC, rx).await {
-                    Ok(Ok(packet)) => Ok(packet),
+                    Ok(Ok(mut packet)) => {
+                        // The upstream echoed the rewritten wire ID; restore
+                        // the client's original transaction ID.
+                        packet.header.id = client_id;
+                        Ok(packet)
+                    }
                     Ok(Err(_)) => Err(MudzError::new(
                         ErrorKind::Timeout,
                         "UDP response channel closed",
@@ -979,5 +1002,89 @@ mod tests {
         );
         let state = group.state.read().await;
         assert_eq!(state.udp_transports.len(), 1);
+    }
+
+    /// Concurrent queries for the same (domain, type, class) with the same
+    /// client transaction ID but different DNSSEC OK bits must each receive
+    /// their own response. Before per-query wire ID rewriting, the first
+    /// response was delivered to every waiter under the shared key, so one
+    /// caller received the other query's response.
+    #[tokio::test]
+    async fn test_concurrent_same_id_queries_not_cross_delivered() {
+        // Fake upstream: reply to each query echoing the received ID and the
+        // query's DO bit, so the two responses are distinguishable.
+        let upstream =
+            Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let upstream_addr = upstream.local_addr().unwrap();
+        let server = upstream.clone();
+        let server_task = tokio::spawn(async move {
+            let mut buf = [0u8; 512];
+            for _ in 0..2 {
+                let (n, peer) = server.recv_from(&mut buf).await.unwrap();
+                let query = DnsPacket::parse(&buf[..n]).unwrap();
+                let question = &query.questions[0];
+                let mut reply = DnsPacket::new_reply(
+                    query.header.id,
+                    DnsResponseCode::NoError,
+                    question.domain.clone(),
+                    question.kind,
+                    question.class,
+                    true,
+                );
+                reply.add_opt_record(1232, query.dnssec_ok());
+                server.send_to(&reply.to_bytes(), peer).await.unwrap();
+            }
+        });
+
+        let transport = DnsUdpTransport::new(&upstream_addr.to_string())
+            .await
+            .unwrap();
+
+        // Two queries for the same name/type/class with the same client ID,
+        // one with the DNSSEC OK bit set and one without.
+        let mut query_do0 =
+            DnsPacket::new_query("example.com", DnsType::A).unwrap();
+        query_do0.add_opt_record(1232, false);
+        let mut query_do1 =
+            DnsPacket::new_query("example.com", DnsType::A).unwrap();
+        query_do1.add_opt_record(1232, true);
+        query_do1.header.id = query_do0.header.id;
+        let client_id = query_do0.header.id;
+        let question = query_do0.questions[0].clone();
+        let key = (
+            question.domain.to_string(),
+            question.kind,
+            question.class,
+            client_id,
+        );
+
+        let bytes_do0 = query_do0.to_bytes();
+        let bytes_do1 = query_do1.to_bytes();
+        let (rx_do0, rx_do1) = tokio::join!(
+            transport.send_query(&bytes_do0, &key),
+            transport.send_query(&bytes_do1, &key),
+        );
+        let rx_do0 = rx_do0.expect("send DO=0 query");
+        let rx_do1 = rx_do1.expect("send DO=1 query");
+
+        let (resp_do0, resp_do1) = tokio::join!(rx_do0, rx_do1);
+        let mut resp_do0 = resp_do0.expect("DO=0 response");
+        let mut resp_do1 = resp_do1.expect("DO=1 response");
+        // Restore the client ID, as `DnsGroup::request_inner` does.
+        resp_do0.header.id = client_id;
+        resp_do1.header.id = client_id;
+
+        assert_eq!(resp_do0.header.id, client_id);
+        assert_eq!(resp_do1.header.id, client_id);
+        assert!(
+            !resp_do0.dnssec_ok(),
+            "DO=0 caller must not receive the DO=1 response"
+        );
+        assert!(
+            resp_do1.dnssec_ok(),
+            "DO=1 caller must not receive the DO=0 response"
+        );
+
+        server_task.await.unwrap();
     }
 }
