@@ -133,9 +133,8 @@ mod tests {
     use mudz::{DnsPacket, DnsResponseCode};
     use tokio::{net::UdpSocket, sync::mpsc};
 
-    use crate::server::DnsQueryPacket;
-
     use super::DnsUdpListener;
+    use crate::server::DnsQueryPacket;
 
     #[tokio::test]
     async fn test_query_without_question_gets_formerr() {

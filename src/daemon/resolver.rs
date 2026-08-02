@@ -351,39 +351,102 @@ fn build_client_reply(
 
 /// Truncate a serialized DNS message to fit within `limit` bytes once
 /// `opt_len` bytes of a trailing OPT record are accounted for, setting the
-/// TC bit as required by RFC 6891 §6.2.5. The header and question section
-/// are kept; all answer, authority, and additional records are dropped and
-/// their counts zeroed. If the message cannot be parsed or the question
-/// would not fit even on its own, a header-only reply (QDCOUNT 0) is
-/// emitted rather than a corrupt message. Returns whether truncation was
+/// TC bit as required by RFC 6891 §6.2.5. RFC 1035 §4.2.1: the server
+/// SHOULD include as many RRs as possible in a truncated response. Records
+/// are included in section order (answer, authority, additional); once a
+/// section does not fit, all subsequent sections are dropped and TC is set.
+/// OPT records in the additional section are skipped (the caller appends a
+/// per-client OPT ack separately). If the message cannot be parsed or the
+/// question would not fit even on its own, a header-only reply (QDCOUNT 0)
+/// is emitted rather than a corrupt message. Returns whether truncation was
 /// needed.
 fn truncate_response(buf: &mut Vec<u8>, limit: usize, opt_len: usize) -> bool {
     if buf.len() < DnsHeader::LEN || buf.len() + opt_len <= limit {
         return false;
     }
+    let Ok(packet) = DnsPacket::parse(buf) else {
+        let mut new_buf = buf[..DnsHeader::LEN].to_vec();
+        new_buf[2] |= 0x02;
+        new_buf[4..12].fill(0);
+        *buf = new_buf;
+        return true;
+    };
+
+    let mut new_buf = packet.header.to_bytes();
+    let mut truncated = false;
+
+    // Question section: always kept if it fits.
     let mut question_bytes = Vec::new();
-    let mut qdcount = 0u16;
-    if let Ok(packet) = DnsPacket::parse(buf) {
-        qdcount = packet.questions.len() as u16;
-        for question in &packet.questions {
-            question.emit_to(&mut question_bytes);
+    for question in &packet.questions {
+        question.emit_to(&mut question_bytes);
+    }
+    let qdcount = if new_buf.len() + question_bytes.len() + opt_len <= limit {
+        new_buf.extend_from_slice(&question_bytes);
+        packet.questions.len() as u16
+    } else {
+        0u16
+    };
+
+    // Answer section: include as many RRs as fit (RFC 1035 §4.2.1).
+    let mut ancount = 0u16;
+    for answer in &packet.answers {
+        let mut rr = Vec::new();
+        answer.emit_to(&mut rr);
+        if new_buf.len() + rr.len() + opt_len > limit {
+            truncated = true;
+            break;
+        }
+        new_buf.extend_from_slice(&rr);
+        ancount += 1;
+    }
+    if ancount < packet.answers.len() as u16 {
+        truncated = true;
+    }
+
+    // Authority section: include only if all answers fit.
+    let mut nscount = 0u16;
+    if !truncated {
+        for authority in &packet.authorities {
+            let mut rr = Vec::new();
+            authority.emit_to(&mut rr);
+            if new_buf.len() + rr.len() + opt_len > limit {
+                truncated = true;
+                break;
+            }
+            new_buf.extend_from_slice(&rr);
+            nscount += 1;
+        }
+        if nscount < packet.authorities.len() as u16 {
+            truncated = true;
         }
     }
-    let mut new_buf = buf[..DnsHeader::LEN].to_vec();
-    // Set the TC bit (flags byte 2, bit 1) and zero the record counts
-    // (ANCOUNT, NSCOUNT, ARCOUNT at bytes 6..12).
-    new_buf[2] |= 0x02;
-    new_buf[6..12].fill(0);
-    let keep_question =
-        qdcount > 0 && new_buf.len() + question_bytes.len() + opt_len <= limit;
-    if keep_question {
-        new_buf.extend_from_slice(&question_bytes);
-        new_buf[4..6].copy_from_slice(&qdcount.to_be_bytes());
-    } else {
-        // When the question is dropped, QDCOUNT must be zeroed too, or the
-        // reply would claim questions that are not present.
-        new_buf[4..6].fill(0);
+
+    // Additional section (non-OPT): include only if all above fit.
+    let mut arcount = 0u16;
+    if !truncated {
+        for additional in &packet.additionals {
+            if u16::from(additional.kind) == 41 {
+                continue;
+            }
+            let mut rr = Vec::new();
+            additional.emit_to(&mut rr);
+            if new_buf.len() + rr.len() + opt_len > limit {
+                truncated = true;
+                break;
+            }
+            new_buf.extend_from_slice(&rr);
+            arcount += 1;
+        }
     }
+
+    if truncated {
+        new_buf[2] |= 0x02;
+    }
+    new_buf[4..6].copy_from_slice(&qdcount.to_be_bytes());
+    new_buf[6..8].copy_from_slice(&ancount.to_be_bytes());
+    new_buf[8..10].copy_from_slice(&nscount.to_be_bytes());
+    new_buf[10..12].copy_from_slice(&arcount.to_be_bytes());
+
     *buf = new_buf;
     true
 }
@@ -548,7 +611,15 @@ mod tests {
         assert!(parsed.header.tc, "TC bit must be set on truncation");
         assert_eq!(parsed.header.id, 0x1111);
         assert_eq!(parsed.questions[0].domain.to_string(), "example.com");
-        assert!(parsed.answers.is_empty());
+        // RFC 1035 §4.2.1: as many RRs as possible must be kept.
+        assert!(
+            !parsed.answers.is_empty(),
+            "truncated reply must keep as many answers as fit"
+        );
+        assert!(
+            parsed.answers.len() < 100,
+            "not all 100 answers can fit in 512 bytes"
+        );
         assert!(!parsed.has_edns());
     }
 
@@ -570,7 +641,11 @@ mod tests {
         assert!(parsed.header.tc, "TC bit must be set on truncation");
         assert_eq!(parsed.header.id, 0x2222);
         assert_eq!(parsed.questions[0].domain.to_string(), "example.com");
-        assert!(parsed.answers.is_empty());
+        assert!(
+            !parsed.answers.is_empty(),
+            "truncated reply must keep as many answers as fit"
+        );
+        assert!(parsed.answers.len() < 100);
         // An EDNS client still gets its OPT ack.
         assert!(parsed.has_edns());
     }
@@ -656,5 +731,135 @@ mod tests {
         assert_eq!(parsed.answers.len(), 1);
         assert!(parsed.has_edns());
         assert!(parsed.dnssec_ok());
+    }
+
+    #[test]
+    fn test_truncation_keeps_maximum_answers() {
+        // Each A record for "example.com" serializes to 27 bytes
+        // (13 domain + 2 type + 2 class + 4 TTL + 2 rdlength + 4 rdata).
+        // Header(12) + question(17) = 29 bytes overhead.
+        // Non-EDNS limit 512: (512 - 29) / 27 = 17 answers fit.
+        let reply =
+            build_client_reply(&large_response(), 0x6666, true, None, false);
+        let parsed = DnsPacket::parse(&reply).unwrap();
+        assert!(parsed.header.tc);
+        assert_eq!(parsed.answers.len(), 17);
+        assert!(reply.len() <= 512);
+        // Adding one more answer would exceed 512: 29 + 18 * 27 = 515.
+    }
+
+    /// A CNAME chain response similar to `finance.sina.com.cn`: 3 CNAMEs
+    /// plus multiple A records, exceeding 512 bytes when serialized without
+    /// compression.
+    fn cname_chain_response() -> Vec<u8> {
+        let domain = DnsDomainName::from_str("finance.sina.com.cn").unwrap();
+        let cname1 =
+            DnsDomainName::from_str("financesina.gslb.sinaedge.com").unwrap();
+        let cname2 =
+            DnsDomainName::from_str("acksmall.grid.sinaedge.com").unwrap();
+        let cname3 =
+            DnsDomainName::from_str("ww1.sinaimg.cn.w.alikunlun.com").unwrap();
+        let mut answers = vec![
+            DnsResourceRecord {
+                domain: domain.clone(),
+                kind: DnsType::CNAME,
+                class: DnsClass::IN,
+                ttl: 300,
+                rdlength: 0,
+                rdata: {
+                    let mut b = Vec::new();
+                    cname1.emit_to(&mut b);
+                    b
+                },
+            },
+            DnsResourceRecord {
+                domain: cname1.clone(),
+                kind: DnsType::CNAME,
+                class: DnsClass::IN,
+                ttl: 300,
+                rdlength: 0,
+                rdata: {
+                    let mut b = Vec::new();
+                    cname2.emit_to(&mut b);
+                    b
+                },
+            },
+            DnsResourceRecord {
+                domain: cname2.clone(),
+                kind: DnsType::CNAME,
+                class: DnsClass::IN,
+                ttl: 300,
+                rdlength: 0,
+                rdata: {
+                    let mut b = Vec::new();
+                    cname3.emit_to(&mut b);
+                    b
+                },
+            },
+        ];
+        for i in 0..12u8 {
+            answers.push(DnsResourceRecord {
+                domain: cname3.clone(),
+                kind: DnsType::A,
+                class: DnsClass::IN,
+                ttl: 37,
+                rdlength: 4,
+                rdata: vec![121, 17, 122, 56 + i],
+            });
+        }
+        let packet = DnsPacket {
+            header: DnsHeader {
+                id: 0x7777,
+                qr: true,
+                rcode: DnsResponseCode::NoError,
+                qdcount: 1,
+                ancount: answers.len() as u16,
+                ..Default::default()
+            },
+            questions: vec![DnsQuestion {
+                domain,
+                kind: DnsType::A,
+                class: DnsClass::IN,
+            }],
+            answers,
+            authorities: Vec::new(),
+            additionals: Vec::new(),
+        };
+        let bytes = packet.to_bytes();
+        assert!(bytes.len() > 512, "CNAME chain must exceed 512 bytes");
+        bytes
+    }
+
+    #[test]
+    fn test_truncation_keeps_cname_chain_and_some_answers() {
+        // A non-EDNS client querying a CNAME chain with many A records
+        // (like `host finance.sina.com.cn`) must receive as many records
+        // as fit within 512 bytes, not an empty truncated reply.
+        let reply = build_client_reply(
+            &cname_chain_response(),
+            0x7777,
+            true,
+            None,
+            false,
+        );
+        assert!(reply.len() <= 512);
+        let parsed = DnsPacket::parse(&reply).unwrap();
+        assert!(parsed.header.tc);
+        assert_eq!(parsed.header.id, 0x7777);
+        // The 3 CNAME records (~90 bytes each) plus a few A records must
+        // fit; at minimum the CNAME chain is preserved.
+        assert!(
+            parsed.answers.len() >= 3,
+            "CNAME chain must survive truncation, got {} answers",
+            parsed.answers.len()
+        );
+        assert!(
+            parsed.answers.len() < 15,
+            "not all 15 records can fit in 512 bytes"
+        );
+        // First three answers must be the CNAME chain in order.
+        assert_eq!(parsed.answers[0].kind, DnsType::CNAME);
+        assert_eq!(parsed.answers[1].kind, DnsType::CNAME);
+        assert_eq!(parsed.answers[2].kind, DnsType::CNAME);
     }
 }
