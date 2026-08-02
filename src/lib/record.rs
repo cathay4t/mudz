@@ -273,13 +273,43 @@ impl DnsResourceRecord {
 }
 
 /// A fully domain name
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct DnsDomainName {
     pub labels: Vec<Vec<u8>>,
     pub raw_offset: usize,
     /// If the domain was originally encoded as a compression pointer,
     /// this stores the pointer target for faithful re-emission
     pub compression_pointer: Option<usize>,
+}
+
+impl PartialEq for DnsDomainName {
+    /// DNS names are case-insensitive (RFC 4343): two names that differ only
+    /// in label casing compare equal, consistent with [`Self::to_string`] /
+    /// [`std::fmt::Display`], which lowercases. A name parsed from the wire
+    /// preserves its original casing, while `FromStr` lowercases, so without
+    /// this the same domain could compare unequal.
+    fn eq(&self, other: &Self) -> bool {
+        self.labels.len() == other.labels.len()
+            && self.labels.iter().zip(&other.labels).all(|(a, b)| {
+                a.len() == b.len()
+                    && a.iter().zip(b).all(|(x, y)| x.eq_ignore_ascii_case(y))
+            })
+    }
+}
+
+impl Eq for DnsDomainName {}
+
+impl std::hash::Hash for DnsDomainName {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        // Must match `PartialEq`: hash the case-folded labels so names that
+        // compare equal always hash equal.
+        for label in &self.labels {
+            state.write_usize(label.len());
+            for byte in label {
+                state.write_u8(byte.to_ascii_lowercase());
+            }
+        }
+    }
 }
 
 impl std::fmt::Display for DnsDomainName {

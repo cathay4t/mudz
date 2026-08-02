@@ -779,3 +779,47 @@ fn test_add_opt_record() {
     assert!(reparsed.dnssec_ok());
     assert_eq!(reparsed.edns_udp_payload_size(), Some(1232));
 }
+
+/// A DNS query packet whose question name is encoded with uppercase labels
+/// (parsing preserves the original casing).
+fn mixed_case_query() -> DnsPacket {
+    let raw = vec![
+        0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x03, b'W', b'W', b'W', 0x07, b'E', b'X', b'A', b'M', b'P', b'L', b'E',
+        0x03, b'C', b'O', b'M', 0x00, 0x00, 0x01, 0x00, 0x01,
+    ];
+    DnsPacket::parse(&raw).expect("parse mixed-case query")
+}
+
+#[test]
+fn test_domain_name_eq_ignores_case() {
+    let wire_domain = &mixed_case_query().questions[0].domain;
+    assert_eq!(wire_domain.labels[0], b"WWW");
+    // A name built via FromStr is lowercased; it must still compare equal to
+    // the wire-parsed name of the same domain.
+    let from_str = DnsDomainName::from_str("www.example.com")
+        .expect("parse domain from string");
+    assert_eq!(wire_domain, &from_str);
+    assert_eq!(wire_domain.to_string(), "www.example.com");
+}
+
+#[test]
+fn test_domain_name_hash_ignores_case() {
+    use std::collections::HashSet;
+
+    let wire_domain = mixed_case_query().questions[0].domain.clone();
+    let from_str = DnsDomainName::from_str("WWW.Example.COM")
+        .expect("parse domain from string");
+
+    let mut set = HashSet::new();
+    set.insert(wire_domain);
+    assert!(set.contains(&from_str), "hash must be case-insensitive");
+    assert_eq!(set.len(), 1);
+}
+
+#[test]
+fn test_domain_name_eq_different_names() {
+    let a = DnsDomainName::from_str("example.com").expect("parse domain a");
+    let b = DnsDomainName::from_str("example.org").expect("parse domain b");
+    assert_ne!(a, b);
+}
