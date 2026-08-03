@@ -26,4 +26,4 @@ toml = "0.8"
 
 [workspace.dependencies.tokio]
 version ="1.35.0"
-features = ["net", "rt", "rt-multi-thread", "macros", "sync", "time", "signal"]
+features = ["net", "rt", "rt-multi-thread", "macros", "sync", "time", "signal", "io-util"]

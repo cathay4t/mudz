@@ -2,7 +2,6 @@
 
 use std::{
     collections::{HashMap, hash_map::Entry},
-    net::SocketAddr,
     str::FromStr,
     sync::Arc,
 };
@@ -15,14 +14,18 @@ use mudz::{
 use tokio::{net::UdpSocket, sync::mpsc::UnboundedReceiver};
 
 use super::{
-    cache::DnsCacheStore, config::MudzConfig, group::DnsGroups,
-    host::HostsFile, server::DnsQueryPacket,
+    cache::DnsCacheStore,
+    config::MudzConfig,
+    group::DnsGroups,
+    host::HostsFile,
+    server::{DnsQueryPacket, DnsReplyTarget},
 };
 
-/// Pending client: (address, transaction ID, RD flag, EDNS payload size).
-/// The payload size is `None` for non-EDNS clients, which are limited to
-/// 512 bytes per RFC 1035 §4.2.1.
-type PendingClient = (SocketAddr, u16, bool, Option<u16>);
+/// Pending client: (reply target, transaction ID, RD flag, EDNS payload
+/// size). The payload size is `None` for non-EDNS clients, which are
+/// limited to 512 bytes per RFC 1035 §4.2.1 over UDP; TCP replies are not
+/// size-limited (RFC 7766 §7).
+type PendingClient = (DnsReplyTarget, u16, bool, Option<u16>);
 /// (domain, query-type, query-class, DNSSEC-OK bit). The DO bit is part of
 /// the key so DO=0 and DO=1 resolutions stay separate (see `CacheKey`).
 type CliIndexKey = (String, DnsType, DnsClass, bool);
@@ -93,15 +96,17 @@ impl DnsResolver {
                         true,
                     );
                     let neutral = packet.to_bytes();
-                    for (cli_addr, id, rd, edns_payload) in cli_addrs {
-                        let buf = build_client_reply(
+                    for (reply, id, rd, edns_payload) in cli_addrs {
+                        reply_client(
+                            &socket,
+                            reply,
                             &neutral,
                             id,
                             rd,
                             edns_payload,
                             dnssec_ok,
-                        );
-                        send_bytes(&socket, &buf, cli_addr).await;
+                        )
+                        .await;
                     }
                 }
             }
@@ -109,17 +114,19 @@ impl DnsResolver {
                 result = receiver.recv() => {
                     if let Some(query_packet) = result {
                         let packet = query_packet.packet;
-                        let cli_addr = query_packet.cli_addr;
+                        let reply = query_packet.reply;
                         if let Some(reply_packet) = hosts.get(&packet) {
                             let neutral = reply_packet.to_bytes();
-                            let buf = build_client_reply(
+                            reply_client(
+                                &socket,
+                                reply,
                                 &neutral,
                                 packet.header.id,
                                 packet.header.rd,
                                 packet.edns_udp_payload_size(),
                                 packet.dnssec_ok(),
-                            );
-                            send_bytes(&socket, &buf, cli_addr).await;
+                            )
+                            .await;
                             continue;
                         }
 
@@ -134,10 +141,11 @@ impl DnsResolver {
                         let dnssec_ok = packet.dnssec_ok();
 
                         if let Some(neutral) = cache.get(&packet) {
-                            let buf = build_client_reply(
-                                &neutral, id, rd, edns_payload, dnssec_ok,
-                            );
-                            send_bytes(&socket, &buf, cli_addr).await;
+                            reply_client(
+                                &socket, reply, &neutral, id, rd,
+                                edns_payload, dnssec_ok,
+                            )
+                            .await;
                             continue;
                         }
 
@@ -163,11 +171,11 @@ impl DnsResolver {
                                 }
                                 pending
                                     .into_mut()
-                                    .push((cli_addr, id, rd, edns_payload));
+                                    .push((reply, id, rd, edns_payload));
                             }
                             Entry::Vacant(vacant) => {
                                 vacant.insert(vec![(
-                                    cli_addr, id, rd, edns_payload,
+                                    reply, id, rd, edns_payload,
                                 )]);
                                 let groups = Arc::clone(&groups);
                                 futures.push(async move {
@@ -254,11 +262,12 @@ impl DnsResolver {
                             true,
                         );
                         let neutral = packet.to_bytes();
-                        for (cli_addr, id, rd, edns_payload) in cli_addrs {
-                            let buf = build_client_reply(
-                                &neutral, id, rd, edns_payload, dnssec_ok,
-                            );
-                            send_bytes(&socket, &buf, cli_addr).await;
+                        for (reply, id, rd, edns_payload) in cli_addrs {
+                            reply_client(
+                                &socket, reply, &neutral, id, rd,
+                                edns_payload, dnssec_ok,
+                            )
+                            .await;
                         }
                         continue;
                     };
@@ -280,11 +289,12 @@ impl DnsResolver {
                     )) else {
                         continue;
                     };
-                    for (cli_addr, id, rd, edns_payload) in cli_addrs {
-                        let buf = build_client_reply(
-                            &neutral, id, rd, edns_payload, dnssec_ok,
-                        );
-                        send_bytes(&socket, &buf, cli_addr).await;
+                    for (reply, id, rd, edns_payload) in cli_addrs {
+                        reply_client(
+                            &socket, reply, &neutral, id, rd, edns_payload,
+                            dnssec_ok,
+                        )
+                        .await;
                     }
                 }
                 else => {
@@ -295,10 +305,22 @@ impl DnsResolver {
     }
 }
 
-async fn send_bytes(socket: &Arc<UdpSocket>, buf: &[u8], cli_addr: SocketAddr) {
-    if let Err(e) = socket.send_to(buf, cli_addr).await {
-        log::warn!("Failed to send DNS reply to {}: {e}", cli_addr);
-    }
+/// Build and deliver a reply to one pending client: rewrite the transaction
+/// ID and RD bit, truncate to the transport's limits (UDP only), append the
+/// OPT ack when the client queried with EDNS, and send it over the client's
+/// chosen transport.
+async fn reply_client(
+    socket: &Arc<UdpSocket>,
+    reply: DnsReplyTarget,
+    neutral: &[u8],
+    id: u16,
+    rd: bool,
+    edns_payload: Option<u16>,
+    dnssec_ok: bool,
+) {
+    let tcp = reply.is_tcp();
+    let buf = build_client_reply(neutral, id, rd, edns_payload, dnssec_ok, tcp);
+    reply.send(socket, buf).await;
 }
 
 /// Set or clear the RD (Recursion Desired) bit in a serialized DNS
@@ -320,26 +342,34 @@ fn set_rd_bit(buf: &mut [u8], rd: bool) {
 /// advertised UDP payload size (setting TC as required by RFC 6891 §6.2.5),
 /// and append an EDNS(0) OPT ack when the client queried with EDNS. RFC 6891
 /// §6.1.1 requires a response to an EDNS query to carry an OPT record; a
-/// non-EDNS client gets none (§6.1.1).
+/// non-EDNS client gets none (§6.1.1). When `tcp` is set the reply is never
+/// truncated: RFC 7766 §7 removes the size limit for TCP transport.
 fn build_client_reply(
     neutral: &[u8],
     id: u16,
     rd: bool,
     edns_payload: Option<u16>,
     dnssec_ok: bool,
+    tcp: bool,
 ) -> Vec<u8> {
     let mut buf = neutral.to_vec();
     if buf.len() >= 2 {
         buf[0..2].copy_from_slice(&id.to_be_bytes());
     }
     set_rd_bit(&mut buf, rd);
-    let opt_len = if edns_payload.is_some() {
-        OPT_ACK_LEN
-    } else {
-        0
-    };
-    let limit = edns_payload.map_or(NON_EDNS_UDP_LIMIT, usize::from);
-    truncate_response(&mut buf, limit, opt_len);
+    // Over TCP there is no message size limit (RFC 7766 §7): never
+    // truncate and never set TC. Over UDP, truncate to the client's
+    // advertised payload size, 512 bytes for non-EDNS clients (RFC 1035
+    // §4.2.1).
+    if !tcp {
+        let opt_len = if edns_payload.is_some() {
+            OPT_ACK_LEN
+        } else {
+            0
+        };
+        let limit = edns_payload.map_or(NON_EDNS_UDP_LIMIT, usize::from);
+        truncate_response(&mut buf, limit, opt_len);
+    }
     if edns_payload.is_some() {
         DnsPacket::append_opt_ack(
             &mut buf,
@@ -612,8 +642,14 @@ mod tests {
 
     #[test]
     fn test_build_client_reply_truncates_large_response_for_non_edns() {
-        let reply =
-            build_client_reply(&large_response(), 0x1111, true, None, false);
+        let reply = build_client_reply(
+            &large_response(),
+            0x1111,
+            true,
+            None,
+            false,
+            false,
+        );
         assert!(
             reply.len() <= 512,
             "non-EDNS reply must fit in 512 bytes, got {}",
@@ -642,6 +678,7 @@ mod tests {
             0x2222,
             false,
             Some(512),
+            false,
             false,
         );
         assert!(
@@ -673,6 +710,7 @@ mod tests {
             false,
             Some(40),
             false,
+            false,
         );
         assert!(
             reply.len() <= 40,
@@ -689,12 +727,52 @@ mod tests {
         // Garbage neutral bytes: must not panic and must yield a parseable
         // header-only reply with TC set instead of a corrupt message.
         let garbage = vec![0xAA; 600];
-        let reply = build_client_reply(&garbage, 0x5555, true, None, false);
+        let reply =
+            build_client_reply(&garbage, 0x5555, true, None, false, false);
         assert!(reply.len() <= 512);
         let parsed = DnsPacket::parse(&reply).unwrap();
         assert!(parsed.header.tc);
         assert_eq!(parsed.header.id, 0x5555);
         assert!(parsed.questions.is_empty());
+    }
+
+    #[test]
+    fn test_build_client_reply_tcp_never_truncates() {
+        // RFC 7766 §7: over TCP there is no message size limit. A reply that
+        // would be truncated to 512 bytes over UDP is delivered whole with
+        // TC clear, even for a non-EDNS client.
+        let reply = build_client_reply(
+            &large_response(),
+            0x8888,
+            true,
+            None,
+            false,
+            true,
+        );
+        let parsed = DnsPacket::parse(&reply).unwrap();
+        assert_eq!(parsed.answers.len(), 100);
+        assert!(!parsed.header.tc, "TCP reply must not be truncated");
+        assert!(
+            !parsed.has_edns(),
+            "non-EDNS client must not get an OPT record over TCP"
+        );
+
+        // EDNS client over TCP: full answer plus OPT ack, still no
+        // truncation even with a tiny advertised payload (RFC 7766 §7).
+        let reply = build_client_reply(
+            &large_response(),
+            0x9999,
+            true,
+            Some(40),
+            true,
+            true,
+        );
+        assert!(reply.len() > 512, "TCP reply carries the full answer");
+        let parsed = DnsPacket::parse(&reply).unwrap();
+        assert_eq!(parsed.answers.len(), 100);
+        assert!(!parsed.header.tc);
+        assert!(parsed.has_edns());
+        assert!(parsed.dnssec_ok());
     }
 
     #[test]
@@ -728,7 +806,8 @@ mod tests {
         let neutral = packet.to_bytes();
 
         // Small response for a non-EDNS client: no truncation, no OPT ack.
-        let reply = build_client_reply(&neutral, 0x3333, true, None, false);
+        let reply =
+            build_client_reply(&neutral, 0x3333, true, None, false, false);
         let parsed = DnsPacket::parse(&reply).unwrap();
         assert!(!parsed.header.tc);
         assert_eq!(parsed.answers.len(), 1);
@@ -737,7 +816,7 @@ mod tests {
         // Small response for an EDNS client with DO=1: intact, with OPT ack
         // echoing the DO bit.
         let reply =
-            build_client_reply(&neutral, 0x3333, true, Some(4096), true);
+            build_client_reply(&neutral, 0x3333, true, Some(4096), true, false);
         let parsed = DnsPacket::parse(&reply).unwrap();
         assert!(!parsed.header.tc);
         assert_eq!(parsed.answers.len(), 1);
@@ -752,8 +831,14 @@ mod tests {
         // 2 type + 2 class + 4 TTL + 2 rdlength + 4 rdata).
         // Header(12) + question(17) = 29 bytes overhead.
         // Non-EDNS limit 512: (512 - 29) / 16 = 30 answers fit.
-        let reply =
-            build_client_reply(&large_response(), 0x6666, true, None, false);
+        let reply = build_client_reply(
+            &large_response(),
+            0x6666,
+            true,
+            None,
+            false,
+            false,
+        );
         let parsed = DnsPacket::parse(&reply).unwrap();
         assert!(parsed.header.tc);
         assert_eq!(parsed.answers.len(), 30);
@@ -853,6 +938,7 @@ mod tests {
             0x7777,
             true,
             None,
+            false,
             false,
         );
         assert!(reply.len() <= 512);

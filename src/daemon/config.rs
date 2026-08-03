@@ -14,6 +14,10 @@ const DEFAULT_UDP_BIND: &str = "127.0.0.1:53";
 pub(crate) struct MudzMainConfig {
     /// UDP socket bind address
     pub(crate) udp_bind: String,
+    /// TCP socket bind address (RFC 7766 §6.1: every DNS server must support
+    /// TCP, used when a UDP reply is truncated). Defaults to the same
+    /// address as `udp_bind` when omitted.
+    pub(crate) tcp_bind: Option<String>,
     /// Maximum number of cache entries
     pub(crate) max_cache_size: usize,
     #[serde(default)]
@@ -25,6 +29,7 @@ impl Default for MudzMainConfig {
     fn default() -> Self {
         Self {
             udp_bind: DEFAULT_UDP_BIND.to_string(),
+            tcp_bind: None,
             max_cache_size: DEFAULT_MAX_CACHE_SIZE,
             log_level: "info".to_string(),
         }

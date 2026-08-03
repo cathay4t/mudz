@@ -1,6 +1,10 @@
 [main]
 # Which UDP socket to listen
 udp_bind = "127.0.0.1:53"
+# Which TCP socket to listen (optional). DNS over TCP is required by
+# RFC 7766: clients retry over TCP when a UDP reply is truncated (TC bit).
+# Defaults to the same address as udp_bind.
+# tcp_bind = "127.0.0.1:53"
 # Maximum number of cache entries
 max_cache_size = 4096
 # Log level (trace, debug, info, warn, error)

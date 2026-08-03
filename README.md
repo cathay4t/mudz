@@ -1,10 +1,10 @@
 # DNS cache daemon in Rust -- mudz
 
 ## Features
- * Support DNS over UDP and HTTPs.
+ * Support DNS over UDP, TCP and HTTPs.
  * Domain based DNS name server selecting.
  * Pure rust code with memory safe guarantee.
- * Lock free concurrency and high performance.
+ * High performance.
 
 ## Usage
 
@@ -24,6 +24,10 @@ sudo systemctl enable mudz.service --now
 [main]
 # Which UDP socket to listen
 udp_bind = "127.0.0.1:53"
+# Which TCP socket to listen (optional; defaults to udp_bind). DNS over TCP
+# is required by RFC 7766: clients retry over TCP when a UDP reply is
+# truncated (TC bit), e.g. bind-utils `host` with answers over 512 bytes.
+tcp_bind = "127.0.0.1:53"
 # Maximum number of cache entries
 max_cache_size = 4096
 # Log level (trace, debug, info, warn, error)

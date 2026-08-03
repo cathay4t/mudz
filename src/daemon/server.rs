@@ -3,19 +3,60 @@
 use std::{net::SocketAddr, sync::Arc};
 
 use mudz::{DnsPacket, ErrorKind, MudzError};
-use tokio::{net::UdpSocket, sync::mpsc};
+use tokio::{
+    net::{TcpListener, UdpSocket},
+    sync::{mpsc, oneshot},
+};
 
 use super::{
-    config::MudzConfig, listener::DnsUdpListener, resolver::DnsResolver,
+    config::MudzConfig,
+    listener::{DnsTcpListener, DnsUdpListener},
+    resolver::DnsResolver,
 };
+
+/// Where to deliver a resolved reply: back over the UDP socket that carried
+/// the query, or over the client's TCP connection (RFC 1035 §4.2.2). TCP
+/// replies are handed to the connection task through a oneshot, which frames
+/// them with the 2-byte length prefix.
+pub(crate) enum DnsReplyTarget {
+    Udp(SocketAddr),
+    Tcp {
+        reply: oneshot::Sender<Vec<u8>>,
+        peer: SocketAddr,
+    },
+}
+
+impl DnsReplyTarget {
+    pub(crate) fn is_tcp(&self) -> bool {
+        matches!(self, DnsReplyTarget::Tcp { .. })
+    }
+
+    /// Deliver `buf` to the client. UDP replies are sent as one datagram;
+    /// TCP replies are sent into the connection task's oneshot.
+    pub(crate) async fn send(self, socket: &UdpSocket, buf: Vec<u8>) {
+        match self {
+            DnsReplyTarget::Udp(addr) => {
+                if let Err(e) = socket.send_to(&buf, addr).await {
+                    log::warn!("Failed to send DNS reply to {}: {e}", addr);
+                }
+            }
+            DnsReplyTarget::Tcp { reply, peer } => {
+                if reply.send(buf).is_err() {
+                    log::debug!("TCP client {peer} closed before reply");
+                }
+            }
+        }
+    }
+}
 
 pub(crate) struct DnsQueryPacket {
     pub(crate) packet: DnsPacket,
-    pub(crate) cli_addr: SocketAddr,
+    pub(crate) reply: DnsReplyTarget,
 }
 
 pub(crate) struct DnsUdpServer {
     socket: Arc<UdpSocket>,
+    tcp_listener: Option<Arc<TcpListener>>,
     config: MudzConfig,
 }
 
@@ -47,7 +88,34 @@ impl DnsUdpServer {
             })?);
         log::info!("DNS UDP server listening on {}", socket_addr);
 
-        Ok(Self { socket, config })
+        // DNS over TCP (RFC 7766): same address as UDP by default. A TCP
+        // bind failure is not fatal — the daemon keeps serving UDP — but is
+        // logged loudly because clients with truncated UDP replies (such as
+        // bind-utils `host`) will fail their TCP fallback.
+        let tcp_bind = config
+            .main
+            .tcp_bind
+            .as_deref()
+            .unwrap_or(&config.main.udp_bind);
+        let tcp_listener = match TcpListener::bind(&tcp_bind).await {
+            Ok(listener) => {
+                log::info!("DNS TCP server listening on {}", tcp_bind);
+                Some(Arc::new(listener))
+            }
+            Err(e) => {
+                log::warn!(
+                    "Failed to bind TCP socket {tcp_bind}: {e}; continuing \
+                     UDP-only"
+                );
+                None
+            }
+        };
+
+        Ok(Self {
+            socket,
+            tcp_listener,
+            config,
+        })
     }
 
     pub(crate) async fn run(&self) -> Result<(), MudzError> {
@@ -70,10 +138,20 @@ impl DnsUdpServer {
         let (sender, receiver) = mpsc::unbounded_channel::<DnsQueryPacket>();
 
         let socket = self.socket.clone();
-        let listener_handle =
+        let udp_sender = sender.clone();
+        let listener_handle = tokio::spawn(async move {
+            DnsUdpListener::run(udp_sender, socket).await
+        });
+
+        // The TCP listener shares the same query channel; replies are
+        // routed back over each client's connection via `DnsReplyTarget`.
+        let tcp_listener_handle = self.tcp_listener.as_ref().map(|listener| {
+            let sender = sender.clone();
+            let listener = Arc::clone(listener);
             tokio::spawn(
-                async move { DnsUdpListener::run(sender, socket).await },
-            );
+                async move { DnsTcpListener::run(sender, listener).await },
+            )
+        });
 
         let config = self.config.clone();
         let socket = self.socket.clone();
@@ -87,6 +165,19 @@ impl DnsUdpServer {
                     Ok(()) => log::info!("DNS listener task exited"),
                     Err(e) => log::error!(
                         "DNS listener task panicked: {e}"
+                    ),
+                }
+            }
+            result = async {
+                match tcp_listener_handle {
+                    Some(handle) => handle.await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                match result {
+                    Ok(()) => log::info!("DNS TCP listener task exited"),
+                    Err(e) => log::error!(
+                        "DNS TCP listener task panicked: {e}"
                     ),
                 }
             }

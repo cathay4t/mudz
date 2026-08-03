@@ -7,7 +7,9 @@
 
 use std::{
     fs,
-    net::{Ipv4Addr, Ipv6Addr, UdpSocket},
+    io::{Read, Write},
+    net::{Ipv4Addr, Ipv6Addr, TcpStream, UdpSocket},
+    sync::Mutex,
     thread,
     time::{Duration, Instant},
 };
@@ -18,6 +20,10 @@ use crate::{config::MudzConfig, server::DnsUdpServer};
 
 const CONF_PATH: &str = "/tmp/test_mudz.conf";
 const BIND: &str = "127.0.0.1:53530";
+
+/// All end-to-end tests bind the same `BIND` port, so they must not run
+/// concurrently. Hold this lock for the whole test body.
+static SERVER_LOCK: Mutex<()> = Mutex::new(());
 
 // i.root-servers.net has stable A/AAAA records that never change.
 const DOMAIN: &str = "i.root-servers.net";
@@ -131,6 +137,29 @@ fn first_aaaa(resp: &DnsPacket) -> Option<String> {
         .map(|octets| Ipv6Addr::from(octets).to_string())
 }
 
+/// Send one query over TCP (RFC 1035 §4.2.2 framing: 2-byte length prefix)
+/// and parse the reply.
+fn tcp_query(query: &DnsPacket) -> DnsPacket {
+    let mut stream = TcpStream::connect(BIND).expect("tcp connect");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("set tcp timeout");
+    let bytes = query.to_bytes();
+    let len = u16::try_from(bytes.len()).expect("query too large for TCP");
+    stream
+        .write_all(&len.to_be_bytes())
+        .expect("write tcp length prefix");
+    stream.write_all(&bytes).expect("write tcp query");
+    let mut len_buf = [0u8; 2];
+    stream
+        .read_exact(&mut len_buf)
+        .expect("read tcp reply length");
+    let reply_len = u16::from_be_bytes(len_buf) as usize;
+    let mut reply = vec![0u8; reply_len];
+    stream.read_exact(&mut reply).expect("read tcp reply body");
+    DnsPacket::parse(&reply).expect("parse tcp reply")
+}
+
 /// Run the full query suite against whatever fallback the current
 /// `/tmp/test_mudz.conf` selects.
 fn run_query_suite() {
@@ -183,10 +212,64 @@ fn run_query_suite() {
     drop(server);
 }
 
+/// Regression test for the original failure: `bailian.console.aliyun.com`'s
+/// A answer is larger than 512 bytes, so a non-EDNS UDP client (what
+/// bind-utils `host` sends) gets a truncated reply with TC set and retries
+/// over TCP (RFC 1035 §4.2.2). mudz must answer that TCP retry with the
+/// full, untruncated answer (RFC 7766 §7) instead of refusing the
+/// connection.
+#[test]
+fn test_daemon_resolves_over_tcp() {
+    let _lock = SERVER_LOCK.lock().expect("server lock poisoned");
+    let _config_guard = ConfigGuard;
+    write_config("\"223.5.5.5\"", "");
+    let server = start_server();
+
+    // Basic TCP resolution: correct answer, never truncated.
+    let query = DnsPacket::new_query(DOMAIN, DnsType::A).expect("build query");
+    let resp = tcp_query(&query);
+    assert_eq!(first_a(&resp).as_deref(), Some(EXPECTED_A));
+    assert!(
+        !resp.header.tc,
+        "TCP reply must not be truncated (RFC 7766 §7)"
+    );
+
+    // The large-answer case that forces the TCP fallback.
+    let query = DnsPacket::new_query("bailian.console.aliyun.com", DnsType::A)
+        .expect("build query");
+    let udp_resp = DnsUdpClient::new(BIND)
+        .expect("udp client")
+        .query(&query)
+        .expect("udp query");
+    assert!(
+        udp_resp.header.tc,
+        "precondition: the non-EDNS UDP reply is truncated to 512 bytes"
+    );
+    let tcp_resp = tcp_query(&query);
+    assert!(
+        !tcp_resp.header.tc,
+        "TCP reply must carry the full answer, not TC"
+    );
+    assert!(
+        tcp_resp.answers.len() > udp_resp.answers.len(),
+        "TCP reply must keep more records than the truncated UDP reply \
+         (udp={}, tcp={})",
+        udp_resp.answers.len(),
+        tcp_resp.answers.len()
+    );
+    assert!(
+        tcp_resp.answers.iter().any(|r| r.kind == DnsType::A),
+        "TCP reply must include the final A record"
+    );
+
+    drop(server);
+}
+
 #[test]
 fn test_daemon_resolves_via_udp_then_doh_fallback() {
     // Declared first so it is dropped last, removing the config file only
     // after both phases (and their servers) have finished.
+    let _lock = SERVER_LOCK.lock().expect("server lock poisoned");
     let _config_guard = ConfigGuard;
 
     // Phase 1: plain UDP fallback nameserver.
@@ -209,6 +292,7 @@ fn test_daemon_resolves_via_udp_then_doh_fallback() {
 /// emitter the reply stays under 512 bytes and must not be truncated.
 #[test]
 fn test_daemon_large_cname_response_not_truncated_for_non_edns() {
+    let _lock = SERVER_LOCK.lock().expect("server lock poisoned");
     let _config_guard = ConfigGuard;
     write_config("\"223.5.5.5\"", "");
     let server = start_server();
