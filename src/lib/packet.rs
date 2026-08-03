@@ -3,8 +3,8 @@
 use std::str::FromStr;
 
 use crate::{
-    DnsClass, DnsDomainName, DnsHeader, DnsQuestion, DnsResourceRecord,
-    DnsResponseCode, MudzError,
+    DnsClass, DnsDomainName, DnsHeader, DnsNameCompressionMap, DnsQuestion,
+    DnsResourceRecord, DnsResponseCode, MudzError,
 };
 
 /// DNS query types
@@ -182,21 +182,34 @@ impl DnsPacket {
         mut ttl_positions: Option<&mut Vec<(usize, u32)>>,
     ) -> Vec<u8> {
         let mut buf = self.header.to_bytes();
+        let mut cmap = DnsNameCompressionMap::new();
 
         for question in &self.questions {
-            question.emit_to(&mut buf);
+            question.emit_to_compressed(&mut buf, &mut cmap);
         }
 
         for answer in &self.answers {
-            answer.emit_to_with_ttl(&mut buf, &mut ttl_positions);
+            answer.emit_to_with_ttl_compressed(
+                &mut buf,
+                &mut ttl_positions,
+                &mut cmap,
+            );
         }
 
         for authority in &self.authorities {
-            authority.emit_to_with_ttl(&mut buf, &mut ttl_positions);
+            authority.emit_to_with_ttl_compressed(
+                &mut buf,
+                &mut ttl_positions,
+                &mut cmap,
+            );
         }
 
         for additional in &self.additionals {
-            additional.emit_to_with_ttl(&mut buf, &mut ttl_positions);
+            additional.emit_to_with_ttl_compressed(
+                &mut buf,
+                &mut ttl_positions,
+                &mut cmap,
+            );
         }
 
         buf
@@ -219,21 +232,34 @@ impl DnsPacket {
         let mut header = self.header.clone();
         header.arcount = header.arcount.saturating_sub(opt_count);
         let mut buf = header.to_bytes();
+        let mut cmap = DnsNameCompressionMap::new();
 
         for question in &self.questions {
-            question.emit_to(&mut buf);
+            question.emit_to_compressed(&mut buf, &mut cmap);
         }
         for answer in &self.answers {
-            answer.emit_to_with_ttl(&mut buf, &mut ttl_positions);
+            answer.emit_to_with_ttl_compressed(
+                &mut buf,
+                &mut ttl_positions,
+                &mut cmap,
+            );
         }
         for authority in &self.authorities {
-            authority.emit_to_with_ttl(&mut buf, &mut ttl_positions);
+            authority.emit_to_with_ttl_compressed(
+                &mut buf,
+                &mut ttl_positions,
+                &mut cmap,
+            );
         }
         for additional in &self.additionals {
             if u16::from(additional.kind) == 41 {
                 continue;
             }
-            additional.emit_to_with_ttl(&mut buf, &mut ttl_positions);
+            additional.emit_to_with_ttl_compressed(
+                &mut buf,
+                &mut ttl_positions,
+                &mut cmap,
+            );
         }
 
         buf

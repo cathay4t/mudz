@@ -11,5 +11,8 @@ pub use self::{
     error::{ErrorKind, MudzError},
     header::{DnsHeader, DnsResponseCode},
     packet::{DnsPacket, DnsType},
-    record::{DnsClass, DnsDomainName, DnsQuestion, DnsResourceRecord},
+    record::{
+        DnsClass, DnsDomainName, DnsNameCompressionMap, DnsQuestion,
+        DnsResourceRecord,
+    },
 };

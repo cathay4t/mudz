@@ -200,3 +200,40 @@ fn test_daemon_resolves_via_udp_then_doh_fallback() {
     );
     run_query_suite();
 }
+
+/// Regression test: `news.sina.com.cn` resolves to a CNAME chain plus a
+/// dozen A records. The upstream answer uses DNS name compression and fits
+/// in ~270 bytes, but re-serializing without compression bloats it past the
+/// 512-byte non-EDNS UDP limit, setting TC and forcing clients such as
+/// `host` to retry over TCP. With RFC 1035 §4.1.4 compression in the
+/// emitter the reply stays under 512 bytes and must not be truncated.
+#[test]
+fn test_daemon_large_cname_response_not_truncated_for_non_edns() {
+    let _config_guard = ConfigGuard;
+    write_config("\"223.5.5.5\"", "");
+    let server = start_server();
+    let client = DnsUdpClient::new(BIND).expect("failed to create client");
+
+    // A plain (non-EDNS) query, exactly what `host` sends.
+    let query = DnsPacket::new_query("news.sina.com.cn", DnsType::A)
+        .expect("build query");
+    let resp = client.query(&query).expect("news.sina.com.cn query failed");
+
+    assert!(
+        !resp.header.tc,
+        "compressed reply must fit in 512 bytes and not set TC (got {} bytes)",
+        resp.to_bytes().len()
+    );
+    assert!(
+        !resp.answers.is_empty(),
+        "reply must carry the CNAME chain and A records"
+    );
+    // The answer must contain at least one A record (the final target of the
+    // CNAME chain) so the client can actually connect.
+    assert!(
+        resp.answers.iter().any(|r| r.kind == DnsType::A),
+        "reply must contain at least one A record"
+    );
+
+    drop(server);
+}

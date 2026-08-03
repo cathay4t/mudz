@@ -9,7 +9,8 @@ use std::{
 
 use futures_util::{StreamExt, stream::FuturesUnordered};
 use mudz::{
-    DnsClass, DnsDomainName, DnsHeader, DnsPacket, DnsResponseCode, DnsType,
+    DnsClass, DnsDomainName, DnsHeader, DnsNameCompressionMap, DnsPacket,
+    DnsResponseCode, DnsType,
 };
 use tokio::{net::UdpSocket, sync::mpsc::UnboundedReceiver};
 
@@ -373,30 +374,33 @@ fn truncate_response(buf: &mut Vec<u8>, limit: usize, opt_len: usize) -> bool {
     };
 
     let mut new_buf = packet.header.to_bytes();
+    let mut cmap = DnsNameCompressionMap::new();
     let mut truncated = false;
 
-    // Question section: always kept if it fits.
-    let mut question_bytes = Vec::new();
+    // Question section: emit directly into new_buf so compression offsets
+    // are relative to the final message. Always kept if it fits.
+    let before_questions = new_buf.len();
     for question in &packet.questions {
-        question.emit_to(&mut question_bytes);
+        question.emit_to_compressed(&mut new_buf, &mut cmap);
     }
-    let qdcount = if new_buf.len() + question_bytes.len() + opt_len <= limit {
-        new_buf.extend_from_slice(&question_bytes);
+    let qdcount = if new_buf.len() + opt_len <= limit {
         packet.questions.len() as u16
     } else {
+        new_buf.truncate(before_questions);
+        cmap = DnsNameCompressionMap::new();
         0u16
     };
 
     // Answer section: include as many RRs as fit (RFC 1035 §4.2.1).
     let mut ancount = 0u16;
     for answer in &packet.answers {
-        let mut rr = Vec::new();
-        answer.emit_to(&mut rr);
-        if new_buf.len() + rr.len() + opt_len > limit {
+        let before = new_buf.len();
+        answer.emit_to_with_ttl_compressed(&mut new_buf, &mut None, &mut cmap);
+        if new_buf.len() + opt_len > limit {
+            new_buf.truncate(before);
             truncated = true;
             break;
         }
-        new_buf.extend_from_slice(&rr);
         ancount += 1;
     }
     if ancount < packet.answers.len() as u16 {
@@ -407,13 +411,17 @@ fn truncate_response(buf: &mut Vec<u8>, limit: usize, opt_len: usize) -> bool {
     let mut nscount = 0u16;
     if !truncated {
         for authority in &packet.authorities {
-            let mut rr = Vec::new();
-            authority.emit_to(&mut rr);
-            if new_buf.len() + rr.len() + opt_len > limit {
+            let before = new_buf.len();
+            authority.emit_to_with_ttl_compressed(
+                &mut new_buf,
+                &mut None,
+                &mut cmap,
+            );
+            if new_buf.len() + opt_len > limit {
+                new_buf.truncate(before);
                 truncated = true;
                 break;
             }
-            new_buf.extend_from_slice(&rr);
             nscount += 1;
         }
         if nscount < packet.authorities.len() as u16 {
@@ -428,13 +436,17 @@ fn truncate_response(buf: &mut Vec<u8>, limit: usize, opt_len: usize) -> bool {
             if u16::from(additional.kind) == 41 {
                 continue;
             }
-            let mut rr = Vec::new();
-            additional.emit_to(&mut rr);
-            if new_buf.len() + rr.len() + opt_len > limit {
+            let before = new_buf.len();
+            additional.emit_to_with_ttl_compressed(
+                &mut new_buf,
+                &mut None,
+                &mut cmap,
+            );
+            if new_buf.len() + opt_len > limit {
+                new_buf.truncate(before);
                 truncated = true;
                 break;
             }
-            new_buf.extend_from_slice(&rr);
             arcount += 1;
         }
     }
@@ -735,17 +747,18 @@ mod tests {
 
     #[test]
     fn test_truncation_keeps_maximum_answers() {
-        // Each A record for "example.com" serializes to 27 bytes
-        // (13 domain + 2 type + 2 class + 4 TTL + 2 rdlength + 4 rdata).
+        // With RFC 1035 §4.1.4 compression, each A record for "example.com"
+        // serializes to 16 bytes (2-byte pointer to the question name +
+        // 2 type + 2 class + 4 TTL + 2 rdlength + 4 rdata).
         // Header(12) + question(17) = 29 bytes overhead.
-        // Non-EDNS limit 512: (512 - 29) / 27 = 17 answers fit.
+        // Non-EDNS limit 512: (512 - 29) / 16 = 30 answers fit.
         let reply =
             build_client_reply(&large_response(), 0x6666, true, None, false);
         let parsed = DnsPacket::parse(&reply).unwrap();
         assert!(parsed.header.tc);
-        assert_eq!(parsed.answers.len(), 17);
+        assert_eq!(parsed.answers.len(), 30);
         assert!(reply.len() <= 512);
-        // Adding one more answer would exceed 512: 29 + 18 * 27 = 515.
+        // Adding one more answer would exceed 512: 29 + 31 * 16 = 525.
     }
 
     /// A CNAME chain response similar to `finance.sina.com.cn`: 3 CNAMEs
@@ -797,7 +810,7 @@ mod tests {
                 },
             },
         ];
-        for i in 0..12u8 {
+        for i in 0..20u8 {
             answers.push(DnsResourceRecord {
                 domain: cname3.clone(),
                 kind: DnsType::A,
@@ -846,16 +859,16 @@ mod tests {
         let parsed = DnsPacket::parse(&reply).unwrap();
         assert!(parsed.header.tc);
         assert_eq!(parsed.header.id, 0x7777);
-        // The 3 CNAME records (~90 bytes each) plus a few A records must
-        // fit; at minimum the CNAME chain is preserved.
+        // The 3 CNAME records plus a few A records must fit; at minimum the
+        // CNAME chain is preserved.
         assert!(
             parsed.answers.len() >= 3,
             "CNAME chain must survive truncation, got {} answers",
             parsed.answers.len()
         );
         assert!(
-            parsed.answers.len() < 15,
-            "not all 15 records can fit in 512 bytes"
+            parsed.answers.len() < 23,
+            "not all 23 records can fit in 512 bytes"
         );
         // First three answers must be the CNAME chain in order.
         assert_eq!(parsed.answers[0].kind, DnsType::CNAME);

@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
-use std::str::FromStr;
+use std::{collections::HashMap, str::FromStr};
 
 use crate::{DnsType, ErrorKind, MudzError};
 
@@ -84,6 +84,16 @@ impl DnsQuestion {
 
     pub fn emit_to(&self, buf: &mut Vec<u8>) {
         self.domain.emit_to(buf);
+        buf.extend_from_slice(&u16::from(self.kind).to_be_bytes());
+        buf.extend_from_slice(&u16::from(self.class).to_be_bytes());
+    }
+
+    pub fn emit_to_compressed(
+        &self,
+        buf: &mut Vec<u8>,
+        map: &mut DnsNameCompressionMap,
+    ) {
+        self.domain.emit_to_compressed(buf, map);
         buf.extend_from_slice(&u16::from(self.kind).to_be_bytes());
         buf.extend_from_slice(&u16::from(self.class).to_be_bytes());
     }
@@ -260,6 +270,28 @@ impl DnsResourceRecord {
         // The OPT pseudo-record (RFC 6891, type 41) reuses the TTL field to
         // carry the extended RCODE, version, and flags (including the DNSSEC
         // DO bit), so it is not a real TTL and must never be decremented.
+        if let Some(positions) = ttl_positions
+            && u16::from(self.kind) != 41
+        {
+            positions.push((buf.len(), self.ttl));
+        }
+        buf.extend_from_slice(&self.ttl.to_be_bytes());
+        let rdlength = self.rdata.len() as u16;
+        buf.extend_from_slice(&rdlength.to_be_bytes());
+        buf.extend_from_slice(&self.rdata);
+    }
+
+    /// Serialize with RFC 1035 §4.1.4 compression applied to the owner
+    /// name. The rdata is emitted verbatim.
+    pub fn emit_to_with_ttl_compressed(
+        &self,
+        buf: &mut Vec<u8>,
+        ttl_positions: &mut Option<&mut Vec<(usize, u32)>>,
+        map: &mut DnsNameCompressionMap,
+    ) {
+        self.domain.emit_to_compressed(buf, map);
+        buf.extend_from_slice(&u16::from(self.kind).to_be_bytes());
+        buf.extend_from_slice(&u16::from(self.class).to_be_bytes());
         if let Some(positions) = ttl_positions
             && u16::from(self.kind) != 41
         {
@@ -467,6 +499,61 @@ impl DnsDomainName {
             buf.extend_from_slice(label);
         }
         buf.push(0);
+    }
+
+    /// Serialize this domain name into `buf` using DNS message compression
+    /// (RFC 1035 §4.1.4). Repeated labels are replaced with 2-byte pointers
+    /// to a prior occurrence. `map` tracks name-suffix → byte-offset across
+    /// the whole message.
+    pub fn emit_to_compressed(
+        &self,
+        buf: &mut Vec<u8>,
+        map: &mut DnsNameCompressionMap,
+    ) {
+        let labels = &self.labels;
+        for i in 0..labels.len() {
+            let suffix = DnsNameCompressionMap::suffix_key(&labels[i..]);
+            if let Some(&offset) = map.names.get(&suffix) {
+                map.emit_pointer(buf, offset);
+                return;
+            }
+            map.names.insert(suffix, buf.len());
+            buf.push(labels[i].len() as u8);
+            buf.extend_from_slice(&labels[i]);
+        }
+        buf.push(0);
+    }
+}
+
+/// Tracks domain-name byte offsets during packet serialization so repeated
+/// names can be emitted as RFC 1035 §4.1.4 compression pointers. One map is
+/// created per serialized message and shared across all sections.
+#[derive(Debug, Default)]
+pub struct DnsNameCompressionMap {
+    names: HashMap<String, usize>,
+}
+
+impl DnsNameCompressionMap {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    fn suffix_key(labels: &[Vec<u8>]) -> String {
+        labels
+            .iter()
+            .map(|l| String::from_utf8_lossy(l).to_ascii_lowercase())
+            .collect::<Vec<_>>()
+            .join(".")
+    }
+
+    /// RFC 1035 §4.1.4: a compression pointer is two octets; the two most
+    /// significant bits are 1, and the remaining 14 bits hold the offset
+    /// from the start of the message. The 14-bit field caps the usable
+    /// offset at 16383.
+    fn emit_pointer(&self, buf: &mut Vec<u8>, offset: usize) {
+        let offset = offset & 0x3FFF;
+        buf.push(0xC0 | ((offset >> 8) & 0x3F) as u8);
+        buf.push((offset & 0xFF) as u8);
     }
 }
 
