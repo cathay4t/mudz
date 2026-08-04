@@ -7,7 +7,7 @@ members = [
 
 [workspace.package]
 version = "0.1.0"
-authors = ["Gris Ge <fge@redhat.com>"]
+authors = ["Gris Ge <cnfourt@gmail.com>"]
 description = "Linux DNS Caching Daemon"
 documentation = "https://github.com/cathay4t/muds"
 edition = "2024"
