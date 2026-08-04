@@ -25,5 +25,9 @@ serde = { version = "1.0.144", features = ["derive"] }
 toml = "0.8"
 
 [workspace.dependencies.tokio]
-version ="1.35.0"
+# 1.51.1 is the minimum: earlier versions do not surface latched socket
+# errors (SO_ERROR, e.g. ICMP port-unreachable ECONNREFUSED) from
+# UdpSocket::recv on Linux (tokio#8001), which the upstream transport
+# relies on to detect dead upstreams.
+version = "1.51.1"
 features = ["net", "rt", "rt-multi-thread", "macros", "sync", "time", "signal", "io-util"]

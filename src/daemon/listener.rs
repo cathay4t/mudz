@@ -176,8 +176,7 @@ async fn handle_tcp_connection(
                             write_tcp_reply(&mut stream, &reply).await
                         {
                             log::debug!(
-                                "Failed to write TCP DNS reply to {peer}: \
-                                 {e}"
+                                "Failed to write TCP DNS reply to {peer}: {e}"
                             );
                             return;
                         }

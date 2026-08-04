@@ -7,6 +7,7 @@ mod group;
 mod host;
 mod listener;
 mod resolver;
+mod retry;
 mod server;
 
 #[cfg(test)]

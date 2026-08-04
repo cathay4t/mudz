@@ -4,11 +4,8 @@ use std::{
     collections::HashMap,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     str::FromStr as _,
-    sync::{
-        Arc, Mutex,
-        atomic::{AtomicU64, Ordering},
-    },
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    sync::{Arc, Mutex},
+    time::Duration,
 };
 
 use futures_util::{StreamExt, future::Either, stream::FuturesUnordered};
@@ -22,10 +19,10 @@ use super::{
     config::MudzConfig,
     doh::{DohClient, DohResolvCache},
     host::HostsFile,
+    retry::{Attempt, CooldownGate, DNS_RETRY_COOLDOWN, UpstreamState},
 };
 
 const DNS_TIMEOUT_SEC: Duration = Duration::from_secs(5);
-const DNS_RETRY_COOLDOWN: Duration = Duration::from_secs(5);
 const IPV6_BLOCKED_HINFO_CPU: &str =
     "AAAA queries have been locally blocked by mudz";
 const IPV6_BLOCKED_HINFO_OS: &str =
@@ -176,6 +173,18 @@ fn synthetic_reply(
 struct DnsUdpTransport {
     socket: Arc<UdpSocket>,
     pending: Arc<Mutex<PendingMap>>,
+    /// Fail-cooldown-retry state (see [`super::retry`]). Shared with
+    /// `recv_loop`, which marks it broken when it exits on a fatal socket
+    /// error; `request_inner` consults it before sending and records the
+    /// outcome, and `ensure_transports` evicts broken transports.
+    state: Arc<UpstreamState>,
+    /// Handle to the background `recv_loop` task. The loop never exits on
+    /// its own except on a fatal socket error (which marks the transport
+    /// broken) or a panic; either way the task finishes. A finished handle
+    /// therefore means the transport can never dispatch responses again and
+    /// must be recreated - even when the panic path failed to mark it
+    /// broken (`tokio::spawn` catches panics silently).
+    recv_task: tokio::task::JoinHandle<()>,
 }
 
 /// Key for matching an upstream UDP response to its waiter: the question's
@@ -191,12 +200,31 @@ impl DnsUdpTransport {
         let socket = Arc::new(create_udp_socket(server_addr).await?);
         let pending: Arc<Mutex<PendingMap>> =
             Arc::new(Mutex::new(HashMap::new()));
+        let state = Arc::new(UpstreamState::new(server_addr));
 
         let recv_socket = socket.clone();
         let recv_pending = pending.clone();
-        tokio::spawn(Self::recv_loop(recv_socket, recv_pending));
+        let recv_state = Arc::clone(&state);
+        let recv_task = tokio::spawn(Self::recv_loop(
+            recv_socket,
+            recv_pending,
+            recv_state,
+        ));
 
-        Ok(Self { socket, pending })
+        Ok(Self {
+            socket,
+            pending,
+            state,
+            recv_task,
+        })
+    }
+
+    /// Whether this transport can still dispatch upstream responses. True
+    /// when the receive loop marked the transport broken on a fatal socket
+    /// error, or when the receive loop task has finished for any other
+    /// reason (e.g. a panic) - `recv_loop` only exits on those two events.
+    fn is_broken(&self) -> bool {
+        self.state.is_broken() || self.recv_task.is_finished()
     }
 
     async fn send_query(
@@ -240,6 +268,7 @@ impl DnsUdpTransport {
     async fn recv_loop(
         socket: Arc<UdpSocket>,
         pending: Arc<Mutex<PendingMap>>,
+        state: Arc<UpstreamState>,
     ) {
         let mut recv_buf = [0u8; DnsPacket::MAX_UDP_EDNS_PACKET_SIZE];
         let mut cleanup = tokio::time::interval(Duration::from_secs(30));
@@ -252,6 +281,12 @@ impl DnsUdpTransport {
                         Err(e) => {
                             log::debug!("UDP recv error on upstream socket: {e}");
                             if is_fatal_io_error(&e) {
+                                log::warn!(
+                                    "Upstream receive loop exiting on fatal \
+                                     socket error: {e}; transport marked \
+                                     broken"
+                                );
+                                state.mark_broken();
                                 break;
                             }
                             continue;
@@ -301,9 +336,9 @@ impl DnsUdpTransport {
 struct DnsGroup {
     name: String,
     state: tokio::sync::RwLock<GroupState>,
-    /// Unix timestamp (seconds) of the last transport-retry attempt.
-    /// Used for the [`DNS_RETRY_COOLDOWN`] gap between recreations.
-    last_attempt: AtomicU64,
+    /// Throttles transport recreation to at most one attempt per
+    /// [`DNS_RETRY_COOLDOWN`].
+    recreate_gate: CooldownGate,
     disable_ipv6: bool,
     /// `true` when the group was explicitly configured with an empty
     /// nameserver list — callers should return NXDOMAIN.
@@ -340,7 +375,7 @@ impl DnsGroup {
         Self {
             name,
             state: tokio::sync::RwLock::new(state),
-            last_attempt: AtomicU64::new(0),
+            recreate_gate: CooldownGate::new(DNS_RETRY_COOLDOWN),
             disable_ipv6,
             blocking,
             nameservers,
@@ -413,38 +448,45 @@ impl DnsGroup {
             return false;
         }
 
-        // Fast path: already ready — just a read-lock.
+        // Fast path: every transport is live and at least one exists.
         {
             let state = self.state.read().await;
-            if !state.udp_transports.is_empty() || !state.doh_clients.is_empty()
-            {
+            let has_broken = state.udp_transports.iter().any(|t| t.is_broken());
+            let has_live = !state.udp_transports.is_empty()
+                || !state.doh_clients.is_empty();
+            if !has_broken && has_live {
                 return true;
             }
         }
 
-        // Cooldown check.
-        let now = now_secs();
-        let prev = self.last_attempt.load(Ordering::Acquire);
-        if now.wrapping_sub(prev) < DNS_RETRY_COOLDOWN.as_secs() {
-            log::debug!(
-                "Group '{}' transport retry cooldown ({:.1}s remaining)",
-                self.name,
-                (DNS_RETRY_COOLDOWN.as_secs() - now.wrapping_sub(prev)) as f32
-            );
-            return false;
-        }
-        let _ = self.last_attempt.compare_exchange(
-            prev,
-            now,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        );
-
         let mut state = self.state.write().await;
+        // Evict transports whose receive loop died (fatal socket error or a
+        // silent panic) or that failed a probe: they can never dispatch
+        // responses again, and keeping them around would block recreation.
+        let before = state.udp_transports.len();
+        state.udp_transports.retain(|t| !t.is_broken());
+        if state.udp_transports.len() != before {
+            log::warn!(
+                "Group '{}': evicted {} broken upstream transport(s)",
+                self.name,
+                before - state.udp_transports.len()
+            );
+        }
         // Double-check: another request may have recreated them already.
         if !state.udp_transports.is_empty() || !state.doh_clients.is_empty() {
             return true;
         }
+
+        // Cooldown check: at most one recreation attempt per window.
+        if !self.recreate_gate.try_acquire() {
+            log::debug!(
+                "Group '{}' transport retry cooldown ({}s remaining)",
+                self.name,
+                self.recreate_gate.remaining_secs()
+            );
+            return false;
+        }
+
         *state = Self::create_state(
             &self.nameservers,
             &self.doh_config,
@@ -477,11 +519,19 @@ impl DnsGroup {
         // send never completes) would otherwise stall the request
         // indefinitely because `send_query` is called outside the
         // per-future timeout that only protects the receive side.
-        tokio::time::timeout(DNS_TIMEOUT_SEC, self.request_inner(request))
-            .await
-            .unwrap_or_else(|_elapsed| {
-                Err(MudzError::new(ErrorKind::Timeout, "DNS request timed out"))
-            })
+        //
+        // The guard must outlive the per-upstream timers: when both share
+        // one deadline they race, and if this outer guard wins,
+        // `request_inner` is dropped before it records the upstream
+        // failure, leaving the upstream health state stale.
+        tokio::time::timeout(
+            DNS_TIMEOUT_SEC + Duration::from_secs(1),
+            self.request_inner(request),
+        )
+        .await
+        .unwrap_or_else(|_elapsed| {
+            Err(MudzError::new(ErrorKind::Timeout, "DNS request timed out"))
+        })
     }
 
     /// Implementation of [`Self::request`] – the actual work, called inside
@@ -517,8 +567,26 @@ impl DnsGroup {
 
         let state = self.state.read().await;
         let mut futures = FuturesUnordered::new();
+        let mut skipped_dead = 0usize;
 
         for transport in &state.udp_transports {
+            // Dead upstreams are skipped so clients fail fast with
+            // SERVFAIL; the retry policy lets one probe through per
+            // cooldown window. Broken ones (receive loop dead, e.g. a
+            // fatal socket error or a silent panic) are never usable again
+            // and wait for eviction by `ensure_transports`.
+            if transport.is_broken() {
+                skipped_dead += 1;
+                continue;
+            }
+            let attempt = transport.state.may_attempt();
+            match attempt {
+                Attempt::Ready | Attempt::Probing => {}
+                Attempt::Dead | Attempt::Broken => {
+                    skipped_dead += 1;
+                    continue;
+                }
+            }
             let rx = match transport.send_query(&query_bytes, &key).await {
                 Ok(rx) => rx,
                 Err(e) => {
@@ -526,12 +594,26 @@ impl DnsGroup {
                         "Error sending DNS query to group '{}': {e}",
                         self.name
                     );
+                    if matches!(attempt, Attempt::Probing) {
+                        // A failed probe means the upstream has been
+                        // unresponsive for a whole cooldown window. Recreate
+                        // the transport instead of probing the same (possibly
+                        // stuck) socket forever - a fresh socket clears any
+                        // latched kernel error state.
+                        transport.state.mark_broken();
+                    } else {
+                        transport.state.record_failure();
+                    }
                     continue;
                 }
             };
             let client_id = key.3;
+            let transport = Arc::clone(transport);
+            let is_probe = matches!(attempt, Attempt::Probing);
             let udp_future = async move {
-                match tokio::time::timeout(DNS_TIMEOUT_SEC, rx).await {
+                let result = match tokio::time::timeout(DNS_TIMEOUT_SEC, rx)
+                    .await
+                {
                     Ok(Ok(mut packet)) => {
                         // The upstream echoed the rewritten wire ID; restore
                         // the client's original transaction ID.
@@ -546,30 +628,66 @@ impl DnsGroup {
                         ErrorKind::Timeout,
                         "UDP DNS query timed out",
                     )),
-                }
+                };
+                (Some(transport), result, is_probe)
             };
             futures.push(Either::Left(udp_future));
         }
 
         // Send to all DoH clients
         for doh_client in &state.doh_clients {
-            futures.push(Either::Right(doh_client.request(&request)));
+            let doh_future =
+                async { (None, doh_client.request(&request).await, false) };
+            futures.push(Either::Right(doh_future));
         }
 
         if futures.is_empty() {
-            return Err(MudzError::new(
-                ErrorKind::Bug,
-                format!(
-                    "No upstream connections available for group '{}'",
-                    self.name
-                ),
-            ));
+            return Err(if skipped_dead > 0 {
+                MudzError::new(
+                    ErrorKind::Timeout,
+                    format!(
+                        "All {skipped_dead} upstream(s) of group '{}' are \
+                         dead, failing fast",
+                        self.name
+                    ),
+                )
+            } else {
+                MudzError::new(
+                    ErrorKind::Bug,
+                    format!(
+                        "No upstream connections available for group '{}'",
+                        self.name
+                    ),
+                )
+            });
         }
 
-        while let Some(result) = futures.next().await {
+        while let Some((transport, result, is_probe)) = futures.next().await {
             match result {
-                Ok(response) => return Ok(response),
+                Ok(response) => {
+                    if let Some(transport) = transport {
+                        transport.state.record_success();
+                    }
+                    return Ok(response);
+                }
                 Err(e) => {
+                    if let Some(transport) = transport {
+                        if is_probe {
+                            // The probe failed: the upstream has been
+                            // unresponsive for a whole cooldown window.
+                            // Evict and recreate the transport so a fresh
+                            // socket (no latched errors, clean ARP/route
+                            // state) is used instead of probing forever.
+                            log::warn!(
+                                "Upstream '{}' failed a probe, marking \
+                                 transport broken for recreation",
+                                transport.state.name()
+                            );
+                            transport.state.mark_broken();
+                        } else {
+                            transport.state.record_failure();
+                        }
+                    }
                     log::debug!("Error processing DNS response: {e}");
                 }
             }
@@ -904,13 +1022,6 @@ async fn get_udp_dns_reply(socket: &UdpSocket) -> Result<DnsPacket, MudzError> {
     }
 }
 
-fn now_secs() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
-}
-
 fn is_fatal_io_error(e: &std::io::Error) -> bool {
     use std::io::ErrorKind;
     matches!(
@@ -923,12 +1034,15 @@ fn is_fatal_io_error(e: &std::io::Error) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::HashMap, sync::atomic::Ordering};
+    use std::collections::HashMap;
 
     use mudz::{DnsPacket, DnsResponseCode, DnsType};
 
     use super::*;
-    use crate::config::{MudzConfig, MudzFallbackConfig, MudzMainConfig};
+    use crate::{
+        config::{MudzConfig, MudzFallbackConfig, MudzMainConfig},
+        retry::now_secs,
+    };
 
     fn test_config(fallback_ns: &str) -> MudzConfig {
         MudzConfig {
@@ -940,6 +1054,80 @@ mod tests {
             doh: None,
             groups: HashMap::new(),
         }
+    }
+
+    /// Nothing listens on the upstream port, so the kernel answers with
+    /// ICMP port-unreachable; the latched socket error must reach the recv
+    /// loop (tokio >= 1.51.1, see tokio#8001) and mark the transport
+    /// broken. Uses its own port so it never collides with the end-to-end
+    /// tests.
+    #[tokio::test]
+    async fn test_transport_broken_on_icmp_refused() {
+        let transport = DnsUdpTransport::new("127.0.0.1:53537")
+            .await
+            .expect("create transport to dead port");
+        let query =
+            DnsPacket::new_query("example.com", DnsType::A).expect("query");
+        let key = (
+            "example.com".to_string(),
+            DnsType::A,
+            DnsClass::IN,
+            query.header.id,
+        );
+        // Let the receive loop park in recv before triggering the ICMP
+        // error, exactly like the running daemon.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let rx = transport
+            .send_query(&query.to_bytes(), &key)
+            .await
+            .expect("send query");
+        // The reply never comes; the rx oneshot only ends when it is
+        // dropped after the timeout future gives up.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        drop(rx);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            transport.state.is_broken(),
+            "recv loop must consume the latched ICMP error and mark the \
+             transport broken"
+        );
+        assert!(
+            transport.is_broken(),
+            "a broken transport must be detected via the transport itself so \
+             ensure_transports can evict it"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_transport_is_broken_when_recv_loop_panics() {
+        // A transport whose receive loop exits for any reason other than a
+        // fatal socket error (here: a panic) must still be detected as
+        // broken. `recv_loop` only exits on a fatal error or a panic, so a
+        // finished task handle is a reliable liveness signal even when the
+        // panic path never ran `mark_broken`.
+        let transport = DnsUdpTransport::new("127.0.0.1:53538")
+            .await
+            .expect("create transport");
+        assert!(
+            !transport.is_broken(),
+            "a freshly created transport must be live"
+        );
+
+        // Abort the receive loop to simulate a silent exit (e.g. a panic
+        // in `recv_loop` being caught by tokio). The transport must then
+        // be detected as broken without any fatal socket error.
+        transport.recv_task.abort();
+        // Allow the abort to take effect.
+        let deadline =
+            std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !transport.is_broken() && std::time::Instant::now() < deadline {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            transport.is_broken(),
+            "a transport whose receive loop exited silently must be detected \
+             as broken so it is evicted and recreated"
+        );
     }
 
     #[tokio::test]
@@ -987,14 +1175,14 @@ mod tests {
             udp_transports: Vec::new(),
             doh_clients: Vec::new(),
         };
-        group.last_attempt.store(now_secs(), Ordering::Release);
+        group.recreate_gate.set_last_attempt(now_secs());
         assert!(
             !group.ensure_transports().await,
             "retry must be refused during the cooldown window"
         );
 
         // Once the cooldown has elapsed, the transports are recreated.
-        group.last_attempt.store(0, Ordering::Release);
+        group.recreate_gate.set_last_attempt(0);
         assert!(
             group.ensure_transports().await,
             "transports must be recreated after the cooldown"
