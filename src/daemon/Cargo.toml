@@ -14,7 +14,7 @@ name = "mudzd"
 path = "main.rs"
 
 [dependencies]
-mudz = { path = "../lib" }
+mudz = { version = "0.1", path = "../lib" }
 tokio.workspace = true
 log.workspace = true
 env_logger.workspace = true

@@ -3,4 +3,5 @@
 mod blackhole;
 mod config;
 mod daemon;
+mod logging;
 mod recovery;
