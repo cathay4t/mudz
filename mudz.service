@@ -1,8 +1,12 @@
 [Unit]
 Description=Mudz DNS Caching Daemon
-After=network.target
-Before=network-online.target nss-lookup.target
-Wants=nss-lookup.target
+# DNS is part of "network online": start only after the network stack
+# (addresses/routes, including any netlink-online tooling) is up, so
+# upstreams are reachable on the first request. network-online.target is
+# passive, so it must be pulled in with Wants= as well as After=.
+After=network-online.target
+Wants=network-online.target nss-lookup.target
+Before=nss-lookup.target
 
 [Service]
 ExecStart=/usr/bin/mudzd
