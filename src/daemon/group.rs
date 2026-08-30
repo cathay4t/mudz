@@ -196,11 +196,14 @@ type PendingKey = (String, DnsType, DnsClass, u16);
 type PendingMap = HashMap<PendingKey, Vec<oneshot::Sender<DnsPacket>>>;
 
 impl DnsUdpTransport {
-    async fn new(server_addr: &str) -> Result<Self, MudzError> {
+    async fn new(
+        server_addr: &str,
+        group_name: &str,
+    ) -> Result<Self, MudzError> {
         let socket = Arc::new(create_udp_socket(server_addr).await?);
         let pending: Arc<Mutex<PendingMap>> =
             Arc::new(Mutex::new(HashMap::new()));
-        let state = Arc::new(UpstreamState::new(server_addr));
+        let state = Arc::new(UpstreamState::new(server_addr, group_name));
 
         let recv_socket = socket.clone();
         let recv_pending = pending.clone();
@@ -282,9 +285,11 @@ impl DnsUdpTransport {
                             log::debug!("UDP recv error on upstream socket: {e}");
                             if is_fatal_io_error(&e) {
                                 log::warn!(
-                                    "Upstream receive loop exiting on fatal \
-                                     socket error: {e}; transport marked \
-                                     broken"
+                                    "Upstream '{}' in group '{}' receive loop \
+                                     exiting on fatal socket error: {e}; \
+                                     transport marked broken",
+                                    state.name(),
+                                    state.group()
                                 );
                                 state.mark_broken();
                                 break;
@@ -331,6 +336,37 @@ impl DnsUdpTransport {
             }
         }
     }
+}
+
+fn record_upstream_success(transport: Option<Arc<DnsUdpTransport>>) {
+    if let Some(transport) = transport {
+        transport.state.record_success();
+    }
+}
+
+fn record_upstream_failure(
+    transport: Option<Arc<DnsUdpTransport>>,
+    error: &MudzError,
+    is_probe: bool,
+) {
+    if let Some(transport) = transport {
+        if is_probe {
+            // The probe failed: the upstream has been unresponsive for a
+            // whole cooldown window. Evict and recreate the transport so a
+            // fresh socket (no latched errors, clean ARP/route state) is
+            // used instead of probing forever.
+            log::warn!(
+                "Upstream '{}' in group '{}' failed a probe, marking \
+                 transport broken for recreation",
+                transport.state.name(),
+                transport.state.group()
+            );
+            transport.state.mark_broken();
+        } else {
+            transport.state.record_failure();
+        }
+    }
+    log::debug!("Error processing DNS response: {error}");
 }
 
 struct DnsGroup {
@@ -409,7 +445,7 @@ impl DnsGroup {
                     ),
                 }
             } else {
-                match DnsUdpTransport::new(srv).await {
+                match DnsUdpTransport::new(srv, group_name).await {
                     Ok(transport) => {
                         udp_transports.push(Arc::new(transport));
                     }
@@ -568,6 +604,7 @@ impl DnsGroup {
         let state = self.state.read().await;
         let mut futures = FuturesUnordered::new();
         let mut skipped_dead = 0usize;
+        let mut pending_udp = 0usize;
 
         for transport in &state.udp_transports {
             // Dead upstreams are skipped so clients fail fast with
@@ -632,12 +669,16 @@ impl DnsGroup {
                 (Some(transport), result, is_probe)
             };
             futures.push(Either::Left(udp_future));
+            pending_udp += 1;
         }
 
         // Send to all DoH clients
         for doh_client in &state.doh_clients {
-            let doh_future =
-                async { (None, doh_client.request(&request).await, false) };
+            let doh_client = doh_client.clone();
+            let doh_request = request.clone();
+            let doh_future = async move {
+                (None, doh_client.request(&doh_request).await, false)
+            };
             futures.push(Either::Right(doh_future));
         }
 
@@ -663,32 +704,38 @@ impl DnsGroup {
         }
 
         while let Some((transport, result, is_probe)) = futures.next().await {
+            if transport.is_some() {
+                pending_udp -= 1;
+            }
             match result {
                 Ok(response) => {
-                    if let Some(transport) = transport {
-                        transport.state.record_success();
+                    record_upstream_success(transport);
+                    if pending_udp > 0 {
+                        // Keep accounting for the upstreams that did not win
+                        // this request: their replies may still arrive (or
+                        // time out), and their health state must not go stale
+                        // just because another upstream answered first.
+                        tokio::spawn(async move {
+                            while let Some((transport, result, is_probe)) =
+                                futures.next().await
+                            {
+                                match result {
+                                    Ok(_) => {
+                                        record_upstream_success(transport);
+                                    }
+                                    Err(e) => {
+                                        record_upstream_failure(
+                                            transport, &e, is_probe,
+                                        );
+                                    }
+                                }
+                            }
+                        });
                     }
                     return Ok(response);
                 }
                 Err(e) => {
-                    if let Some(transport) = transport {
-                        if is_probe {
-                            // The probe failed: the upstream has been
-                            // unresponsive for a whole cooldown window.
-                            // Evict and recreate the transport so a fresh
-                            // socket (no latched errors, clean ARP/route
-                            // state) is used instead of probing forever.
-                            log::warn!(
-                                "Upstream '{}' failed a probe, marking \
-                                 transport broken for recreation",
-                                transport.state.name()
-                            );
-                            transport.state.mark_broken();
-                        } else {
-                            transport.state.record_failure();
-                        }
-                    }
-                    log::debug!("Error processing DNS response: {e}");
+                    record_upstream_failure(transport, &e, is_probe);
                 }
             }
         }
@@ -1063,7 +1110,7 @@ mod tests {
     /// tests.
     #[tokio::test]
     async fn test_transport_broken_on_icmp_refused() {
-        let transport = DnsUdpTransport::new("127.0.0.1:53537")
+        let transport = DnsUdpTransport::new("127.0.0.1:53537", "test")
             .await
             .expect("create transport to dead port");
         let query =
@@ -1105,7 +1152,7 @@ mod tests {
         // broken. `recv_loop` only exits on a fatal error or a panic, so a
         // finished task handle is a reliable liveness signal even when the
         // panic path never ran `mark_broken`.
-        let transport = DnsUdpTransport::new("127.0.0.1:53538")
+        let transport = DnsUdpTransport::new("127.0.0.1:53538", "test")
             .await
             .expect("create transport");
         assert!(
@@ -1223,9 +1270,10 @@ mod tests {
             }
         });
 
-        let transport = DnsUdpTransport::new(&upstream_addr.to_string())
-            .await
-            .unwrap();
+        let transport =
+            DnsUdpTransport::new(&upstream_addr.to_string(), "test")
+                .await
+                .unwrap();
 
         // Two queries for the same name/type/class with the same client ID,
         // one with the DNSSEC OK bit set and one without.

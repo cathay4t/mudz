@@ -71,19 +71,25 @@ struct HealthState {
 /// in an `Arc`. The name is kept only for log messages.
 pub(crate) struct UpstreamState {
     name: String,
+    group: String,
     health: Mutex<HealthState>,
 }
 
 impl UpstreamState {
-    pub(crate) fn new(name: &str) -> Self {
+    pub(crate) fn new(name: &str, group: &str) -> Self {
         Self {
             name: name.to_string(),
+            group: group.to_string(),
             health: Mutex::new(HealthState::default()),
         }
     }
 
     pub(crate) fn name(&self) -> &str {
         &self.name
+    }
+
+    pub(crate) fn group(&self) -> &str {
+        &self.group
     }
 
     /// Whether the next query may be sent to this upstream. A dead
@@ -103,7 +109,11 @@ impl UpstreamState {
             return Attempt::Dead;
         }
         health.dead_until = now + DNS_RETRY_COOLDOWN.as_secs();
-        log::debug!("Probing dead upstream '{}'", self.name);
+        log::debug!(
+            "Probing dead upstream '{}' in group '{}'",
+            self.name,
+            self.group
+        );
         Attempt::Probing
     }
 
@@ -118,9 +128,10 @@ impl UpstreamState {
             health.dead_until = now_secs() + DNS_RETRY_COOLDOWN.as_secs();
             if was_alive {
                 log::warn!(
-                    "Upstream '{}' marked dead for {}s after {} consecutive \
-                     failures",
+                    "Upstream '{}' in group '{}' marked dead for {}s after {} \
+                     consecutive failures",
                     self.name,
+                    self.group,
                     DNS_RETRY_COOLDOWN.as_secs(),
                     health.consecutive_failures
                 );
@@ -128,10 +139,18 @@ impl UpstreamState {
         }
     }
 
+    /// Record a successful attempt. A recovery message is only emitted when
+    /// the upstream was inside a dead window (that is, it had actually been
+    /// marked dead or was being probed); a single failure that never crossed
+    /// the dead threshold is not reported as a recovery.
     pub(crate) fn record_success(&self) {
         let mut health = self.health.lock().expect("health lock poisoned");
-        if health.consecutive_failures > 0 || health.dead_until != 0 {
-            log::info!("Upstream '{}' recovered", self.name);
+        if health.dead_until != 0 && !health.broken {
+            log::info!(
+                "Upstream '{}' in group '{}' recovered",
+                self.name,
+                self.group
+            );
         }
         health.consecutive_failures = 0;
         health.dead_until = 0;
@@ -194,7 +213,7 @@ mod tests {
     use super::*;
 
     fn upstream_state() -> UpstreamState {
-        UpstreamState::new("192.0.2.1")
+        UpstreamState::new("192.0.2.1", "test")
     }
 
     /// Force the dead window to have elapsed without sleeping.
