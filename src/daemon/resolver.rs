@@ -56,13 +56,7 @@ impl DnsResolver {
 
         let doh_config = config.doh.clone();
         let groups =
-            match DnsGroups::new(config, doh_config, hosts.clone()).await {
-                Ok(groups) => Arc::new(groups),
-                Err(e) => {
-                    log::error!("Failed to initialize DNS groups: {e}");
-                    return;
-                }
-            };
+            Arc::new(DnsGroups::new(config, doh_config, hosts.clone()));
 
         let mut futures = FuturesUnordered::new();
         loop {

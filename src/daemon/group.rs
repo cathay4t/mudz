@@ -36,11 +36,11 @@ pub(crate) struct DnsGroups {
 }
 
 impl DnsGroups {
-    pub(crate) async fn new(
+    pub(crate) fn new(
         mut config: MudzConfig,
         doh_config: Option<super::config::MudzDohConfig>,
         hosts: Arc<HostsFile>,
-    ) -> Result<Self, MudzError> {
+    ) -> Self {
         let fallback = DnsGroup::new(
             "fallback".to_string(),
             config.fallback.nameservers,
@@ -48,8 +48,7 @@ impl DnsGroups {
             false, // fallback is never intentionally blocking
             doh_config.clone(),
             hosts.clone(),
-        )
-        .await;
+        );
 
         let mut groups = HashMap::new();
         let mut search_index = HashMap::new();
@@ -62,8 +61,7 @@ impl DnsGroups {
                 blocking,
                 doh_config.clone(),
                 hosts.clone(),
-            )
-            .await;
+            );
             groups.insert(group_name.to_string(), dns_group);
 
             for domain in group_config.domains {
@@ -73,11 +71,11 @@ impl DnsGroups {
             }
         }
 
-        Ok(Self {
+        Self {
             fallback,
             groups,
             search_index,
-        })
+        }
     }
 
     pub(crate) async fn request(
@@ -112,7 +110,7 @@ impl DnsGroups {
                         );
                     }
 
-                    if !group.ensure_transports().await {
+                    if !ensure_transports_with_timeout(group).await {
                         // All transports failed and cooldown hasn't
                         // elapsed — reply SERVFAIL so the client will
                         // retry rather than silently timing out.
@@ -125,11 +123,11 @@ impl DnsGroups {
                 }
             }
             // fallback
-            if !self.fallback.ensure_transports().await {
+            if !ensure_transports_with_timeout(&self.fallback).await {
                 // The fallback group follows the same retry policy as named
-                // groups: if its transports failed at startup (e.g. the
-                // network was not up yet), try to recreate them, and reply
-                // SERVFAIL while they are unavailable.
+                // groups: transports are created on demand, and if they are
+                // unavailable (e.g. the network is not up yet) we reply
+                // SERVFAIL and retry after the cooldown.
                 log::debug!(
                     "Fallback group has no available transports, replying \
                      SERVFAIL"
@@ -142,6 +140,26 @@ impl DnsGroups {
                 ErrorKind::InvalidArgument,
                 "DNS request does not contain a domain",
             ))
+        }
+    }
+}
+
+/// Ensure `group` has transports, bounding the (potentially blocking)
+/// transport-creation work with the same per-upstream timeout used for DNS
+/// requests. A group whose upstreams are unreachable must fail fast with
+/// SERVFAIL instead of stalling the client while sockets or DoH bootstrap
+/// queries time out.
+async fn ensure_transports_with_timeout(group: &DnsGroup) -> bool {
+    match tokio::time::timeout(DNS_TIMEOUT_SEC, group.ensure_transports()).await
+    {
+        Ok(ready) => ready,
+        Err(_elapsed) => {
+            log::warn!(
+                "Timed out creating transports for group '{}', replying \
+                 SERVFAIL",
+                group.name
+            );
+            false
         }
     }
 }
@@ -391,7 +409,7 @@ struct GroupState {
 }
 
 impl DnsGroup {
-    async fn new(
+    fn new(
         name: String,
         nameservers: Vec<String>,
         disable_ipv6: bool,
@@ -399,18 +417,15 @@ impl DnsGroup {
         doh_config: Option<super::config::MudzDohConfig>,
         hosts: Arc<HostsFile>,
     ) -> Self {
-        let state = Self::create_state(
-            &nameservers,
-            &doh_config,
-            &hosts,
-            &name,
-            blocking,
-        )
-        .await;
-
         Self {
             name,
-            state: tokio::sync::RwLock::new(state),
+            // Upstream transports are created lazily on the first request
+            // for this group, so an unreachable fallback (or any other
+            // group) never blocks daemon startup or unrelated groups.
+            state: tokio::sync::RwLock::new(GroupState {
+                udp_transports: Vec::new(),
+                doh_clients: Vec::new(),
+            }),
             recreate_gate: CooldownGate::new(DNS_RETRY_COOLDOWN),
             disable_ipv6,
             blocking,
@@ -473,10 +488,10 @@ impl DnsGroup {
         }
     }
 
-    /// Ensure this group has working transports.  If they were
-    /// previously empty (e.g. the p2p interface was not up at startup),
-    /// try to recreate them — but only if at least
-    /// [`DNS_RETRY_COOLDOWN`] have passed since the last attempt.
+    /// Ensure this group has working transports. Transports are created
+    /// lazily on the first request; if creation failed (e.g. the p2p
+    /// interface was not up), retry — but only if at least
+    /// [`DNS_RETRY_COOLDOWN`] has passed since the last attempt.
     ///
     /// Returns `true` if one or more transports are now available.
     async fn ensure_transports(&self) -> bool {
@@ -1087,7 +1102,9 @@ mod tests {
 
     use super::*;
     use crate::{
-        config::{MudzConfig, MudzFallbackConfig, MudzMainConfig},
+        config::{
+            DnsUpstreamGroup, MudzConfig, MudzFallbackConfig, MudzMainConfig,
+        },
         retry::now_secs,
     };
 
@@ -1182,9 +1199,7 @@ mod tests {
         // An unparseable nameserver address always fails transport creation,
         // leaving the fallback group with no upstream connections.
         let config = test_config("not-an-address");
-        let groups = DnsGroups::new(config, None, Arc::new(HostsFile::new()))
-            .await
-            .expect("create groups");
+        let groups = DnsGroups::new(config, None, Arc::new(HostsFile::new()));
         let query = DnsPacket::new_query("example.com", DnsType::A)
             .expect("build query");
 
@@ -1200,6 +1215,93 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_group_transports_created_on_demand() {
+        let probe = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr = probe.local_addr().unwrap();
+        drop(probe);
+
+        let group = DnsGroup::new(
+            "test".to_string(),
+            vec![addr.to_string()],
+            false,
+            false,
+            None,
+            Arc::new(HostsFile::new()),
+        );
+
+        {
+            let state = group.state.read().await;
+            assert!(
+                state.udp_transports.is_empty(),
+                "no upstream transport should be created until first request"
+            );
+        }
+
+        assert!(group.ensure_transports().await);
+        let state = group.state.read().await;
+        assert_eq!(state.udp_transports.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_named_group_resolves_when_fallback_unavailable() {
+        let upstream =
+            Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let upstream_addr = upstream.local_addr().unwrap();
+        let server = upstream.clone();
+        let server_task = tokio::spawn(async move {
+            let mut buf = [0u8; 512];
+            let (len, peer) = tokio::time::timeout(
+                Duration::from_secs(5),
+                server.recv_from(&mut buf),
+            )
+            .await
+            .expect("named group must query its upstream")
+            .unwrap();
+            let query = DnsPacket::parse(&buf[..len]).unwrap();
+            let question = query.first_question().unwrap();
+            let reply = DnsPacket::new_reply(
+                query.header.id,
+                DnsResponseCode::NoError,
+                question.domain.clone(),
+                question.kind,
+                question.class,
+                true,
+            );
+            server.send_to(&reply.to_bytes(), peer).await.unwrap();
+        });
+
+        let mut groups = HashMap::new();
+        groups.insert(
+            "corp".to_string(),
+            DnsUpstreamGroup {
+                nameservers: vec![upstream_addr.to_string()],
+                domains: vec!["corp.example".to_string()],
+                disable_ipv6: false,
+            },
+        );
+        let config = MudzConfig {
+            main: MudzMainConfig::default(),
+            fallback: MudzFallbackConfig {
+                nameservers: vec!["not-an-address".to_string()],
+                disable_ipv6: false,
+            },
+            doh: None,
+            groups,
+        };
+        let groups = DnsGroups::new(config, None, Arc::new(HostsFile::new()));
+
+        let resp = groups
+            .request(
+                DnsPacket::new_query("host.corp.example", DnsType::A)
+                    .expect("build query"),
+            )
+            .await
+            .expect("named group request must succeed");
+        assert_eq!(resp.header.rcode, DnsResponseCode::NoError);
+        server_task.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn test_ensure_transports_recovers_after_cooldown() {
         let probe = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let addr = probe.local_addr().unwrap();
@@ -1212,8 +1314,7 @@ mod tests {
             false,
             None,
             Arc::new(HostsFile::new()),
-        )
-        .await;
+        );
         assert!(group.ensure_transports().await);
 
         // Simulate a failed startup: no transports and a recent retry
