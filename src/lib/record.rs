@@ -281,8 +281,9 @@ impl DnsResourceRecord {
         buf.extend_from_slice(&self.rdata);
     }
 
-    /// Serialize with RFC 1035 §4.1.4 compression applied to the owner
-    /// name. The rdata is emitted verbatim.
+    /// Serialize with RFC 1035 §4.1.4 compression applied to the owner name
+    /// and to domain names embedded in rdata of known name-bearing record
+    /// types. Unknown types fall back to emitting rdata verbatim.
     pub fn emit_to_with_ttl_compressed(
         &self,
         buf: &mut Vec<u8>,
@@ -298,9 +299,125 @@ impl DnsResourceRecord {
             positions.push((buf.len(), self.ttl));
         }
         buf.extend_from_slice(&self.ttl.to_be_bytes());
-        let rdlength = self.rdata.len() as u16;
-        buf.extend_from_slice(&rdlength.to_be_bytes());
-        buf.extend_from_slice(&self.rdata);
+        let rdlength_pos = buf.len();
+        buf.extend_from_slice(&0u16.to_be_bytes());
+        self.emit_rdata_to_compressed(buf, map);
+        let rdlength = (buf.len() - rdlength_pos - 2) as u16;
+        buf[rdlength_pos..rdlength_pos + 2]
+            .copy_from_slice(&rdlength.to_be_bytes());
+    }
+
+    /// Serialize rdata with RFC 1035 §4.1.4 compression applied to embedded
+    /// domain names. Parsing expands compression pointers for known
+    /// name-bearing types, so emitting those names verbatim would make
+    /// re-serialized responses larger than the upstream wire form. If the
+    /// rdata is not a well-formed instance of the declared type, it is
+    /// emitted verbatim instead of corrupting the record.
+    fn emit_rdata_to_compressed(
+        &self,
+        buf: &mut Vec<u8>,
+        map: &mut DnsNameCompressionMap,
+    ) {
+        if !kind_has_domain_names(self.kind) || !self.rdata_is_well_formed() {
+            buf.extend_from_slice(&self.rdata);
+            return;
+        }
+
+        let mut offset = 0usize;
+
+        match self.kind {
+            DnsType::CNAME | DnsType::NS | DnsType::PTR => {
+                let Ok(name) =
+                    DnsDomainName::parse_from(&self.rdata, &mut offset)
+                else {
+                    buf.extend_from_slice(&self.rdata);
+                    return;
+                };
+                name.emit_to_compressed(buf, map);
+            }
+            DnsType::MX => {
+                buf.extend_from_slice(&self.rdata[..2]);
+                offset = 2;
+                let Ok(name) =
+                    DnsDomainName::parse_from(&self.rdata, &mut offset)
+                else {
+                    buf.extend_from_slice(&self.rdata);
+                    return;
+                };
+                name.emit_to_compressed(buf, map);
+            }
+            DnsType::SOA => {
+                let Ok(mname) =
+                    DnsDomainName::parse_from(&self.rdata, &mut offset)
+                else {
+                    buf.extend_from_slice(&self.rdata);
+                    return;
+                };
+                mname.emit_to_compressed(buf, map);
+                let Ok(rname) =
+                    DnsDomainName::parse_from(&self.rdata, &mut offset)
+                else {
+                    buf.extend_from_slice(&self.rdata);
+                    return;
+                };
+                rname.emit_to_compressed(buf, map);
+                buf.extend_from_slice(&self.rdata[offset..]);
+            }
+            DnsType::SRV => {
+                buf.extend_from_slice(&self.rdata[..6]);
+                offset = 6;
+                let Ok(name) =
+                    DnsDomainName::parse_from(&self.rdata, &mut offset)
+                else {
+                    buf.extend_from_slice(&self.rdata);
+                    return;
+                };
+                name.emit_to_compressed(buf, map);
+            }
+            _ => buf.extend_from_slice(&self.rdata),
+        }
+    }
+
+    /// Whether rdata is a well-formed instance of its declared
+    /// name-bearing type. Used to guard `emit_rdata_to_compressed` so a
+    /// malformed record falls back to verbatim emission before any part of
+    /// its rdata has been written.
+    fn rdata_is_well_formed(&self) -> bool {
+        let mut offset = 0usize;
+        match self.kind {
+            DnsType::CNAME | DnsType::NS | DnsType::PTR => {
+                DnsDomainName::parse_from(&self.rdata, &mut offset).is_ok()
+                    && offset == self.rdata.len()
+            }
+            DnsType::MX => {
+                if self.rdata.len() < 2 {
+                    return false;
+                }
+                offset = 2;
+                DnsDomainName::parse_from(&self.rdata, &mut offset).is_ok()
+                    && offset == self.rdata.len()
+            }
+            DnsType::SOA => {
+                if DnsDomainName::parse_from(&self.rdata, &mut offset).is_err()
+                {
+                    return false;
+                }
+                if DnsDomainName::parse_from(&self.rdata, &mut offset).is_err()
+                {
+                    return false;
+                }
+                offset + 20 == self.rdata.len()
+            }
+            DnsType::SRV => {
+                if self.rdata.len() < 6 {
+                    return false;
+                }
+                offset = 6;
+                DnsDomainName::parse_from(&self.rdata, &mut offset).is_ok()
+                    && offset == self.rdata.len()
+            }
+            _ => true,
+        }
     }
 }
 

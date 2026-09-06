@@ -841,8 +841,8 @@ mod tests {
     }
 
     /// A CNAME chain response similar to `finance.sina.com.cn`: 3 CNAMEs
-    /// plus multiple A records, exceeding 512 bytes when serialized without
-    /// compression.
+    /// plus enough A records that even the compressed serialization exceeds
+    /// 512 bytes.
     fn cname_chain_response() -> Vec<u8> {
         let domain = DnsDomainName::from_str("finance.sina.com.cn").unwrap();
         let cname1 =
@@ -889,7 +889,7 @@ mod tests {
                 },
             },
         ];
-        for i in 0..20u8 {
+        for i in 0..40u8 {
             answers.push(DnsResourceRecord {
                 domain: cname3.clone(),
                 kind: DnsType::A,
@@ -947,8 +947,8 @@ mod tests {
             parsed.answers.len()
         );
         assert!(
-            parsed.answers.len() < 23,
-            "not all 23 records can fit in 512 bytes"
+            parsed.answers.len() < 43,
+            "not all 43 records can fit in 512 bytes"
         );
         // First three answers must be the CNAME chain in order.
         assert_eq!(parsed.answers[0].kind, DnsType::CNAME);

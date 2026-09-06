@@ -14,7 +14,10 @@ use std::{
     time::{Duration, Instant},
 };
 
-use mudz::{DnsPacket, DnsType, DnsUdpClient};
+use mudz::{
+    DnsClass, DnsHeader, DnsPacket, DnsResourceRecord, DnsResponseCode,
+    DnsType, DnsUdpClient,
+};
 
 use crate::{config::MudzConfig, server::DnsUdpServer};
 
@@ -212,31 +215,86 @@ fn run_query_suite() {
     drop(server);
 }
 
-/// Regression test for the original failure: `bailian.console.aliyun.com`'s
-/// A answer is larger than 512 bytes, so a non-EDNS UDP client (what
-/// bind-utils `host` sends) gets a truncated reply with TC set and retries
-/// over TCP (RFC 1035 §4.2.2). mudz must answer that TCP retry with the
+/// Start a fake upstream that answers every query with 100 A records, so a
+/// non-EDNS UDP client gets a truncated reply with TC set and retries over
+/// TCP (RFC 1035 §4.2.2). The daemon must answer that TCP retry with the
 /// full, untruncated answer (RFC 7766 §7) instead of refusing the
 /// connection.
+fn start_large_upstream() -> std::net::SocketAddr {
+    let socket =
+        std::net::UdpSocket::bind("127.0.0.1:0").expect("bind fake upstream");
+    let addr = socket.local_addr().expect("fake upstream address");
+    thread::spawn(move || {
+        let mut buf = [0u8; 4096];
+        loop {
+            let Ok((size, peer)) = socket.recv_from(&mut buf) else {
+                return;
+            };
+            let Ok(query) = DnsPacket::parse(&buf[..size]) else {
+                continue;
+            };
+            let Some(question) = query.first_question() else {
+                continue;
+            };
+            let domain = question.domain.clone();
+            let answers = (0..100u8)
+                .map(|i| DnsResourceRecord {
+                    domain: domain.clone(),
+                    kind: DnsType::A,
+                    class: DnsClass::IN,
+                    ttl: 300,
+                    rdlength: 4,
+                    rdata: vec![10, 0, 0, i],
+                })
+                .collect();
+            let response = DnsPacket {
+                header: DnsHeader {
+                    id: query.header.id,
+                    qr: true,
+                    rcode: DnsResponseCode::NoError,
+                    qdcount: 1,
+                    ancount: 100,
+                    ..Default::default()
+                },
+                questions: vec![question.clone()],
+                answers,
+                authorities: Vec::new(),
+                additionals: Vec::new(),
+            };
+            let bytes = response.to_bytes();
+            assert!(
+                bytes.len() > 512,
+                "fake upstream answer must exceed 512 bytes"
+            );
+            let _ = socket.send_to(&bytes, peer);
+        }
+    });
+    addr
+}
+
 #[test]
 fn test_daemon_resolves_over_tcp() {
     let _lock = SERVER_LOCK.lock().expect("server lock poisoned");
     let _config_guard = ConfigGuard;
-    write_config("\"223.5.5.5\"", "");
+    let upstream = start_large_upstream();
+    write_config(&format!("\"127.0.0.1:{}\"", upstream.port()), "");
     let server = start_server();
 
     // Basic TCP resolution: correct answer, never truncated.
-    let query = DnsPacket::new_query(DOMAIN, DnsType::A).expect("build query");
-    let resp = tcp_query(&query);
-    assert_eq!(first_a(&resp).as_deref(), Some(EXPECTED_A));
+    let query =
+        DnsPacket::new_query("large.example", DnsType::A).expect("build query");
+    let tcp_resp = tcp_query(&query);
     assert!(
-        !resp.header.tc,
+        !tcp_resp.header.tc,
         "TCP reply must not be truncated (RFC 7766 §7)"
+    );
+    assert_eq!(
+        tcp_resp.answers.len(),
+        100,
+        "TCP reply must carry the full answer"
     );
 
     // The large-answer case that forces the TCP fallback.
-    let query = DnsPacket::new_query("bailian.console.aliyun.com", DnsType::A)
-        .expect("build query");
     let udp_resp = DnsUdpClient::new(BIND)
         .expect("udp client")
         .query(&query)

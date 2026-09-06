@@ -1,8 +1,0 @@
- * Compression is expanded on re-emit, so forwarded responses grow. The client
-   query is read into a 512-byte buffer and replies are sent with no EDNS
-   handling and no truncation (TC) bit. A response that grows past 512 (or past
-   the client's advertised size) can break non-EDNS clients. Consider honoring
-   the query's EDNS payload size and setting TC when over the limit.
- * The Eq/Hash of DnsDomainName should depend on lower case string of domain.
- * dnscrypt-proxy reply with notes AAAA is disabled.
- * DohResolvCache never refreshed

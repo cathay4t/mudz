@@ -1,0 +1,3 @@
+- The Eq/Hash of DnsDomainName should depend on lower case string of domain.
+- dnscrypt-proxy reply with notes AAAA is disabled.
+- DohResolvCache never refreshed

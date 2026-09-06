@@ -303,6 +303,55 @@ fn test_dns_cname_rdata_expanded() {
     assert_eq!(reparsed_answer.rdata, answer.rdata);
 }
 
+/// A 477-byte response with 32 CNAME records whose owner names and RDATA
+/// targets are compression pointers to the question name. This fits within
+/// the 512-byte non-EDNS UDP limit only as long as the RDATA pointers are
+/// not expanded on re-emission.
+fn compressed_cname_response() -> Vec<u8> {
+    let mut raw = vec![
+        0x12, 0x34, 0x81, 0x80, 0x00, 0x01, 0x00, 0x20, 0x00, 0x00, 0x00,
+        0x00, // header: id, QR=1, qdcount=1, ancount=32
+        0x07, b'e', b'x', b'a', b'm', b'p', b'l', b'e', 0x03, b'c', b'o', b'm',
+        0x00, // question name: example.com
+        0x00, 0x01, 0x00, 0x01, // qtype A, qclass IN
+    ];
+    for _ in 0..32 {
+        raw.extend_from_slice(&[0xc0, 0x0c]); // owner: pointer to question
+        raw.extend_from_slice(&[
+            0x00, 0x05, 0x00, 0x01, 0x00, 0x00, 0x00,
+            0x3c, // CNAME, IN, TTL 60
+            0x00, 0x02, // rdlength: 2 (compression pointer)
+        ]);
+        raw.extend_from_slice(&[0xc0, 0x0c]); // RDATA: pointer to question
+    }
+    raw
+}
+
+#[test]
+fn test_reemit_keeps_compressed_rdata_size() {
+    let raw = compressed_cname_response();
+    assert!(
+        raw.len() < 512,
+        "test response must fit in 512 bytes, got {}",
+        raw.len()
+    );
+
+    let packet = DnsPacket::parse(&raw).expect("parse compressed response");
+    assert_eq!(packet.answers.len(), 32);
+
+    let emitted = packet.to_bytes_without_opt(None);
+    assert!(
+        emitted.len() <= raw.len(),
+        "re-emission must not expand compressed RDATA: raw {} bytes, emitted \
+         {} bytes",
+        raw.len(),
+        emitted.len(),
+    );
+    let reparsed =
+        DnsPacket::parse(&emitted).expect("parse re-emitted response");
+    assert_eq!(reparsed.answers.len(), 32);
+}
+
 #[test]
 fn test_parse_dns_header_flags() {
     let raw_packet: Vec<u8> = vec![
