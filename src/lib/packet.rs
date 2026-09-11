@@ -216,10 +216,10 @@ impl DnsPacket {
     }
 
     /// Serialize this packet omitting any EDNS(0) OPT pseudo-records, with
-    /// the header ARCOUNT adjusted accordingly. RFC 6891 §6.2.1 mandates
-    /// that OPT records MUST NOT be cached, so this is the form stored in
-    /// the cache. TTL byte offsets are recorded in `ttl_positions` for later
-    /// in-place decrement (OPT records, having no real TTL, are excluded).
+    /// the header ARCOUNT adjusted accordingly (RFC 6891 §6.2.1 forbids
+    /// caching or forwarding OPT records). TTL byte offsets are recorded in
+    /// `ttl_positions` for callers that decrement TTLs in place (OPT
+    /// records, having no real TTL, are excluded).
     pub fn to_bytes_without_opt(
         &self,
         mut ttl_positions: Option<&mut Vec<(usize, u32)>>,

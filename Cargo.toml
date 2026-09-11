@@ -8,7 +8,6 @@ members = [
 [workspace.package]
 version = "0.1.0"
 authors = ["Gris Ge <cnfourt@gmail.com>"]
-description = "Linux DNS Caching Daemon"
 documentation = "https://github.com/cathay4t/muds"
 edition = "2024"
 license = "Apache-2.0"

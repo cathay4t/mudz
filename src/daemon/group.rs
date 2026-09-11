@@ -2,7 +2,7 @@
 
 use std::{
     collections::HashMap,
-    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
+    net::SocketAddr,
     str::FromStr as _,
     sync::{Arc, Mutex},
     time::Duration,
@@ -18,7 +18,6 @@ use tokio::{net::UdpSocket, sync::oneshot};
 use super::{
     config::MudzConfig,
     doh::{DohClient, DohResolvCache},
-    host::HostsFile,
     retry::{Attempt, CooldownGate, DNS_RETRY_COOLDOWN, UpstreamState},
 };
 
@@ -38,16 +37,14 @@ pub(crate) struct DnsGroups {
 impl DnsGroups {
     pub(crate) fn new(
         mut config: MudzConfig,
-        doh_config: Option<super::config::MudzDohConfig>,
-        hosts: Arc<HostsFile>,
+        doh_cache: Option<Arc<DohResolvCache>>,
     ) -> Self {
         let fallback = DnsGroup::new(
             "fallback".to_string(),
             config.fallback.nameservers,
             config.fallback.disable_ipv6,
             false, // fallback is never intentionally blocking
-            doh_config.clone(),
-            hosts.clone(),
+            doh_cache.clone(),
         );
 
         let mut groups = HashMap::new();
@@ -59,8 +56,7 @@ impl DnsGroups {
                 group_config.nameservers,
                 group_config.disable_ipv6,
                 blocking,
-                doh_config.clone(),
-                hosts.clone(),
+                doh_cache.clone(),
             );
             groups.insert(group_name.to_string(), dns_group);
 
@@ -399,8 +395,9 @@ struct DnsGroup {
     blocking: bool,
     /// Configuration for recreating transports at runtime.
     nameservers: Vec<String>,
-    doh_config: Option<super::config::MudzDohConfig>,
-    hosts: Arc<HostsFile>,
+    /// DoH hostname-to-IP mapping resolved at startup. `None` when the
+    /// daemon has no DoH nameserver configured.
+    doh_cache: Option<Arc<DohResolvCache>>,
 }
 
 struct GroupState {
@@ -414,8 +411,7 @@ impl DnsGroup {
         nameservers: Vec<String>,
         disable_ipv6: bool,
         blocking: bool,
-        doh_config: Option<super::config::MudzDohConfig>,
-        hosts: Arc<HostsFile>,
+        doh_cache: Option<Arc<DohResolvCache>>,
     ) -> Self {
         Self {
             name,
@@ -430,8 +426,7 @@ impl DnsGroup {
             disable_ipv6,
             blocking,
             nameservers,
-            doh_config,
-            hosts,
+            doh_cache,
         }
     }
 
@@ -440,8 +435,7 @@ impl DnsGroup {
     /// logged and an empty state is returned — the caller will retry.
     async fn create_state(
         nameservers: &[String],
-        doh_config: &Option<super::config::MudzDohConfig>,
-        hosts: &HostsFile,
+        doh_cache: &Option<Arc<DohResolvCache>>,
         group_name: &str,
         blocking: bool,
     ) -> GroupState {
@@ -450,7 +444,7 @@ impl DnsGroup {
 
         for srv in nameservers {
             if srv.starts_with("https://") {
-                match create_doh_client(srv, doh_config, hosts).await {
+                match create_doh_client(srv, doh_cache) {
                     Ok(client) => doh_clients.push(client),
                     Err(e) => log::warn!(
                         "Failed to create DoH client for '{}' in group '{}': \
@@ -540,8 +534,7 @@ impl DnsGroup {
 
         *state = Self::create_state(
             &self.nameservers,
-            &self.doh_config,
-            &self.hosts,
+            &self.doh_cache,
             &self.name,
             false,
         )
@@ -836,252 +829,21 @@ async fn create_udp_socket(srv: &str) -> Result<UdpSocket, MudzError> {
     Ok(socket)
 }
 
-async fn create_doh_client(
+fn create_doh_client(
     srv: &str,
-    doh_config: &Option<super::config::MudzDohConfig>,
-    hosts: &HostsFile,
+    doh_cache: &Option<Arc<DohResolvCache>>,
 ) -> Result<DohClient, MudzError> {
-    let hostname =
-        super::config::extract_doh_hostname(srv).ok_or_else(|| {
-            MudzError::new(
-                ErrorKind::InvalidConfig,
-                format!("Invalid DoH URL: {srv}"),
-            )
-        })?;
-
-    let doh_cfg = doh_config.as_ref().ok_or_else(|| {
+    let cache = doh_cache.clone().ok_or_else(|| {
         MudzError::new(
             ErrorKind::InvalidConfig,
             format!(
-                "DoH server '{}' configured but no [doh] section with IP \
-                 nameservers found",
+                "DoH server '{}' configured but no startup bootstrap from \
+                 [doh] nameservers available",
                 srv
             ),
         )
     })?;
-
-    let ips = resolve_hostname(
-        &hostname,
-        &doh_cfg.nameservers,
-        doh_cfg.disable_ipv6,
-        hosts,
-    )
-    .await?;
-
-    let mut cache = DohResolvCache::new();
-    cache.insert(&hostname, ips);
-    let cache = Arc::new(cache);
-
     DohClient::new(srv, cache)
-}
-
-async fn resolve_hostname(
-    host_name: &str,
-    nameservers: &[IpAddr],
-    disable_ipv6: bool,
-    hosts: &HostsFile,
-) -> Result<Vec<IpAddr>, MudzError> {
-    log::info!("Resolving DoH hostname {}", host_name);
-
-    let hosts_ips = hosts.lookup_ips(host_name);
-    if !hosts_ips.is_empty() {
-        log::info!(
-            "Resolved DoH hostname {} from /etc/hosts: {:?}",
-            host_name,
-            hosts_ips
-        );
-        return Ok(hosts_ips);
-    }
-
-    let mut ret = Vec::new();
-
-    let query_packet = DnsPacket::new_query(host_name, DnsType::A)?;
-    match send_request_and_wait_first_reply(nameservers, &query_packet).await {
-        Ok(ips) => ret.extend_from_slice(&ips),
-        Err(e) => {
-            log::debug!(
-                "Failed to resolve DoH hostname {} to A record: {e}",
-                host_name
-            );
-        }
-    }
-
-    if disable_ipv6 {
-        if ret.is_empty() {
-            return Err(MudzError::new(
-                ErrorKind::InvalidConfig,
-                format!(
-                    "Failed to resolve DoH hostname {} to A record",
-                    host_name
-                ),
-            ));
-        } else {
-            return Ok(ret);
-        }
-    }
-
-    let query_packet = DnsPacket::new_query(host_name, DnsType::AAAA)?;
-    match send_request_and_wait_first_reply(nameservers, &query_packet).await {
-        Ok(ips) => ret.extend_from_slice(&ips),
-        Err(e) => {
-            log::debug!(
-                "Failed to resolve DoH hostname {} to AAAA record: {e}",
-                host_name
-            );
-        }
-    }
-
-    if ret.is_empty() {
-        Err(MudzError::new(
-            ErrorKind::InvalidConfig,
-            format!("Failed to resolve DoH hostname {}", host_name),
-        ))
-    } else {
-        Ok(ret)
-    }
-}
-
-async fn send_request_and_wait_first_reply(
-    nameservers: &[IpAddr],
-    query_packet: &DnsPacket,
-) -> Result<Vec<IpAddr>, MudzError> {
-    let mut sockets = Vec::new();
-    let mut ret = Vec::new();
-
-    for nameserver in nameservers {
-        let bind_addr = match nameserver {
-            ip if ip.is_ipv4() => {
-                SocketAddr::new(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), 0)
-            }
-            _ => {
-                SocketAddr::new(IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED), 0)
-            }
-        };
-        let socket = UdpSocket::bind(bind_addr).await.map_err(|e| {
-            MudzError::new(
-                ErrorKind::Bug,
-                format!("Failed to bind UDP socket: {e}"),
-            )
-        })?;
-        log::debug!("Connecting to UDP nameserver {}:53", nameserver);
-        socket.connect((*nameserver, 53)).await.map_err(|e| {
-            MudzError::new(
-                ErrorKind::InvalidConfig,
-                format!("Failed to connect to nameserver {}: {e}", nameserver),
-            )
-        })?;
-        sockets.push(socket);
-    }
-
-    // Send queries with a timeout so a stuck UDP socket cannot
-    // block startup indefinitely.
-    for socket in &sockets {
-        let send_bytes = query_packet.to_bytes();
-        match tokio::time::timeout(DNS_TIMEOUT_SEC, socket.send(&send_bytes))
-            .await
-        {
-            Ok(Ok(_n)) => {}
-            Ok(Err(e)) => {
-                log::warn!("Failed to send DNS query to nameserver: {e}");
-            }
-            Err(_) => {
-                log::warn!("Timed out sending DNS query to nameserver");
-            }
-        }
-    }
-
-    let mut futures = FuturesUnordered::new();
-    for socket in &sockets {
-        futures.push(get_udp_dns_reply(socket));
-    }
-    while let Some(result) = futures.next().await {
-        let packet = match result {
-            Ok(packet) => packet,
-            Err(e) => {
-                log::debug!("Failed to get DNS reply: {e}");
-                continue;
-            }
-        };
-        log::debug!("Received DNS reply: {}", packet.display_brief());
-
-        if packet.header.id != query_packet.header.id {
-            log::debug!(
-                "DNS reply TXID mismatch: expected {:#06x}, got {:#06x}",
-                query_packet.header.id,
-                packet.header.id,
-            );
-            continue;
-        }
-        if !packet.header.qr {
-            log::debug!("Ignoring non-response DNS packet");
-            continue;
-        }
-        if packet.header.rcode != DnsResponseCode::NoError {
-            log::debug!("DNS reply rcode {:?}, ignoring", packet.header.rcode,);
-            continue;
-        }
-
-        for record in packet
-            .answers
-            .into_iter()
-            .filter(|r| r.kind == DnsType::A || r.kind == DnsType::AAAA)
-        {
-            if record.kind == DnsType::A
-                && record.rdata.len() >= Ipv4Addr::BITS as usize / 8
-            {
-                ret.push(IpAddr::V4(std::net::Ipv4Addr::new(
-                    record.rdata[0],
-                    record.rdata[1],
-                    record.rdata[2],
-                    record.rdata[3],
-                )));
-            } else if record.kind == DnsType::AAAA
-                && record.rdata.len() >= Ipv6Addr::BITS as usize / 8
-            {
-                ret.push(IpAddr::V6(std::net::Ipv6Addr::from([
-                    record.rdata[0],
-                    record.rdata[1],
-                    record.rdata[2],
-                    record.rdata[3],
-                    record.rdata[4],
-                    record.rdata[5],
-                    record.rdata[6],
-                    record.rdata[7],
-                    record.rdata[8],
-                    record.rdata[9],
-                    record.rdata[10],
-                    record.rdata[11],
-                    record.rdata[12],
-                    record.rdata[13],
-                    record.rdata[14],
-                    record.rdata[15],
-                ])));
-            }
-        }
-        if !ret.is_empty() {
-            break;
-        }
-    }
-
-    Ok(ret)
-}
-
-async fn get_udp_dns_reply(socket: &UdpSocket) -> Result<DnsPacket, MudzError> {
-    let mut buf = [0u8; DnsPacket::MAX_UDP_EDNS_PACKET_SIZE];
-    match tokio::time::timeout(DNS_TIMEOUT_SEC, socket.recv(&mut buf)).await {
-        Ok(Ok(len)) => {
-            let packet = DnsPacket::parse(&buf[..len])?;
-            Ok(packet)
-        }
-        Ok(Err(e)) => Err(MudzError::new(
-            ErrorKind::Bug,
-            format!("Error receiving DNS response: {e}"),
-        )),
-        Err(_) => Err(MudzError::new(
-            ErrorKind::Timeout,
-            "Timed out waiting for DNS response",
-        )),
-    }
 }
 
 fn is_fatal_io_error(e: &std::io::Error) -> bool {
@@ -1095,332 +857,5 @@ fn is_fatal_io_error(e: &std::io::Error) -> bool {
 }
 
 #[cfg(test)]
-mod tests {
-    use std::collections::HashMap;
-
-    use mudz::{DnsPacket, DnsResponseCode, DnsType};
-
-    use super::*;
-    use crate::{
-        config::{
-            DnsUpstreamGroup, MudzConfig, MudzFallbackConfig, MudzMainConfig,
-        },
-        retry::now_secs,
-    };
-
-    fn test_config(fallback_ns: &str) -> MudzConfig {
-        MudzConfig {
-            main: MudzMainConfig::default(),
-            fallback: MudzFallbackConfig {
-                nameservers: vec![fallback_ns.to_string()],
-                disable_ipv6: false,
-            },
-            doh: None,
-            groups: HashMap::new(),
-        }
-    }
-
-    /// Nothing listens on the upstream port, so the kernel answers with
-    /// ICMP port-unreachable; the latched socket error must reach the recv
-    /// loop (tokio >= 1.51.1, see tokio#8001) and mark the transport
-    /// broken. Uses its own port so it never collides with the end-to-end
-    /// tests.
-    #[tokio::test]
-    async fn test_transport_broken_on_icmp_refused() {
-        let transport = DnsUdpTransport::new("127.0.0.1:53537", "test")
-            .await
-            .expect("create transport to dead port");
-        let query =
-            DnsPacket::new_query("example.com", DnsType::A).expect("query");
-        let key = (
-            "example.com".to_string(),
-            DnsType::A,
-            DnsClass::IN,
-            query.header.id,
-        );
-        // Let the receive loop park in recv before triggering the ICMP
-        // error, exactly like the running daemon.
-        tokio::time::sleep(Duration::from_millis(300)).await;
-        let rx = transport
-            .send_query(&query.to_bytes(), &key)
-            .await
-            .expect("send query");
-        // The reply never comes; the rx oneshot only ends when it is
-        // dropped after the timeout future gives up.
-        tokio::time::sleep(Duration::from_millis(500)).await;
-        drop(rx);
-        tokio::time::sleep(Duration::from_millis(200)).await;
-        assert!(
-            transport.state.is_broken(),
-            "recv loop must consume the latched ICMP error and mark the \
-             transport broken"
-        );
-        assert!(
-            transport.is_broken(),
-            "a broken transport must be detected via the transport itself so \
-             ensure_transports can evict it"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_transport_is_broken_when_recv_loop_panics() {
-        // A transport whose receive loop exits for any reason other than a
-        // fatal socket error (here: a panic) must still be detected as
-        // broken. `recv_loop` only exits on a fatal error or a panic, so a
-        // finished task handle is a reliable liveness signal even when the
-        // panic path never ran `mark_broken`.
-        let transport = DnsUdpTransport::new("127.0.0.1:53538", "test")
-            .await
-            .expect("create transport");
-        assert!(
-            !transport.is_broken(),
-            "a freshly created transport must be live"
-        );
-
-        // Abort the receive loop to simulate a silent exit (e.g. a panic
-        // in `recv_loop` being caught by tokio). The transport must then
-        // be detected as broken without any fatal socket error.
-        transport.recv_task.abort();
-        // Allow the abort to take effect.
-        let deadline =
-            std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while !transport.is_broken() && std::time::Instant::now() < deadline {
-            tokio::task::yield_now().await;
-        }
-        assert!(
-            transport.is_broken(),
-            "a transport whose receive loop exited silently must be detected \
-             as broken so it is evicted and recreated"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_fallback_servfail_when_no_transports() {
-        // An unparseable nameserver address always fails transport creation,
-        // leaving the fallback group with no upstream connections.
-        let config = test_config("not-an-address");
-        let groups = DnsGroups::new(config, None, Arc::new(HostsFile::new()));
-        let query = DnsPacket::new_query("example.com", DnsType::A)
-            .expect("build query");
-
-        // Must be a SERVFAIL reply, not an error: the resolver turns the
-        // former into a reply to the client.
-        let resp = groups
-            .request(query)
-            .await
-            .expect("request must return a reply");
-        assert_eq!(resp.header.rcode, DnsResponseCode::ServFail);
-        assert!(resp.header.qr);
-        assert_eq!(resp.questions[0].domain.to_string(), "example.com");
-    }
-
-    #[tokio::test]
-    async fn test_group_transports_created_on_demand() {
-        let probe = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let addr = probe.local_addr().unwrap();
-        drop(probe);
-
-        let group = DnsGroup::new(
-            "test".to_string(),
-            vec![addr.to_string()],
-            false,
-            false,
-            None,
-            Arc::new(HostsFile::new()),
-        );
-
-        {
-            let state = group.state.read().await;
-            assert!(
-                state.udp_transports.is_empty(),
-                "no upstream transport should be created until first request"
-            );
-        }
-
-        assert!(group.ensure_transports().await);
-        let state = group.state.read().await;
-        assert_eq!(state.udp_transports.len(), 1);
-    }
-
-    #[tokio::test]
-    async fn test_named_group_resolves_when_fallback_unavailable() {
-        let upstream =
-            Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
-        let upstream_addr = upstream.local_addr().unwrap();
-        let server = upstream.clone();
-        let server_task = tokio::spawn(async move {
-            let mut buf = [0u8; 512];
-            let (len, peer) = tokio::time::timeout(
-                Duration::from_secs(5),
-                server.recv_from(&mut buf),
-            )
-            .await
-            .expect("named group must query its upstream")
-            .unwrap();
-            let query = DnsPacket::parse(&buf[..len]).unwrap();
-            let question = query.first_question().unwrap();
-            let reply = DnsPacket::new_reply(
-                query.header.id,
-                DnsResponseCode::NoError,
-                question.domain.clone(),
-                question.kind,
-                question.class,
-                true,
-            );
-            server.send_to(&reply.to_bytes(), peer).await.unwrap();
-        });
-
-        let mut groups = HashMap::new();
-        groups.insert(
-            "corp".to_string(),
-            DnsUpstreamGroup {
-                nameservers: vec![upstream_addr.to_string()],
-                domains: vec!["corp.example".to_string()],
-                disable_ipv6: false,
-            },
-        );
-        let config = MudzConfig {
-            main: MudzMainConfig::default(),
-            fallback: MudzFallbackConfig {
-                nameservers: vec!["not-an-address".to_string()],
-                disable_ipv6: false,
-            },
-            doh: None,
-            groups,
-        };
-        let groups = DnsGroups::new(config, None, Arc::new(HostsFile::new()));
-
-        let resp = groups
-            .request(
-                DnsPacket::new_query("host.corp.example", DnsType::A)
-                    .expect("build query"),
-            )
-            .await
-            .expect("named group request must succeed");
-        assert_eq!(resp.header.rcode, DnsResponseCode::NoError);
-        server_task.await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn test_ensure_transports_recovers_after_cooldown() {
-        let probe = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let addr = probe.local_addr().unwrap();
-        drop(probe);
-
-        let group = DnsGroup::new(
-            "test".to_string(),
-            vec![addr.to_string()],
-            false,
-            false,
-            None,
-            Arc::new(HostsFile::new()),
-        );
-        assert!(group.ensure_transports().await);
-
-        // Simulate a failed startup: no transports and a recent retry
-        // attempt, so ensure_transports must respect the cooldown.
-        *group.state.write().await = GroupState {
-            udp_transports: Vec::new(),
-            doh_clients: Vec::new(),
-        };
-        group.recreate_gate.set_last_attempt(now_secs());
-        assert!(
-            !group.ensure_transports().await,
-            "retry must be refused during the cooldown window"
-        );
-
-        // Once the cooldown has elapsed, the transports are recreated.
-        group.recreate_gate.set_last_attempt(0);
-        assert!(
-            group.ensure_transports().await,
-            "transports must be recreated after the cooldown"
-        );
-        let state = group.state.read().await;
-        assert_eq!(state.udp_transports.len(), 1);
-    }
-
-    /// Concurrent queries for the same (domain, type, class) with the same
-    /// client transaction ID but different DNSSEC OK bits must each receive
-    /// their own response. Before per-query wire ID rewriting, the first
-    /// response was delivered to every waiter under the shared key, so one
-    /// caller received the other query's response.
-    #[tokio::test]
-    async fn test_concurrent_same_id_queries_not_cross_delivered() {
-        // Fake upstream: reply to each query echoing the received ID and the
-        // query's DO bit, so the two responses are distinguishable.
-        let upstream =
-            Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
-        let upstream_addr = upstream.local_addr().unwrap();
-        let server = upstream.clone();
-        let server_task = tokio::spawn(async move {
-            let mut buf = [0u8; 512];
-            for _ in 0..2 {
-                let (n, peer) = server.recv_from(&mut buf).await.unwrap();
-                let query = DnsPacket::parse(&buf[..n]).unwrap();
-                let question = &query.questions[0];
-                let mut reply = DnsPacket::new_reply(
-                    query.header.id,
-                    DnsResponseCode::NoError,
-                    question.domain.clone(),
-                    question.kind,
-                    question.class,
-                    true,
-                );
-                reply.add_opt_record(1232, query.dnssec_ok());
-                server.send_to(&reply.to_bytes(), peer).await.unwrap();
-            }
-        });
-
-        let transport =
-            DnsUdpTransport::new(&upstream_addr.to_string(), "test")
-                .await
-                .unwrap();
-
-        // Two queries for the same name/type/class with the same client ID,
-        // one with the DNSSEC OK bit set and one without.
-        let mut query_do0 =
-            DnsPacket::new_query("example.com", DnsType::A).unwrap();
-        query_do0.add_opt_record(1232, false);
-        let mut query_do1 =
-            DnsPacket::new_query("example.com", DnsType::A).unwrap();
-        query_do1.add_opt_record(1232, true);
-        query_do1.header.id = query_do0.header.id;
-        let client_id = query_do0.header.id;
-        let question = query_do0.questions[0].clone();
-        let key = (
-            question.domain.to_string(),
-            question.kind,
-            question.class,
-            client_id,
-        );
-
-        let bytes_do0 = query_do0.to_bytes();
-        let bytes_do1 = query_do1.to_bytes();
-        let (rx_do0, rx_do1) = tokio::join!(
-            transport.send_query(&bytes_do0, &key),
-            transport.send_query(&bytes_do1, &key),
-        );
-        let rx_do0 = rx_do0.expect("send DO=0 query");
-        let rx_do1 = rx_do1.expect("send DO=1 query");
-
-        let (resp_do0, resp_do1) = tokio::join!(rx_do0, rx_do1);
-        let mut resp_do0 = resp_do0.expect("DO=0 response");
-        let mut resp_do1 = resp_do1.expect("DO=1 response");
-        // Restore the client ID, as `DnsGroup::request_inner` does.
-        resp_do0.header.id = client_id;
-        resp_do1.header.id = client_id;
-
-        assert_eq!(resp_do0.header.id, client_id);
-        assert_eq!(resp_do1.header.id, client_id);
-        assert!(
-            !resp_do0.dnssec_ok(),
-            "DO=0 caller must not receive the DO=1 response"
-        );
-        assert!(
-            resp_do1.dnssec_ok(),
-            "DO=1 caller must not receive the DO=0 response"
-        );
-
-        server_task.await.unwrap();
-    }
-}
+#[path = "unit_tests/group.rs"]
+mod tests;

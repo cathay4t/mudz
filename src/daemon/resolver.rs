@@ -9,13 +9,14 @@ use std::{
 use futures_util::{StreamExt, stream::FuturesUnordered};
 use mudz::{
     DnsClass, DnsDomainName, DnsHeader, DnsNameCompressionMap, DnsPacket,
-    DnsResponseCode, DnsType,
+    DnsResponseCode, DnsType, MudzError,
 };
 use tokio::{net::UdpSocket, sync::mpsc::UnboundedReceiver};
 
 use super::{
-    cache::DnsCacheStore,
+    cache::{CACHE_GC_INTERVAL, DnsCacheStore},
     config::MudzConfig,
+    doh::DohResolvCache,
     group::DnsGroups,
     host::HostsFile,
     server::{DnsQueryPacket, DnsReplyTarget},
@@ -29,6 +30,14 @@ type PendingClient = (DnsReplyTarget, u16, bool, Option<u16>);
 /// (domain, query-type, query-class, DNSSEC-OK bit). The DO bit is part of
 /// the key so DO=0 and DO=1 resolutions stay separate (see `CacheKey`).
 type CliIndexKey = (String, DnsType, DnsClass, bool);
+/// Result of one upstream lookup: query key plus the upstream reply.
+type ResolvedQuery = (
+    String,
+    DnsType,
+    DnsClass,
+    bool,
+    Result<DnsPacket, MudzError>,
+);
 
 /// UDP payload size advertised in synthesized OPT acks (RFC 6891 §6.2.4).
 /// Matches the listener's receive buffer so we never promise more than we can
@@ -48,15 +57,18 @@ impl DnsResolver {
         mut receiver: UnboundedReceiver<DnsQueryPacket>,
         config: MudzConfig,
         socket: Arc<UdpSocket>,
+        hosts: Arc<HostsFile>,
+        doh_cache: Option<Arc<DohResolvCache>>,
     ) {
-        let hosts = Arc::new(HostsFile::new());
         let mut cache = DnsCacheStore::new(config.main.max_cache_size);
         let mut cli_index: HashMap<CliIndexKey, Vec<PendingClient>> =
             HashMap::new();
+        let groups = Arc::new(DnsGroups::new(config, doh_cache));
 
-        let doh_config = config.doh.clone();
-        let groups =
-            Arc::new(DnsGroups::new(config, doh_config, hosts.clone()));
+        let mut cache_gc = tokio::time::interval(CACHE_GC_INTERVAL);
+        // The first tick of a tokio interval completes immediately; skip it
+        // so GC only runs after a full interval.
+        cache_gc.tick().await;
 
         let mut futures = FuturesUnordered::new();
         loop {
@@ -64,238 +76,223 @@ impl DnsResolver {
                 log::debug!("Pending DNS reply count {}", futures.len());
             }
             if futures.is_empty() && !cli_index.is_empty() {
-                let count: usize = cli_index.values().map(|v| v.len()).sum();
-                log::debug!(
-                    "All pending DNS queries failed to resolve, replying \
-                     SERVFAIL to remaining {count} clients",
-                );
-                for ((domain, kind, class, dnssec_ok), cli_addrs) in
-                    cli_index.drain()
-                {
-                    let Ok(domain_obj) = DnsDomainName::from_str(&domain)
-                    else {
-                        log::warn!(
-                            "Failed to parse domain name {}: invalid format, \
-                             skipping reply",
-                            domain
-                        );
-                        continue;
-                    };
-                    let packet = DnsPacket::new_reply(
-                        0,
-                        DnsResponseCode::ServFail,
-                        domain_obj,
-                        kind,
-                        class,
-                        true,
-                    );
-                    let neutral = packet.to_bytes();
-                    for (reply, id, rd, edns_payload) in cli_addrs {
-                        reply_client(
-                            &socket,
-                            reply,
-                            &neutral,
-                            id,
-                            rd,
-                            edns_payload,
-                            dnssec_ok,
-                        )
-                        .await;
-                    }
-                }
+                reply_servfail_all(&socket, &mut cli_index).await;
             }
+
             tokio::select! {
                 result = receiver.recv() => {
-                    if let Some(query_packet) = result {
-                        let packet = query_packet.packet;
-                        let reply = query_packet.reply;
-                        if let Some(reply_packet) = hosts.get(&packet) {
-                            let neutral = reply_packet.to_bytes();
-                            reply_client(
-                                &socket,
-                                reply,
-                                &neutral,
-                                packet.header.id,
-                                packet.header.rd,
-                                packet.edns_udp_payload_size(),
-                                packet.dnssec_ok(),
-                            )
-                            .await;
-                            continue;
-                        }
-
-                        let question = packet.first_question();
-                        let Some(question) = question else { continue };
-                        let domain = question.domain.to_string();
-                        let dns_type = question.kind;
-                        let dns_class = question.class;
-                        let id = packet.header.id;
-                        let rd = packet.header.rd;
-                        let edns_payload = packet.edns_udp_payload_size();
-                        let dnssec_ok = packet.dnssec_ok();
-
-                        if let Some(neutral) = cache.get(&packet) {
-                            reply_client(
-                                &socket, reply, &neutral, id, rd,
-                                edns_payload, dnssec_ok,
-                            )
-                            .await;
-                            continue;
-                        }
-
-                        if log::log_enabled!(log::Level::Debug) {
-                            log::debug!(
-                                "Received DNS query from {}",
-                                packet.display_brief()
-                            );
-                        }
-                        let domain_key = domain.clone();
-                        match cli_index.entry((
-                            domain_key,
-                            dns_type,
-                            dns_class,
-                            dnssec_ok,
-                        )) {
-                            Entry::Occupied(pending) => {
-                                if log::log_enabled!(log::Level::Debug) {
-                                    log::debug!(
-                                        "Already has pending request for {}",
-                                        packet.display_brief()
-                                    );
-                                }
-                                pending
-                                    .into_mut()
-                                    .push((reply, id, rd, edns_payload));
-                            }
-                            Entry::Vacant(vacant) => {
-                                vacant.insert(vec![(
-                                    reply, id, rd, edns_payload,
-                                )]);
-                                let groups = Arc::clone(&groups);
-                                futures.push(async move {
-                                    match groups.request(packet).await {
-                                        Ok(reply) => (domain,
-                                                      dns_type,
-                                                      dns_class,
-                                                      dnssec_ok,
-                                                      Ok(reply)),
-                                        Err(e) => (domain,
-                                                   dns_type,
-                                                   dns_class,
-                                                   dnssec_ok,
-                                                   Err(e)),
-                                    }
-                                });
-                            }
-                        }
-                    } else {
-                        break;
+                    let Some(query_packet) = result else { break };
+                    if let Some((packet, key)) = handle_client_query(
+                        query_packet,
+                        &socket,
+                        &hosts,
+                        &mut cache,
+                        &mut cli_index,
+                    )
+                    .await
+                    {
+                        let groups = Arc::clone(&groups);
+                        futures.push(async move {
+                            let (domain, dns_type, dns_class, dnssec_ok) =
+                                key;
+                            let result = groups.request(packet).await;
+                            (domain, dns_type, dns_class, dnssec_ok, result)
+                        });
                     }
                 }
-                Some((domain, dns_type, dns_class, dnssec_ok, result)) =
-                    futures.next() =>
-                {
-                    let reply_packet = match result {
-                        Ok(packet) => {
-                            if validate_upstream_response(
-                                &packet, &domain, dns_type, dns_class,
-                            ) {
-                                if log::log_enabled!(log::Level::Debug) {
-                                    log::debug!(
-                                        "Got DNS reply from upstream for {}",
-                                        packet.display_brief()
-                                    );
-                                }
-                                Some(packet)
-                            } else {
-                                log::warn!(
-                                    "Upstream response question mismatch \
-                                     for {}/{}/{:?}",
-                                    domain,
-                                    dns_type,
-                                    dns_class,
-                                );
-                                None
-                            }
-                        }
-                        Err(e) => {
-                            log::debug!(
-                                "Upstream DNS query for {}/{} failed: {e}",
-                                domain,
-                                dns_type,
-                            );
-                            None
-                        }
-                    };
-
-                    let Some(reply_packet) = reply_packet else {
-                        let Ok(domain_obj) =
-                            DnsDomainName::from_str(&domain)
-                        else {
-                            log::warn!(
-                                "Failed to parse domain name {}: \
-                                 invalid format",
-                                domain,
-                            );
-                            let _ = cli_index.remove(&(
-                                domain, dns_type, dns_class, dnssec_ok,
-                            ));
-                            continue;
-                        };
-                        let Some(cli_addrs) = cli_index.remove(&(
-                            domain, dns_type, dns_class, dnssec_ok,
-                        )) else {
-                            continue;
-                        };
-                        let packet = DnsPacket::new_reply(
-                            0,
-                            DnsResponseCode::ServFail,
-                            domain_obj,
-                            dns_type,
-                            dns_class,
-                            true,
-                        );
-                        let neutral = packet.to_bytes();
-                        for (reply, id, rd, edns_payload) in cli_addrs {
-                            reply_client(
-                                &socket, reply, &neutral, id, rd,
-                                edns_payload, dnssec_ok,
-                            )
-                            .await;
-                        }
-                        continue;
-                    };
-
-                    let neutral = match cache.insert(&reply_packet, dnssec_ok)
-                    {
-                        Some(bytes) => bytes,
-                        None => {
-                            log::debug!(
-                                "Cache insert failed for {}, \
-                                 forwarding without caching",
-                                reply_packet.display_brief(),
-                            );
-                            reply_packet.to_bytes_without_opt(None)
-                        }
-                    };
-                    let Some(cli_addrs) = cli_index.remove(&(
-                        domain, dns_type, dns_class, dnssec_ok,
-                    )) else {
-                        continue;
-                    };
-                    for (reply, id, rd, edns_payload) in cli_addrs {
-                        reply_client(
-                            &socket, reply, &neutral, id, rd, edns_payload,
-                            dnssec_ok,
-                        )
-                        .await;
-                    }
+                Some(resolved) = futures.next() => {
+                    handle_upstream_result(
+                        resolved, &socket, &mut cache, &mut cli_index,
+                    )
+                    .await;
+                }
+                _ = cache_gc.tick() => {
+                    cache.gc();
                 }
                 else => {
                     break;
                 }
             }
         }
+    }
+}
+
+/// Reply SERVFAIL to every client still waiting once no upstream lookup can
+/// answer them anymore.
+async fn reply_servfail_all(
+    socket: &Arc<UdpSocket>,
+    cli_index: &mut HashMap<CliIndexKey, Vec<PendingClient>>,
+) {
+    let count: usize = cli_index.values().map(|v| v.len()).sum();
+    log::debug!(
+        "All pending DNS queries failed to resolve, replying SERVFAIL to \
+         remaining {count} clients",
+    );
+    for ((domain, dns_type, dns_class, dnssec_ok), cli_addrs) in
+        cli_index.drain()
+    {
+        reply_servfail(
+            socket, cli_addrs, &domain, dns_type, dns_class, dnssec_ok,
+        )
+        .await;
+    }
+}
+
+/// Reply SERVFAIL to the clients waiting on one failed query.
+async fn reply_servfail(
+    socket: &Arc<UdpSocket>,
+    cli_addrs: Vec<PendingClient>,
+    domain: &str,
+    dns_type: DnsType,
+    dns_class: DnsClass,
+    dnssec_ok: bool,
+) {
+    let Ok(domain_obj) = DnsDomainName::from_str(domain) else {
+        log::warn!(
+            "Failed to parse domain name {}: invalid format, skipping reply",
+            domain
+        );
+        return;
+    };
+    let packet = DnsPacket::new_reply(
+        0,
+        DnsResponseCode::ServFail,
+        domain_obj,
+        dns_type,
+        dns_class,
+        true,
+    );
+    let neutral = packet.to_bytes();
+    for (reply, id, rd, edns_payload) in cli_addrs {
+        reply_client(socket, reply, &neutral, id, rd, edns_payload, dnssec_ok)
+            .await;
+    }
+}
+
+/// Serve one client query from `/etc/hosts` or the cache. When the query is
+/// not cached, the client joins `cli_index`; the packet and key are returned
+/// only for the first client of a key so the caller can start the upstream
+/// lookup.
+async fn handle_client_query(
+    query_packet: DnsQueryPacket,
+    socket: &Arc<UdpSocket>,
+    hosts: &HostsFile,
+    cache: &mut DnsCacheStore,
+    cli_index: &mut HashMap<CliIndexKey, Vec<PendingClient>>,
+) -> Option<(DnsPacket, CliIndexKey)> {
+    let DnsQueryPacket { packet, reply } = query_packet;
+
+    if let Some(reply_packet) = hosts.get(&packet) {
+        let neutral = reply_packet.to_bytes();
+        reply_client(
+            socket,
+            reply,
+            &neutral,
+            packet.header.id,
+            packet.header.rd,
+            packet.edns_udp_payload_size(),
+            packet.dnssec_ok(),
+        )
+        .await;
+        return None;
+    }
+
+    let question = packet.first_question()?;
+    let domain = question.domain.to_string();
+    let dns_type = question.kind;
+    let dns_class = question.class;
+    let id = packet.header.id;
+    let rd = packet.header.rd;
+    let edns_payload = packet.edns_udp_payload_size();
+    let dnssec_ok = packet.dnssec_ok();
+    let key = (domain, dns_type, dns_class, dnssec_ok);
+
+    if let Some(cached) = cache.get(&key) {
+        // The cache stores parsed packets; the caller owns the wire-format
+        // conversion.
+        let neutral = cached.to_bytes_without_opt(None);
+        reply_client(socket, reply, &neutral, id, rd, edns_payload, dnssec_ok)
+            .await;
+        return None;
+    }
+
+    log::debug!("Received DNS query from {}", packet.display_brief());
+    match cli_index.entry(key.clone()) {
+        Entry::Occupied(pending) => {
+            log::debug!(
+                "Already has pending request for {}",
+                packet.display_brief()
+            );
+            pending.into_mut().push((reply, id, rd, edns_payload));
+            None
+        }
+        Entry::Vacant(vacant) => {
+            vacant.insert(vec![(reply, id, rd, edns_payload)]);
+            Some((packet, key))
+        }
+    }
+}
+
+/// Validate one finished upstream lookup, then cache and dispatch the reply
+/// or answer SERVFAIL to every waiting client.
+async fn handle_upstream_result(
+    resolved: ResolvedQuery,
+    socket: &Arc<UdpSocket>,
+    cache: &mut DnsCacheStore,
+    cli_index: &mut HashMap<CliIndexKey, Vec<PendingClient>>,
+) {
+    let (domain, dns_type, dns_class, dnssec_ok, result) = resolved;
+    let key = (domain.clone(), dns_type, dns_class, dnssec_ok);
+
+    let reply_packet = match result {
+        Ok(packet) => {
+            if validate_upstream_response(&packet, &domain, dns_type, dns_class)
+            {
+                log::debug!(
+                    "Got DNS reply from upstream for {}",
+                    packet.display_brief()
+                );
+                Some(packet)
+            } else {
+                log::warn!(
+                    "Upstream response question mismatch for {}/{}/{:?}",
+                    domain,
+                    dns_type,
+                    dns_class,
+                );
+                None
+            }
+        }
+        Err(e) => {
+            log::debug!(
+                "Upstream DNS query for {}/{} failed: {e}",
+                domain,
+                dns_type,
+            );
+            None
+        }
+    };
+
+    let Some(reply_packet) = reply_packet else {
+        if let Some(cli_addrs) = cli_index.remove(&key) {
+            reply_servfail(
+                socket, cli_addrs, &domain, dns_type, dns_class, dnssec_ok,
+            )
+            .await;
+        }
+        return;
+    };
+
+    let neutral = reply_packet.to_bytes_without_opt(None);
+    // Cache the validated upstream reply before replying, so a follow-up
+    // query for this key is a cache hit.
+    cache.add(key.clone(), reply_packet);
+    let Some(cli_addrs) = cli_index.remove(&key) else {
+        return;
+    };
+    for (reply, id, rd, edns_payload) in cli_addrs {
+        reply_client(socket, reply, &neutral, id, rd, edns_payload, dnssec_ok)
+            .await;
     }
 }
 
@@ -507,452 +504,5 @@ fn validate_upstream_response(
 }
 
 #[cfg(test)]
-mod tests {
-    use std::str::FromStr;
-
-    use mudz::{
-        DnsClass, DnsDomainName, DnsHeader, DnsPacket, DnsQuestion,
-        DnsResourceRecord, DnsResponseCode, DnsType,
-    };
-
-    use super::{build_client_reply, validate_upstream_response};
-
-    /// A NOERROR response to `example.com A` carrying an OPT record whose
-    /// TTL encodes the given extended RCODE in its high byte.
-    fn response_with_ext_rcode(ext_rcode: u8) -> DnsPacket {
-        let domain = DnsDomainName::from_str("example.com").unwrap();
-        let opt_ttl: u32 = (ext_rcode as u32) << 24;
-        DnsPacket {
-            header: DnsHeader {
-                id: 0x1234,
-                qr: true,
-                rcode: DnsResponseCode::NoError,
-                qdcount: 1,
-                arcount: 1,
-                ..Default::default()
-            },
-            questions: vec![DnsQuestion {
-                domain: domain.clone(),
-                kind: DnsType::A,
-                class: DnsClass::IN,
-            }],
-            answers: vec![DnsResourceRecord {
-                domain: domain.clone(),
-                kind: DnsType::A,
-                class: DnsClass::IN,
-                ttl: 300,
-                rdlength: 4,
-                rdata: vec![1, 2, 3, 4],
-            }],
-            authorities: Vec::new(),
-            additionals: vec![DnsResourceRecord {
-                domain: DnsDomainName::default(),
-                kind: DnsType::Other(41),
-                class: DnsClass::Other(1232),
-                ttl: opt_ttl,
-                rdlength: 0,
-                rdata: Vec::new(),
-            }],
-        }
-    }
-
-    #[test]
-    fn test_validate_accepts_matching_response() {
-        let packet = response_with_ext_rcode(0);
-        assert!(validate_upstream_response(
-            &packet,
-            "example.com",
-            DnsType::A,
-            DnsClass::IN,
-        ));
-    }
-
-    #[test]
-    fn test_validate_rejects_extended_rcode() {
-        // BADVERS = 16 (ext-rcode 1): the header says NoError, but the
-        // response is an error and must not be treated as a valid answer.
-        let packet = response_with_ext_rcode(1);
-        assert_eq!(packet.extended_rcode(), 1);
-        assert!(!validate_upstream_response(
-            &packet,
-            "example.com",
-            DnsType::A,
-            DnsClass::IN,
-        ));
-    }
-
-    #[test]
-    fn test_validate_rejects_question_mismatch() {
-        let packet = response_with_ext_rcode(0);
-        assert!(!validate_upstream_response(
-            &packet,
-            "other.com",
-            DnsType::A,
-            DnsClass::IN,
-        ));
-        assert!(!validate_upstream_response(
-            &packet,
-            "example.com",
-            DnsType::AAAA,
-            DnsClass::IN,
-        ));
-    }
-
-    /// A NOERROR response to `example.com A` with 100 answers, serialized to
-    /// well over 512 bytes.
-    fn large_response() -> Vec<u8> {
-        let domain = DnsDomainName::from_str("example.com").unwrap();
-        let packet = DnsPacket {
-            header: DnsHeader {
-                id: 0x1234,
-                qr: true,
-                rcode: DnsResponseCode::NoError,
-                qdcount: 1,
-                ancount: 100,
-                ..Default::default()
-            },
-            questions: vec![DnsQuestion {
-                domain: domain.clone(),
-                kind: DnsType::A,
-                class: DnsClass::IN,
-            }],
-            answers: (0..100u8)
-                .map(|i| DnsResourceRecord {
-                    domain: domain.clone(),
-                    kind: DnsType::A,
-                    class: DnsClass::IN,
-                    ttl: 300,
-                    rdlength: 4,
-                    rdata: vec![10, 0, 0, i],
-                })
-                .collect(),
-            authorities: Vec::new(),
-            additionals: Vec::new(),
-        };
-        let bytes = packet.to_bytes();
-        assert!(bytes.len() > 512, "test response must exceed 512 bytes");
-        bytes
-    }
-
-    #[test]
-    fn test_build_client_reply_truncates_large_response_for_non_edns() {
-        let reply = build_client_reply(
-            &large_response(),
-            0x1111,
-            true,
-            None,
-            false,
-            false,
-        );
-        assert!(
-            reply.len() <= 512,
-            "non-EDNS reply must fit in 512 bytes, got {}",
-            reply.len()
-        );
-        let parsed = DnsPacket::parse(&reply).unwrap();
-        assert!(parsed.header.tc, "TC bit must be set on truncation");
-        assert_eq!(parsed.header.id, 0x1111);
-        assert_eq!(parsed.questions[0].domain.to_string(), "example.com");
-        // RFC 1035 §4.2.1: as many RRs as possible must be kept.
-        assert!(
-            !parsed.answers.is_empty(),
-            "truncated reply must keep as many answers as fit"
-        );
-        assert!(
-            parsed.answers.len() < 100,
-            "not all 100 answers can fit in 512 bytes"
-        );
-        assert!(!parsed.has_edns());
-    }
-
-    #[test]
-    fn test_build_client_reply_truncates_to_edns_payload() {
-        let reply = build_client_reply(
-            &large_response(),
-            0x2222,
-            false,
-            Some(512),
-            false,
-            false,
-        );
-        assert!(
-            reply.len() <= 512,
-            "reply must fit within the advertised payload, got {}",
-            reply.len()
-        );
-        let parsed = DnsPacket::parse(&reply).unwrap();
-        assert!(parsed.header.tc, "TC bit must be set on truncation");
-        assert_eq!(parsed.header.id, 0x2222);
-        assert_eq!(parsed.questions[0].domain.to_string(), "example.com");
-        assert!(
-            !parsed.answers.is_empty(),
-            "truncated reply must keep as many answers as fit"
-        );
-        assert!(parsed.answers.len() < 100);
-        // An EDNS client still gets its OPT ack.
-        assert!(parsed.has_edns());
-    }
-
-    #[test]
-    fn test_build_client_reply_tiny_advertised_payload() {
-        // A client advertising an absurdly small payload (below the 512
-        // octet EDNS minimum) must still receive a reply that fits, even if
-        // that means dropping the question section entirely.
-        let reply = build_client_reply(
-            &large_response(),
-            0x4444,
-            false,
-            Some(40),
-            false,
-            false,
-        );
-        assert!(
-            reply.len() <= 40,
-            "reply must fit within the tiny advertised payload, got {}",
-            reply.len()
-        );
-        let parsed = DnsPacket::parse(&reply).unwrap();
-        assert!(parsed.header.tc, "TC bit must be set on truncation");
-        assert_eq!(parsed.header.id, 0x4444);
-    }
-
-    #[test]
-    fn test_build_client_reply_malformed_neutral() {
-        // Garbage neutral bytes: must not panic and must yield a parseable
-        // header-only reply with TC set instead of a corrupt message.
-        let garbage = vec![0xAA; 600];
-        let reply =
-            build_client_reply(&garbage, 0x5555, true, None, false, false);
-        assert!(reply.len() <= 512);
-        let parsed = DnsPacket::parse(&reply).unwrap();
-        assert!(parsed.header.tc);
-        assert_eq!(parsed.header.id, 0x5555);
-        assert!(parsed.questions.is_empty());
-    }
-
-    #[test]
-    fn test_build_client_reply_tcp_never_truncates() {
-        // RFC 7766 §7: over TCP there is no message size limit. A reply that
-        // would be truncated to 512 bytes over UDP is delivered whole with
-        // TC clear, even for a non-EDNS client.
-        let reply = build_client_reply(
-            &large_response(),
-            0x8888,
-            true,
-            None,
-            false,
-            true,
-        );
-        let parsed = DnsPacket::parse(&reply).unwrap();
-        assert_eq!(parsed.answers.len(), 100);
-        assert!(!parsed.header.tc, "TCP reply must not be truncated");
-        assert!(
-            !parsed.has_edns(),
-            "non-EDNS client must not get an OPT record over TCP"
-        );
-
-        // EDNS client over TCP: full answer plus OPT ack, still no
-        // truncation even with a tiny advertised payload (RFC 7766 §7).
-        let reply = build_client_reply(
-            &large_response(),
-            0x9999,
-            true,
-            Some(40),
-            true,
-            true,
-        );
-        assert!(reply.len() > 512, "TCP reply carries the full answer");
-        let parsed = DnsPacket::parse(&reply).unwrap();
-        assert_eq!(parsed.answers.len(), 100);
-        assert!(!parsed.header.tc);
-        assert!(parsed.has_edns());
-        assert!(parsed.dnssec_ok());
-    }
-
-    #[test]
-    fn test_build_client_reply_keeps_small_response() {
-        let domain = DnsDomainName::from_str("example.com").unwrap();
-        let packet = DnsPacket {
-            header: DnsHeader {
-                id: 0x3333,
-                qr: true,
-                rcode: DnsResponseCode::NoError,
-                qdcount: 1,
-                ancount: 1,
-                ..Default::default()
-            },
-            questions: vec![DnsQuestion {
-                domain: domain.clone(),
-                kind: DnsType::A,
-                class: DnsClass::IN,
-            }],
-            answers: vec![DnsResourceRecord {
-                domain: domain.clone(),
-                kind: DnsType::A,
-                class: DnsClass::IN,
-                ttl: 300,
-                rdlength: 4,
-                rdata: vec![1, 2, 3, 4],
-            }],
-            authorities: Vec::new(),
-            additionals: Vec::new(),
-        };
-        let neutral = packet.to_bytes();
-
-        // Small response for a non-EDNS client: no truncation, no OPT ack.
-        let reply =
-            build_client_reply(&neutral, 0x3333, true, None, false, false);
-        let parsed = DnsPacket::parse(&reply).unwrap();
-        assert!(!parsed.header.tc);
-        assert_eq!(parsed.answers.len(), 1);
-        assert!(!parsed.has_edns());
-
-        // Small response for an EDNS client with DO=1: intact, with OPT ack
-        // echoing the DO bit.
-        let reply =
-            build_client_reply(&neutral, 0x3333, true, Some(4096), true, false);
-        let parsed = DnsPacket::parse(&reply).unwrap();
-        assert!(!parsed.header.tc);
-        assert_eq!(parsed.answers.len(), 1);
-        assert!(parsed.has_edns());
-        assert!(parsed.dnssec_ok());
-    }
-
-    #[test]
-    fn test_truncation_keeps_maximum_answers() {
-        // With RFC 1035 §4.1.4 compression, each A record for "example.com"
-        // serializes to 16 bytes (2-byte pointer to the question name +
-        // 2 type + 2 class + 4 TTL + 2 rdlength + 4 rdata).
-        // Header(12) + question(17) = 29 bytes overhead.
-        // Non-EDNS limit 512: (512 - 29) / 16 = 30 answers fit.
-        let reply = build_client_reply(
-            &large_response(),
-            0x6666,
-            true,
-            None,
-            false,
-            false,
-        );
-        let parsed = DnsPacket::parse(&reply).unwrap();
-        assert!(parsed.header.tc);
-        assert_eq!(parsed.answers.len(), 30);
-        assert!(reply.len() <= 512);
-        // Adding one more answer would exceed 512: 29 + 31 * 16 = 525.
-    }
-
-    /// A CNAME chain response similar to `finance.sina.com.cn`: 3 CNAMEs
-    /// plus enough A records that even the compressed serialization exceeds
-    /// 512 bytes.
-    fn cname_chain_response() -> Vec<u8> {
-        let domain = DnsDomainName::from_str("finance.sina.com.cn").unwrap();
-        let cname1 =
-            DnsDomainName::from_str("financesina.gslb.sinaedge.com").unwrap();
-        let cname2 =
-            DnsDomainName::from_str("acksmall.grid.sinaedge.com").unwrap();
-        let cname3 =
-            DnsDomainName::from_str("ww1.sinaimg.cn.w.alikunlun.com").unwrap();
-        let mut answers = vec![
-            DnsResourceRecord {
-                domain: domain.clone(),
-                kind: DnsType::CNAME,
-                class: DnsClass::IN,
-                ttl: 300,
-                rdlength: 0,
-                rdata: {
-                    let mut b = Vec::new();
-                    cname1.emit_to(&mut b);
-                    b
-                },
-            },
-            DnsResourceRecord {
-                domain: cname1.clone(),
-                kind: DnsType::CNAME,
-                class: DnsClass::IN,
-                ttl: 300,
-                rdlength: 0,
-                rdata: {
-                    let mut b = Vec::new();
-                    cname2.emit_to(&mut b);
-                    b
-                },
-            },
-            DnsResourceRecord {
-                domain: cname2.clone(),
-                kind: DnsType::CNAME,
-                class: DnsClass::IN,
-                ttl: 300,
-                rdlength: 0,
-                rdata: {
-                    let mut b = Vec::new();
-                    cname3.emit_to(&mut b);
-                    b
-                },
-            },
-        ];
-        for i in 0..40u8 {
-            answers.push(DnsResourceRecord {
-                domain: cname3.clone(),
-                kind: DnsType::A,
-                class: DnsClass::IN,
-                ttl: 37,
-                rdlength: 4,
-                rdata: vec![121, 17, 122, 56 + i],
-            });
-        }
-        let packet = DnsPacket {
-            header: DnsHeader {
-                id: 0x7777,
-                qr: true,
-                rcode: DnsResponseCode::NoError,
-                qdcount: 1,
-                ancount: answers.len() as u16,
-                ..Default::default()
-            },
-            questions: vec![DnsQuestion {
-                domain,
-                kind: DnsType::A,
-                class: DnsClass::IN,
-            }],
-            answers,
-            authorities: Vec::new(),
-            additionals: Vec::new(),
-        };
-        let bytes = packet.to_bytes();
-        assert!(bytes.len() > 512, "CNAME chain must exceed 512 bytes");
-        bytes
-    }
-
-    #[test]
-    fn test_truncation_keeps_cname_chain_and_some_answers() {
-        // A non-EDNS client querying a CNAME chain with many A records
-        // (like `host finance.sina.com.cn`) must receive as many records
-        // as fit within 512 bytes, not an empty truncated reply.
-        let reply = build_client_reply(
-            &cname_chain_response(),
-            0x7777,
-            true,
-            None,
-            false,
-            false,
-        );
-        assert!(reply.len() <= 512);
-        let parsed = DnsPacket::parse(&reply).unwrap();
-        assert!(parsed.header.tc);
-        assert_eq!(parsed.header.id, 0x7777);
-        // The 3 CNAME records plus a few A records must fit; at minimum the
-        // CNAME chain is preserved.
-        assert!(
-            parsed.answers.len() >= 3,
-            "CNAME chain must survive truncation, got {} answers",
-            parsed.answers.len()
-        );
-        assert!(
-            parsed.answers.len() < 43,
-            "not all 43 records can fit in 512 bytes"
-        );
-        // First three answers must be the CNAME chain in order.
-        assert_eq!(parsed.answers[0].kind, DnsType::CNAME);
-        assert_eq!(parsed.answers[1].kind, DnsType::CNAME);
-        assert_eq!(parsed.answers[2].kind, DnsType::CNAME);
-    }
-}
+#[path = "unit_tests/resolver.rs"]
+mod tests;

@@ -10,6 +10,8 @@ use tokio::{
 
 use super::{
     config::MudzConfig,
+    doh::{self, DohResolvCache},
+    host::HostsFile,
     listener::{DnsTcpListener, DnsUdpListener},
     resolver::DnsResolver,
 };
@@ -58,6 +60,10 @@ pub(crate) struct DnsUdpServer {
     socket: Arc<UdpSocket>,
     tcp_listener: Option<Arc<TcpListener>>,
     config: MudzConfig,
+    hosts: Arc<HostsFile>,
+    /// DoH hostname-to-IP mapping resolved before the server starts. `None`
+    /// when no DoH nameserver is configured.
+    doh_cache: Option<Arc<DohResolvCache>>,
 }
 
 impl DnsUdpServer {
@@ -70,6 +76,13 @@ impl DnsUdpServer {
                 group.nameservers
             );
         }
+
+        // DoH server hostnames are resolved once here, through the plain-IP
+        // [doh] nameservers, and pinned for the process lifetime. A failure
+        // is fatal: reqwest uses the pinned mapping instead of the system
+        // resolver, so no DoH query could ever succeed without it.
+        let hosts = Arc::new(HostsFile::new());
+        let doh_cache = doh::bootstrap_doh_cache(&config, &hosts).await?;
 
         let socket_addr =
             config.main.udp_bind.parse::<SocketAddr>().map_err(|e| {
@@ -115,6 +128,8 @@ impl DnsUdpServer {
             socket,
             tcp_listener,
             config,
+            hosts,
+            doh_cache,
         })
     }
 
@@ -139,7 +154,7 @@ impl DnsUdpServer {
 
         let socket = self.socket.clone();
         let udp_sender = sender.clone();
-        let listener_handle = tokio::spawn(async move {
+        let udp_listener_handle = tokio::spawn(async move {
             DnsUdpListener::run(udp_sender, socket).await
         });
 
@@ -155,12 +170,14 @@ impl DnsUdpServer {
 
         let config = self.config.clone();
         let socket = self.socket.clone();
+        let hosts = Arc::clone(&self.hosts);
+        let doh_cache = self.doh_cache.clone();
         let resolver_handle = tokio::spawn(async move {
-            DnsResolver::run(receiver, config, socket).await
+            DnsResolver::run(receiver, config, socket, hosts, doh_cache).await
         });
 
         tokio::select! {
-            result = listener_handle => {
+            result = udp_listener_handle => {
                 match result {
                     Ok(()) => log::info!("DNS listener task exited"),
                     Err(e) => log::error!(
