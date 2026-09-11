@@ -21,6 +21,10 @@ env_logger.workspace = true
 serde = { workspace = true, features = ["derive"] }
 futures-util.workspace = true
 data-encoding.workspace = true
-reqwest.workspace = true
+http-body-util.workspace = true
+hyper.workspace = true
+hyper-rustls.workspace = true
+hyper-util.workspace = true
 toml.workspace = true
 rand.workspace = true
+tower-service.workspace = true

@@ -79,8 +79,8 @@ impl DnsUdpServer {
 
         // DoH server hostnames are resolved once here, through the plain-IP
         // [doh] nameservers, and pinned for the process lifetime. A failure
-        // is fatal: reqwest uses the pinned mapping instead of the system
-        // resolver, so no DoH query could ever succeed without it.
+        // is fatal: the DoH client uses the pinned mapping instead of the
+        // system resolver, so no DoH query could ever succeed without it.
         let hosts = Arc::new(HostsFile::new());
         let doh_cache = doh::bootstrap_doh_cache(&config, &hosts).await?;
 

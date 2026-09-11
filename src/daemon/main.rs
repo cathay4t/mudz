@@ -26,10 +26,10 @@ const DEFAULT_CONFIG_PATH: &str = "/etc/mudz/mudz.conf";
 /// Builds the daemon's log filter.
 ///
 /// The configured `log_level` applies to mudz's own crates (`mudz`,
-/// `mudzd`) only. Third-party crates (reqwest, hyper, rustls, ...) are
-/// capped at `info` — or at the configured level when it is below `info` —
-/// so their TRACE/DEBUG chatter (e.g. `reqwest::retry` "shouldn't retry!")
-/// does not pollute the daemon log when `debug`/`trace` is configured.
+/// `mudzd`) only. Third-party crates (hyper, h2, rustls, ...) are capped at
+/// `info` — or at the configured level when it is below `info` — so their
+/// TRACE/DEBUG chatter does not pollute the daemon log when
+/// `debug`/`trace` is configured.
 ///
 /// `RUST_LOG` (when set) overrides these defaults entirely.
 fn build_logger(log_level: &str, rust_log: Option<&str>) -> Builder {

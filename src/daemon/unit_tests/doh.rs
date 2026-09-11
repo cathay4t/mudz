@@ -163,3 +163,40 @@ async fn test_bootstrap_without_doh_section_fails() {
         "error must mention the missing [doh] section: {err}"
     );
 }
+
+#[tokio::test]
+async fn test_pinned_connector_rejects_unknown_hostname() {
+    let mut connector =
+        PinnedTcpConnector::new(Arc::new(DohResolvCache::new(HashMap::new())));
+    let uri = Uri::from_static("https://unknown.test/dns-query");
+
+    let err = connector
+        .call(uri)
+        .await
+        .expect_err("hostname outside the pinned registry must not connect");
+    assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+}
+
+#[tokio::test]
+async fn test_pinned_connector_uses_pinned_ip_and_uri_port() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let mut store = HashMap::new();
+    store.insert(
+        "doh.test".to_string(),
+        vec![IpAddr::V4(Ipv4Addr::LOCALHOST)],
+    );
+    let mut connector =
+        PinnedTcpConnector::new(Arc::new(DohResolvCache::new(store)));
+    // Mixed-case hostname and non-default port: the connector must match the
+    // pinned entry case-insensitively and connect to the port from the URI.
+    let uri = format!("https://DoH.test:{port}/dns-query")
+        .parse::<Uri>()
+        .unwrap();
+
+    let (accepted, connected) =
+        tokio::join!(listener.accept(), connector.call(uri));
+    let (_stream, peer) = accepted.expect("pinned connector must connect");
+    connected.expect("pinned connector must return the TCP stream");
+    assert!(peer.ip().is_loopback());
+}

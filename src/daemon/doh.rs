@@ -4,29 +4,43 @@
 
 use std::{
     collections::{BTreeSet, HashMap},
+    future::Future,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
+    pin::Pin,
     sync::Arc,
+    task::{Context, Poll},
     time::Duration,
 };
 
 use data_encoding::BASE64URL_NOPAD;
 use futures_util::{StreamExt, future::join_all, stream::FuturesUnordered};
+use http_body_util::{BodyExt, Empty};
+use hyper::{Request, Uri, body::Bytes, header};
+use hyper_rustls::{HttpsConnector, HttpsConnectorBuilder};
+use hyper_util::{
+    client::legacy::Client as HttpClient,
+    rt::{TokioExecutor, TokioIo},
+};
 use mudz::{DnsPacket, DnsResponseCode, DnsType, ErrorKind, MudzError};
-use reqwest::{Client, Url};
-use tokio::net::UdpSocket;
+use tokio::net::{TcpStream, UdpSocket};
+use tower_service::Service;
 
 use super::{config::MudzConfig, host::HostsFile};
 
 const DEFAULT_TIMEOUT_SEC: Duration = Duration::from_secs(5);
 const BOOTSTRAP_TIMEOUT_SEC: Duration = Duration::from_secs(5);
 const DOH_NAMESERVER_PORT: u16 = 53;
+const DOH_HTTPS_PORT: u16 = 443;
 const DNS_MEDIA_TYPE: &str = "application/dns-message";
+
+type DohHttpClient =
+    HttpClient<HttpsConnector<PinnedTcpConnector>, Empty<Bytes>>;
 
 #[derive(Clone)]
 pub(crate) struct DohClient {
     url_prefix: String,
-    http_client: Client,
-    timeout: std::time::Duration,
+    http_client: DohHttpClient,
+    timeout: Duration,
 }
 
 impl DohClient {
@@ -41,16 +55,16 @@ impl DohClient {
             ));
         }
 
-        let http_client = Client::builder()
-            .timeout(DEFAULT_TIMEOUT_SEC)
-            .dns_resolver(cache)
-            .build()
-            .map_err(|e| {
-                MudzError::new(
-                    ErrorKind::Bug,
-                    format!("Failed to create HTTP client: {e}",),
-                )
-            })?;
+        // `hyper-rustls` performs the TLS handshake (including ALPN-based
+        // HTTP/2 negotiation) on top of the pinned-IP TCP connector.
+        let https_connector = HttpsConnectorBuilder::new()
+            .with_webpki_roots()
+            .https_only()
+            .enable_http1()
+            .enable_http2()
+            .wrap_connector(PinnedTcpConnector::new(cache));
+        let http_client =
+            HttpClient::builder(TokioExecutor::new()).build(https_connector);
 
         let url_prefix = if server_url.contains('?') {
             format!("{server_url}&dns=")
@@ -72,28 +86,53 @@ impl DohClient {
         let dns_param = BASE64URL_NOPAD.encode(&packet.to_bytes());
 
         let url = format!("{}{}", self.url_prefix, dns_param);
-        let url = Url::parse(&url).map_err(|e| {
+        let uri = Uri::try_from(url).map_err(|e| {
             MudzError::new(
                 ErrorKind::InvalidConfig,
                 format!("Invalid DoH server URL: {e}"),
             )
         })?;
 
-        let response = self
-            .http_client
-            .get(url)
-            .header("Accept", DNS_MEDIA_TYPE)
-            .timeout(self.timeout)
-            .send()
-            .await
+        let request = Request::builder()
+            .method(hyper::Method::GET)
+            .uri(uri)
+            .header(header::ACCEPT, DNS_MEDIA_TYPE)
+            .body(Empty::<Bytes>::new())
             .map_err(|e| {
                 MudzError::new(
                     ErrorKind::Bug,
-                    format!("Failed to send DoH request: {e}"),
+                    format!("Failed to build DoH request: {e}"),
                 )
             })?;
 
-        let status = response.status();
+        let (status, response_bytes) =
+            tokio::time::timeout(self.timeout, async {
+                let response =
+                    self.http_client.request(request).await.map_err(|e| {
+                        MudzError::new(
+                            ErrorKind::Bug,
+                            format!("Failed to send DoH request: {e}"),
+                        )
+                    })?;
+                let status = response.status();
+                let bytes = response
+                    .into_body()
+                    .collect()
+                    .await
+                    .map_err(|_| {
+                        MudzError::new(
+                            ErrorKind::Bug,
+                            "Failed to read DoH response body",
+                        )
+                    })?
+                    .to_bytes();
+                Ok::<_, MudzError>((status, bytes))
+            })
+            .await
+            .map_err(|_| {
+                MudzError::new(ErrorKind::Timeout, "DoH request timed out")
+            })??;
+
         if !status.is_success() {
             return Err(MudzError::new(
                 ErrorKind::InvalidPacket,
@@ -104,17 +143,6 @@ impl DohClient {
                 ),
             ));
         }
-
-        let response_bytes = response
-            .bytes()
-            .await
-            .map_err(|_| {
-                MudzError::new(
-                    ErrorKind::Bug,
-                    "Failed to read DoH response body",
-                )
-            })?
-            .to_vec();
 
         if response_bytes.len() > DnsPacket::MAX_DOH_PACKET_SIZE {
             return Err(MudzError::new(
@@ -163,26 +191,88 @@ impl DohResolvCache {
     pub(crate) fn new(store: HashMap<String, Vec<IpAddr>>) -> Self {
         Self { store }
     }
+
+    /// Pinned addresses of `hostname`, if the hostname was resolved during
+    /// bootstrap.
+    fn lookup(&self, hostname: &str) -> Option<&[IpAddr]> {
+        self.store.get(hostname).map(Vec::as_slice)
+    }
 }
 
-impl reqwest::dns::Resolve for DohResolvCache {
-    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
-        if let Some(ips) = self.store.get(name.as_str()) {
-            let addrs: Vec<SocketAddr> =
-                ips.iter().map(|ip| SocketAddr::new(*ip, 0)).collect();
-            Box::pin(async move {
-                Ok(Box::new(addrs.into_iter())
-                    as Box<dyn Iterator<Item = SocketAddr> + Send>)
-            })
-        } else {
-            Box::pin(async move {
-                Err(Box::new(std::io::Error::new(
-                    std::io::ErrorKind::NotFound,
-                    "Domain not found in static registry",
+/// TCP connector that connects only to addresses pinned in
+/// [`DohResolvCache`].
+///
+/// The system resolver is never consulted: DoH hostnames are resolved once at
+/// startup through the plain-IP `[doh]` nameservers, and the resulting
+/// addresses are used for the lifetime of the process.
+#[derive(Clone)]
+struct PinnedTcpConnector {
+    cache: Arc<DohResolvCache>,
+}
+
+impl PinnedTcpConnector {
+    fn new(cache: Arc<DohResolvCache>) -> Self {
+        Self { cache }
+    }
+}
+
+impl Service<Uri> for PinnedTcpConnector {
+    type Response = TokioIo<TcpStream>;
+    type Error = std::io::Error;
+    type Future = Pin<
+        Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>,
+    >;
+
+    fn poll_ready(
+        &mut self,
+        _cx: &mut Context<'_>,
+    ) -> Poll<Result<(), Self::Error>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn call(&mut self, uri: Uri) -> Self::Future {
+        let Some(host) = uri.host().map(str::to_ascii_lowercase) else {
+            return Box::pin(async {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "DoH URL has no hostname",
                 ))
-                    as Box<dyn std::error::Error + Send + Sync>)
-            })
-        }
+            });
+        };
+        let port = uri.port_u16().unwrap_or(DOH_HTTPS_PORT);
+        let cache = Arc::clone(&self.cache);
+
+        Box::pin(async move {
+            let ips = cache.lookup(&host).ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    format!(
+                        "DoH hostname {host} is not in the pinned DNS registry"
+                    ),
+                )
+            })?;
+
+            let mut last_error = None;
+            for ip in ips {
+                match TcpStream::connect(SocketAddr::new(*ip, port)).await {
+                    Ok(stream) => return Ok(TokioIo::new(stream)),
+                    Err(e) => {
+                        log::debug!(
+                            "Failed to connect to DoH server {host} at {ip}: \
+                             {e}"
+                        );
+                        last_error = Some(e);
+                    }
+                }
+            }
+
+            Err(last_error.unwrap_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    format!("No pinned address for DoH hostname {host}"),
+                )
+            }))
+        })
     }
 }
 
@@ -214,10 +304,10 @@ fn doh_hostnames(config: &MudzConfig) -> Result<BTreeSet<String>, MudzError> {
 /// Resolve every configured DoH hostname and pin it for the process
 /// lifetime.
 ///
-/// Called before the daemon starts serving. Failure aborts startup: reqwest
-/// uses [`DohResolvCache`] instead of the system resolver, so without the
-/// bootstrap addresses no DoH query could ever succeed. Returns `None` when
-/// no DoH nameserver is configured.
+/// Called before the daemon starts serving. Failure aborts startup: the DoH
+/// client uses [`DohResolvCache`] instead of the system resolver, so without
+/// the bootstrap addresses no DoH query could ever succeed. Returns `None`
+/// when no DoH nameserver is configured.
 pub(crate) async fn bootstrap_doh_cache(
     config: &MudzConfig,
     hosts: &HostsFile,

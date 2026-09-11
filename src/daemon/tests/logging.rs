@@ -3,10 +3,9 @@
 //! Log filter tests.
 //!
 //! The daemon's configured `log_level` must apply to mudz's own crates only;
-//! third-party crates (reqwest, hyper, rustls, ...) must not leak their
-//! TRACE/DEBUG chatter (e.g. `reqwest::retry` "shouldn't retry!") into the
-//! daemon log when `debug`/`trace` is configured. `RUST_LOG` keeps its full
-//! override.
+//! third-party crates (hyper, h2, rustls, ...) must not leak their
+//! TRACE/DEBUG chatter into the daemon log when `debug`/`trace` is
+//! configured. `RUST_LOG` keeps its full override.
 
 use env_logger::Logger;
 use log::{Level, Log, Record};
@@ -37,10 +36,10 @@ fn trace_level_applies_to_mudz_crates_only() {
     assert!(enabled(&logger, "mudzd::group", Level::Trace));
     assert!(enabled(&logger, "mudz", Level::Trace));
 
-    // Third-party crates are capped at info: no reqwest::retry TRACE spam.
-    assert!(!enabled(&logger, "reqwest::retry", Level::Trace));
-    assert!(!enabled(&logger, "reqwest::retry", Level::Debug));
-    assert!(enabled(&logger, "reqwest::retry", Level::Info));
+    // Third-party crates are capped at info: no h2 TRACE spam.
+    assert!(!enabled(&logger, "h2::codec", Level::Trace));
+    assert!(!enabled(&logger, "h2::codec", Level::Debug));
+    assert!(enabled(&logger, "h2::codec", Level::Info));
     assert!(!enabled(&logger, "hyper::client", Level::Trace));
     assert!(!enabled(&logger, "rustls", Level::Debug));
 }
@@ -52,9 +51,9 @@ fn info_level_keeps_previous_behavior() {
     assert!(enabled(&logger, "mudzd", Level::Info));
     assert!(!enabled(&logger, "mudzd", Level::Debug));
     // Third parties stay at info, same as before this change.
-    assert!(enabled(&logger, "reqwest::retry", Level::Info));
-    assert!(enabled(&logger, "reqwest::retry", Level::Warn));
-    assert!(!enabled(&logger, "reqwest::retry", Level::Debug));
+    assert!(enabled(&logger, "h2::codec", Level::Info));
+    assert!(enabled(&logger, "h2::codec", Level::Warn));
+    assert!(!enabled(&logger, "h2::codec", Level::Debug));
 }
 
 #[test]
@@ -64,17 +63,17 @@ fn error_level_keeps_previous_behavior() {
     assert!(enabled(&logger, "mudzd", Level::Error));
     assert!(!enabled(&logger, "mudzd", Level::Info));
     // Dependency errors must stay visible at any configured level.
-    assert!(enabled(&logger, "reqwest::retry", Level::Error));
-    assert!(!enabled(&logger, "reqwest::retry", Level::Warn));
+    assert!(enabled(&logger, "h2::codec", Level::Error));
+    assert!(!enabled(&logger, "h2::codec", Level::Warn));
 }
 
 #[test]
 fn rust_log_overrides_module_defaults() {
     let logger =
-        crate::build_logger("info", Some("reqwest=trace,mudzd=error")).build();
+        crate::build_logger("info", Some("h2=trace,mudzd=error")).build();
 
     // RUST_LOG wins over both the module defaults and the dependency cap.
-    assert!(enabled(&logger, "reqwest::retry", Level::Trace));
+    assert!(enabled(&logger, "h2::codec", Level::Trace));
     assert!(!enabled(&logger, "mudzd", Level::Info));
     assert!(enabled(&logger, "mudzd", Level::Error));
 }
@@ -85,5 +84,5 @@ fn invalid_log_level_falls_back_to_error() {
 
     assert!(enabled(&logger, "mudzd", Level::Error));
     assert!(!enabled(&logger, "mudzd", Level::Info));
-    assert!(enabled(&logger, "reqwest::retry", Level::Error));
+    assert!(enabled(&logger, "h2::codec", Level::Error));
 }
