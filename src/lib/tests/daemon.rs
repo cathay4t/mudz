@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! End-to-end test: run the daemon in a background thread on a non-privileged
-//! port and drive it with the blocking [`mudz::DnsUdpClient`], covering
-//! traditional (non-EDNS) and EDNS queries against a stable domain, for both a
-//! plain-UDP fallback and a DoH fallback.
+//! End-to-end test: run [`mudz::MudzServer`] in a background thread on a
+//! non-privileged port and drive it with the blocking [`mudz::DnsUdpClient`],
+//! covering traditional (non-EDNS) and EDNS queries against a stable domain,
+//! for both a plain-UDP fallback and a DoH fallback.
 
 use std::{
     fs,
@@ -16,10 +16,8 @@ use std::{
 
 use mudz::{
     DnsClass, DnsHeader, DnsPacket, DnsResourceRecord, DnsResponseCode,
-    DnsType, DnsUdpClient,
+    DnsType, DnsUdpClient, MudzConfig, MudzServer,
 };
-
-use crate::{config::MudzConfig, server::DnsUdpServer};
 
 const CONF_PATH: &str = "/tmp/test_mudz.conf";
 const BIND: &str = "127.0.0.1:53530";
@@ -81,7 +79,7 @@ fn start_server() -> ServerHandle {
             .build()
             .expect("failed to build test runtime");
         rt.block_on(async move {
-            let server = DnsUdpServer::new(config)
+            let server = MudzServer::new(config)
                 .await
                 .expect("failed to start DNS server");
             server

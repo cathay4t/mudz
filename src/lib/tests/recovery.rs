@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Stress the upstream health/recovery machinery the way a long-running
-//! daemon hits it: an upstream that is *alive* most of the time, with short
+//! server hits it: an upstream that is *alive* most of the time, with short
 //! outages sprinkled in. Every query must either resolve or fail fast with
 //! SERVFAIL - never hang - and the daemon must always recover on its own
 //! once the upstream answers again (no restart), for every outage cycle.
@@ -17,9 +17,10 @@ use std::{
     time::{Duration, Instant},
 };
 
-use mudz::{DnsClass, DnsPacket, DnsResourceRecord, DnsResponseCode, DnsType};
-
-use crate::{config::MudzConfig, server::DnsUdpServer};
+use mudz::{
+    DnsClass, DnsPacket, DnsResourceRecord, DnsResponseCode, DnsType,
+    MudzConfig, MudzServer,
+};
 
 /// Ports and config path for the long-outage test.
 const BIND_A: &str = "127.0.0.1:53541";
@@ -156,7 +157,7 @@ fn start_server(bind: &str, conf: &str) -> ServerHandle {
             .build()
             .expect("failed to build test runtime");
         rt.block_on(async move {
-            let server = DnsUdpServer::new(config)
+            let server = MudzServer::new(config)
                 .await
                 .expect("failed to start DNS server");
             server

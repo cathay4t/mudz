@@ -2,13 +2,10 @@
 
 use std::collections::HashMap;
 
-use mudz::{DnsPacket, DnsResponseCode, DnsType};
-
 use super::*;
 use crate::{
-    config::{
-        DnsUpstreamGroup, MudzConfig, MudzFallbackConfig, MudzMainConfig,
-    },
+    DnsPacket, DnsResponseCode, DnsType,
+    config::{MudzConfig, MudzFallbackConfig, MudzGroupConfig, MudzMainConfig},
     retry::now_secs,
 };
 
@@ -176,7 +173,7 @@ async fn test_named_group_resolves_when_fallback_unavailable() {
     let mut groups = HashMap::new();
     groups.insert(
         "corp".to_string(),
-        DnsUpstreamGroup {
+        MudzGroupConfig {
             nameservers: vec![upstream_addr.to_string()],
             domains: vec!["corp.example".to_string()],
             disable_ipv6: false,

@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! End-to-end tests for dead upstreams at daemon start: the node boots,
-//! mudzd starts, and a group's upstream server is not reachable yet (or is
-//! blackholed). Clients querying that group must get SERVFAIL instead of
-//! waiting forever, and the daemon must recover on its own once the upstream
-//! becomes reachable — no restart.
+//! End-to-end tests for dead upstreams at server start: the node boots, the
+//! embedded [`mudz::MudzServer`] starts, and a group's upstream server is not
+//! reachable yet (or is blackholed). Clients querying that group must get
+//! SERVFAIL instead of waiting forever, and the server must recover on its
+//! own once the upstream becomes reachable — no restart.
 //!
 //! `test_blackhole_upstream_at_boot` reproduces the boot scenario with a
 //! kernel blackhole route (`ip route blackhole`, RFC 5737 TEST-NET-1
@@ -12,7 +12,7 @@
 //!
 //! ```text
 //! cargo test --package mudz --no-run
-//! sudo target/debug/deps/mudzd-* blackhole --ignored --nocapture
+//! sudo target/debug/deps/blackhole-* blackhole --ignored --nocapture
 //! ```
 //!
 //! `test_silent_upstream_fails_fast_after_repeated_timeouts` reproduces the
@@ -32,9 +32,10 @@ use std::{
     time::{Duration, Instant},
 };
 
-use mudz::{DnsClass, DnsPacket, DnsResourceRecord, DnsResponseCode, DnsType};
-
-use crate::{config::MudzConfig, server::DnsUdpServer};
+use mudz::{
+    DnsClass, DnsPacket, DnsResourceRecord, DnsResponseCode, DnsType,
+    MudzConfig, MudzServer,
+};
 
 /// RFC 5737 TEST-NET-1: guaranteed never to be routed anywhere real.
 const UPSTREAM: &str = "192.0.2.153";
@@ -147,7 +148,7 @@ fn start_server(conf_path: &str, bind: &str) -> ServerHandle {
             .build()
             .expect("failed to build test runtime");
         rt.block_on(async move {
-            let server = DnsUdpServer::new(config)
+            let server = MudzServer::new(config)
                 .await
                 .expect("failed to start DNS server");
             server
@@ -353,15 +354,15 @@ fn write_refused_config() {
     fs::write(REFUSED_CONF, content).expect("write refused config");
 }
 
-/// Boot scenario: the upstream is unreachable the moment mudzd starts.
+/// Boot scenario: the upstream is unreachable the moment the server starts.
 ///
-/// Phase 1 — a kernel blackhole route covers the upstream, so mudzd starts
+/// Phase 1 — a kernel blackhole route covers the upstream, so the server starts
 /// with a dead upstream. Queries for the group's domains must be answered
-/// SERVFAIL (never hang), and after the daemon has seen the upstream fail
+/// SERVFAIL (never hang), and after the server has seen the upstream fail
 /// repeatedly it must fail fast.
 ///
 /// Phase 2 — the blackhole route is removed and the upstream address comes
-/// up on loopback with a live DNS server behind it. The daemon must recover
+/// up on loopback with a live DNS server behind it. The server must recover
 /// by itself (no restart) once the transport retry cooldown has passed.
 #[test]
 #[ignore = "requires root: installs a kernel blackhole route"]
@@ -376,7 +377,7 @@ fn test_blackhole_upstream_at_boot() {
     let _config_guard = ConfigGuard(BLACKHOLE_CONF);
     let _net_guard = NetGuard;
 
-    // The upstream is already blackholed when mudzd starts, exactly like a
+    // The upstream is already blackholed when the server starts, exactly like a
     // group whose nameserver is not reachable at node boot.
     run_ip(&["route", "replace", "blackhole", UPSTREAM])
         .expect("install blackhole route");

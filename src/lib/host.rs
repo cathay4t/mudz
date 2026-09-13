@@ -6,7 +6,7 @@ use std::{
     net::{IpAddr, Ipv4Addr, Ipv6Addr},
 };
 
-use mudz::{DnsClass, DnsPacket, DnsResourceRecord, DnsType};
+use crate::{DnsClass, DnsPacket, DnsResourceRecord, DnsType};
 
 const HOSTS_FILE: &str = "/etc/hosts";
 
@@ -17,6 +17,15 @@ pub(crate) struct HostsFile {
 }
 
 impl HostsFile {
+    /// A hosts file with no entries, used when `/etc/hosts` answers are
+    /// disabled by configuration.
+    pub(crate) fn empty() -> Self {
+        Self {
+            a_records: HashMap::new(),
+            aaaa_records: HashMap::new(),
+        }
+    }
+
     pub(crate) fn new() -> Self {
         let mut a_records: HashMap<String, Vec<Ipv4Addr>> = HashMap::new();
         let mut aaaa_records: HashMap<String, Vec<Ipv6Addr>> = HashMap::new();

@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::config::*;
+use mudz::MudzConfig;
 
 #[test]
 fn test_doh_options_defaults() {
@@ -257,27 +257,4 @@ nameservers = ["8.8.8.8"]
         "Expected valid config with plain IP fallback and no [doh] section, \
          got: {result:?}"
     );
-}
-
-#[test]
-fn test_extract_doh_hostname() {
-    assert_eq!(
-        extract_doh_hostname("https://dns.alidns.com/dns-query"),
-        Some("dns.alidns.com".to_string())
-    );
-    assert_eq!(
-        extract_doh_hostname("https://doh.pub/dns-query"),
-        Some("doh.pub".to_string())
-    );
-    assert_eq!(
-        extract_doh_hostname("https://dns.google/dns-query"),
-        Some("dns.google".to_string())
-    );
-    assert_eq!(
-        extract_doh_hostname("https://dns.google:443/dns-query"),
-        Some("dns.google".to_string())
-    );
-    assert_eq!(extract_doh_hostname("invalid"), None);
-    assert_eq!(extract_doh_hostname("https://"), None);
-    assert_eq!(extract_doh_hostname("https:///path"), None);
 }

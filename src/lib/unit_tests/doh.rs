@@ -1,10 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 
-use mudz::{DnsClass, DnsResourceRecord};
-
 use super::*;
-use crate::config::{
-    DnsUpstreamGroup, MudzDohConfig, MudzFallbackConfig, MudzMainConfig,
+use crate::{
+    DnsClass, DnsResourceRecord,
+    config::{
+        MudzDohConfig, MudzFallbackConfig, MudzGroupConfig, MudzMainConfig,
+    },
 };
 
 fn a_reply(query: &DnsPacket, ips: &[Ipv4Addr]) -> DnsPacket {
@@ -103,7 +104,7 @@ fn test_doh_hostnames_are_unique_and_lowercased() {
     let mut groups = HashMap::new();
     groups.insert(
         "corp".to_string(),
-        DnsUpstreamGroup {
+        MudzGroupConfig {
             nameservers: vec![
                 "https://DNS.Example.COM/dns-query".to_string(),
                 "8.8.8.8".to_string(),

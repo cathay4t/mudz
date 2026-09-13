@@ -5,8 +5,11 @@ udp_bind = "127.0.0.1:53"
 # RFC 7766: clients retry over TCP when a UDP reply is truncated (TC bit).
 # Defaults to the same address as udp_bind.
 # tcp_bind = "127.0.0.1:53"
-# Maximum number of cache entries
+# Maximum number of cache entries. 0 disables caching, queries are still
+# forwarded to the upstream nameservers.
 max_cache_size = 4096
+# Answer A/AAAA queries from /etc/hosts before forwarding them
+load_etc_hosts = true
 # Log level (trace, debug, info, warn, error)
 log_level = "info"
 

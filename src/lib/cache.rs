@@ -5,7 +5,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use mudz::{DnsClass, DnsPacket, DnsType};
+use crate::{DnsClass, DnsPacket, DnsType};
 
 const MIN_CACHE_TTL_SEC: u32 = 5;
 const MAX_CACHE_TTL_SEC: u32 = 86400;
@@ -41,6 +41,12 @@ impl DnsCacheStore {
         }
     }
 
+    /// Whether responses are cached at all. A `max_cache_size` of 0 disables
+    /// caching while the resolver keeps forwarding queries.
+    pub(crate) fn is_enabled(&self) -> bool {
+        self.max_size > 0
+    }
+
     /// Drop expired entries.
     pub(crate) fn gc(&mut self) {
         let now = Instant::now();
@@ -50,6 +56,9 @@ impl DnsCacheStore {
     /// Evict the least-recently-used entry. O(n) scan, but only called
     /// when the cache is full — far less frequent than cache hits.
     fn evict_lru(&mut self) {
+        if !self.is_enabled() {
+            return;
+        }
         while self.entries.len() >= self.max_size {
             let Some(oldest_key) = self
                 .entries
@@ -131,6 +140,10 @@ impl DnsCacheStore {
 
     /// Store or refresh the parsed response for `key`.
     pub(crate) fn add(&mut self, key: CacheKey, mut response: DnsPacket) {
+        if !self.is_enabled() {
+            return;
+        }
+
         if self.entries.len() >= self.max_size {
             self.gc();
             self.evict_lru();

@@ -24,7 +24,6 @@ use hyper_util::{
     client::legacy::Client as HttpClient,
     rt::{TokioExecutor, TokioIo, TokioTimer},
 };
-use mudz::{DnsPacket, DnsResponseCode, DnsType, ErrorKind, MudzError};
 use tokio::{
     net::{TcpStream, UdpSocket},
     sync::RwLock,
@@ -35,6 +34,7 @@ use super::{
     config::{MudzConfig, MudzDohConfig},
     host::HostsFile,
 };
+use crate::{DnsPacket, DnsResponseCode, DnsType, ErrorKind, MudzError};
 
 /// Overall budget for one DoH lookup, including any retry.
 const DEFAULT_TIMEOUT_SEC: Duration = Duration::from_secs(5);

@@ -2,9 +2,6 @@
 
 use std::{net::SocketAddr, sync::Arc};
 
-use mudz::{
-    DnsClass, DnsHeader, DnsPacket, DnsResourceRecord, DnsResponseCode, DnsType,
-};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream, UdpSocket},
@@ -12,7 +9,11 @@ use tokio::{
 };
 
 use super::{DnsTcpListener, DnsUdpListener, classify_query};
-use crate::server::{DnsQueryPacket, DnsReplyTarget};
+use crate::{
+    DnsClass, DnsHeader, DnsPacket, DnsResourceRecord, DnsResponseCode,
+    DnsType,
+    server::{DnsQueryPacket, DnsReplyTarget},
+};
 
 #[tokio::test]
 async fn test_query_without_question_gets_formerr() {

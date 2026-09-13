@@ -2,12 +2,11 @@
 
 use std::str::FromStr;
 
-use mudz::{
+use super::{build_client_reply, validate_upstream_response};
+use crate::{
     DnsClass, DnsDomainName, DnsHeader, DnsPacket, DnsQuestion,
     DnsResourceRecord, DnsResponseCode, DnsType,
 };
-
-use super::{build_client_reply, validate_upstream_response};
 
 /// A NOERROR response to `example.com A` carrying an OPT record whose
 /// TTL encodes the given extended RCODE in its high byte.

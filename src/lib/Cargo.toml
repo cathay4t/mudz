@@ -2,7 +2,7 @@
 name = "mudz"
 version.workspace = true
 authors.workspace = true
-description = "The library of DNS cache"
+description = "DNS cache library with an embeddable caching resolver"
 documentation.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -13,4 +13,19 @@ name = "mudz"
 path = "lib.rs"
 
 [dependencies]
+data-encoding.workspace = true
+futures-util.workspace = true
+http-body-util.workspace = true
+hyper.workspace = true
+hyper-rustls.workspace = true
+hyper-util.workspace = true
+libc.workspace = true
+log.workspace = true
 rand.workspace = true
+serde.workspace = true
+tokio.workspace = true
+toml.workspace = true
+tower-service.workspace = true
+
+[dev-dependencies]
+env_logger.workspace = true

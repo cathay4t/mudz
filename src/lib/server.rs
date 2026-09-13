@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 
-use std::{net::SocketAddr, sync::Arc};
+use std::{future::Future, net::SocketAddr, sync::Arc};
 
-use mudz::{DnsPacket, ErrorKind, MudzError};
 use tokio::{
     net::{TcpListener, UdpSocket},
     sync::{mpsc, oneshot},
+    task::JoinSet,
 };
 
 use super::{
@@ -15,6 +15,7 @@ use super::{
     listener::{DnsTcpListener, DnsUdpListener},
     resolver::DnsResolver,
 };
+use crate::{DnsPacket, ErrorKind, MudzError};
 
 /// Where to deliver a resolved reply: back over the UDP socket that carried
 /// the query, or over the client's TCP connection (RFC 1035 §4.2.2). TCP
@@ -56,7 +57,14 @@ pub(crate) struct DnsQueryPacket {
     pub(crate) reply: DnsReplyTarget,
 }
 
-pub(crate) struct DnsUdpServer {
+/// The embeddable DNS cache server.
+///
+/// [`MudzServer::new`] validates the configuration, binds the listening
+/// sockets and resolves the DoH bootstrap addresses, so a returned server is
+/// ready to serve. The server owns its sockets: once the future returned by
+/// [`MudzServer::run`] or [`MudzServer::run_with_shutdown`] finishes, the
+/// bound addresses are free again.
+pub struct MudzServer {
     socket: Arc<UdpSocket>,
     tcp_listener: Option<Arc<TcpListener>>,
     config: MudzConfig,
@@ -66,8 +74,17 @@ pub(crate) struct DnsUdpServer {
     doh_cache: Option<Arc<DohResolvCache>>,
 }
 
-impl DnsUdpServer {
-    pub(crate) async fn new(config: MudzConfig) -> Result<Self, MudzError> {
+impl MudzServer {
+    /// Bind the listening sockets and resolve the configured DoH server
+    /// hostnames.
+    ///
+    /// The configuration is validated first, so an invalid one fails before
+    /// any socket is bound. A failure to bind the UDP socket is fatal, while
+    /// a TCP bind failure is logged and only disables DNS over TCP
+    /// (RFC 7766 §6.1).
+    pub async fn new(config: MudzConfig) -> Result<Self, MudzError> {
+        config.validate()?;
+
         for (name, group) in &config.groups {
             log::info!(
                 "Domain group '{}': {:?} -> {:?}",
@@ -81,7 +98,11 @@ impl DnsUdpServer {
         // [doh] nameservers, and pinned for the process lifetime. A failure
         // is fatal: the DoH client uses the pinned mapping instead of the
         // system resolver, so no DoH query could ever succeed without it.
-        let hosts = Arc::new(HostsFile::new());
+        let hosts = Arc::new(if config.main.load_etc_hosts {
+            HostsFile::new()
+        } else {
+            HostsFile::empty()
+        });
         let doh_cache = doh::bootstrap_doh_cache(&config, &hosts).await?;
 
         let socket_addr =
@@ -133,85 +154,110 @@ impl DnsUdpServer {
         })
     }
 
-    pub(crate) async fn run(&self) -> Result<(), MudzError> {
-        self.run_with_shutdown(async {
-            let _ = tokio::signal::ctrl_c().await;
-        })
-        .await
+    /// Serve DNS queries until the process receives `SIGINT` or `SIGTERM`.
+    ///
+    /// This blocks the caller until the server is told to exit, which is the
+    /// behaviour a standalone daemon wants. Embedders that manage shutdown
+    /// themselves use [`MudzServer::run_with_shutdown`].
+    pub async fn run(self) -> Result<(), MudzError> {
+        self.run_with_shutdown(shutdown_signal()).await
     }
 
-    /// Run the server until a spawned task exits or `shutdown` resolves.
-    /// [`Self::run`] wires `shutdown` to Ctrl-C; tests supply their own signal
-    /// so they can stop the server deterministically.
-    pub(crate) async fn run_with_shutdown<F>(
-        &self,
+    /// Serve DNS queries until `shutdown` resolves or a serving task exits.
+    ///
+    /// All tasks spawned by the server are aborted and joined before this
+    /// returns, so no socket is left bound once it resolves. A task panic is
+    /// reported as an [`ErrorKind::Bug`] error.
+    pub async fn run_with_shutdown<F>(
+        self,
         shutdown: F,
     ) -> Result<(), MudzError>
     where
-        F: std::future::Future<Output = ()>,
+        F: Future<Output = ()> + Send,
     {
         let (sender, receiver) = mpsc::unbounded_channel::<DnsQueryPacket>();
 
-        let socket = self.socket.clone();
-        let udp_sender = sender.clone();
-        let udp_listener_handle = tokio::spawn(async move {
-            DnsUdpListener::run(udp_sender, socket).await
-        });
+        let mut tasks = JoinSet::new();
+        tasks.spawn(DnsUdpListener::run(
+            sender.clone(),
+            Arc::clone(&self.socket),
+        ));
 
         // The TCP listener shares the same query channel; replies are
         // routed back over each client's connection via `DnsReplyTarget`.
-        let tcp_listener_handle = self.tcp_listener.as_ref().map(|listener| {
-            let sender = sender.clone();
-            let listener = Arc::clone(listener);
-            tokio::spawn(
-                async move { DnsTcpListener::run(sender, listener).await },
-            )
-        });
+        if let Some(listener) = self.tcp_listener.as_ref() {
+            tasks.spawn(DnsTcpListener::run(
+                sender.clone(),
+                Arc::clone(listener),
+            ));
+        }
 
-        let config = self.config.clone();
-        let socket = self.socket.clone();
-        let hosts = Arc::clone(&self.hosts);
-        let doh_cache = self.doh_cache.clone();
-        let resolver_handle = tokio::spawn(async move {
-            DnsResolver::run(receiver, config, socket, hosts, doh_cache).await
-        });
+        tasks.spawn(DnsResolver::run(
+            receiver,
+            self.config.clone(),
+            Arc::clone(&self.socket),
+            Arc::clone(&self.hosts),
+            self.doh_cache.clone(),
+        ));
 
+        let mut result = Ok(());
         tokio::select! {
-            result = udp_listener_handle => {
-                match result {
-                    Ok(()) => log::info!("DNS listener task exited"),
-                    Err(e) => log::error!(
-                        "DNS listener task panicked: {e}"
-                    ),
-                }
-            }
-            result = async {
-                match tcp_listener_handle {
-                    Some(handle) => handle.await,
-                    None => std::future::pending().await,
-                }
-            } => {
-                match result {
-                    Ok(()) => log::info!("DNS TCP listener task exited"),
-                    Err(e) => log::error!(
-                        "DNS TCP listener task panicked: {e}"
-                    ),
-                }
-            }
-            result = resolver_handle => {
-                match result {
-                    Ok(()) => log::info!("DNS resolver task exited"),
-                    Err(e) => log::error!(
-                        "DNS resolver task panicked: {e}"
-                    ),
-                }
-            }
             _ = shutdown => {
-                log::info!("Received shutdown signal");
+                log::debug!("Shutdown requested by the embedder");
+            }
+            task = tasks.join_next() => {
+                match task {
+                    Some(Ok(())) => log::info!("DNS serving task exited"),
+                    Some(Err(e)) => {
+                        log::error!("DNS serving task failed: {e}");
+                        result = Err(MudzError::new(
+                            ErrorKind::Bug,
+                            format!("DNS serving task failed: {e}"),
+                        ));
+                    }
+                    None => {
+                        log::error!("All DNS serving tasks exited");
+                    }
+                }
             }
         }
 
+        // Abort the remaining tasks and wait until they are dropped, so the
+        // listening sockets are released before this function returns.
+        tasks.abort_all();
+        while tasks.join_next().await.is_some() {}
+
         log::info!("Shutting down");
-        Ok(())
+        result
+    }
+}
+
+/// Resolves when the process is asked to terminate: `SIGINT` (Ctrl-C) or, on
+/// Unix, `SIGTERM` (the signal `systemctl stop` and `kill` send).
+async fn shutdown_signal() {
+    let interrupt = async {
+        let _ = tokio::signal::ctrl_c().await;
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        use tokio::signal::unix::{SignalKind, signal};
+
+        match signal(SignalKind::terminate()) {
+            Ok(mut signal) => {
+                signal.recv().await;
+            }
+            Err(e) => {
+                log::warn!("Failed to install SIGTERM handler: {e}");
+                std::future::pending::<()>().await;
+            }
+        }
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = interrupt => log::info!("Received SIGINT"),
+        _ = terminate => log::info!("Received SIGTERM"),
     }
 }

@@ -10,4 +10,4 @@
     this when multiple upstreams are configured, but a single-upstream
     group cannot switch.
   - HTTP-date `Retry-After` values are ignored.
-  See `DohAttemptError` in `src/daemon/doh.rs`.
+  See `DohAttemptError` in `src/lib/doh.rs`.

@@ -2,12 +2,11 @@
 
 use std::str::FromStr;
 
-use mudz::{
+use super::{CacheKey, DnsCacheStore};
+use crate::{
     DnsClass, DnsDomainName, DnsHeader, DnsPacket, DnsQuestion,
     DnsResourceRecord, DnsResponseCode, DnsType,
 };
-
-use super::{CacheKey, DnsCacheStore};
 
 fn response_for(domain: &str, ip_last_octet: u8) -> DnsPacket {
     let domain_obj = DnsDomainName::from_str(domain).unwrap();
@@ -65,6 +64,19 @@ fn test_lru_evicts_least_recently_accessed() {
         "LRU entry must be evicted"
     );
     assert!(cache.get(&key_for("c.com")).is_some());
+}
+
+#[test]
+fn test_zero_max_size_disables_caching() {
+    let mut cache = DnsCacheStore::new(0);
+    assert!(!cache.is_enabled());
+
+    cache.add(key_for("a.com"), response_for("a.com", 1));
+
+    assert!(
+        cache.get(&key_for("a.com")).is_none(),
+        "a disabled cache must not store responses"
+    );
 }
 
 #[test]

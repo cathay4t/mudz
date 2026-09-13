@@ -8,10 +8,6 @@ use std::{
 };
 
 use futures_util::{StreamExt, stream::FuturesUnordered};
-use mudz::{
-    DnsClass, DnsDomainName, DnsHeader, DnsNameCompressionMap, DnsPacket,
-    DnsResponseCode, DnsType, MudzError,
-};
 use tokio::{net::UdpSocket, sync::mpsc::UnboundedReceiver};
 
 use super::{
@@ -22,6 +18,10 @@ use super::{
     host::HostsFile,
     server::{DnsQueryPacket, DnsReplyTarget},
     suspend::ResumeDetector,
+};
+use crate::{
+    DnsClass, DnsDomainName, DnsHeader, DnsNameCompressionMap, DnsPacket,
+    DnsResponseCode, DnsType, MudzError,
 };
 
 /// Pending client: (reply target, transaction ID, RD flag, EDNS payload
@@ -65,6 +65,12 @@ impl DnsResolver {
         doh_cache: Option<Arc<DohResolvCache>>,
     ) {
         let mut cache = DnsCacheStore::new(config.main.max_cache_size);
+        if !cache.is_enabled() {
+            log::info!(
+                "Response caching is disabled (max_cache_size = 0), queries \
+                 are still forwarded"
+            );
+        }
         let mut cli_index: HashMap<CliIndexKey, Vec<PendingClient>> =
             HashMap::new();
         let groups = Arc::new(DnsGroups::new(config, doh_cache));

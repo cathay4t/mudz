@@ -2,8 +2,9 @@
 
 use std::{collections::HashMap, fs, net::IpAddr, path::Path};
 
-use mudz::{ErrorKind, MudzError};
 use serde::Deserialize;
+
+use crate::{ErrorKind, MudzError};
 
 const DEFAULT_MAX_CACHE_SIZE: usize = 4096;
 const DEFAULT_UDP_BIND: &str = "127.0.0.1:53";
@@ -38,20 +39,22 @@ fn default_doh_idle_timeout() -> u64 {
 }
 
 /// Configuration for the main section
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Clone, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
-pub(crate) struct MudzMainConfig {
+pub struct MudzMainConfig {
     /// UDP socket bind address
-    pub(crate) udp_bind: String,
+    pub udp_bind: String,
     /// TCP socket bind address (RFC 7766 §6.1: every DNS server must support
     /// TCP, used when a UDP reply is truncated). Defaults to the same
     /// address as `udp_bind` when omitted.
-    pub(crate) tcp_bind: Option<String>,
+    pub tcp_bind: Option<String>,
     /// Maximum number of cache entries
-    pub(crate) max_cache_size: usize,
+    pub max_cache_size: usize,
     #[serde(default)]
     /// Log level (e.g., "info", "debug", "warn", "error")
-    pub(crate) log_level: String,
+    pub log_level: String,
+    /// Answer A/AAAA queries from `/etc/hosts` before forwarding them.
+    pub load_etc_hosts: bool,
 }
 
 impl Default for MudzMainConfig {
@@ -61,46 +64,47 @@ impl Default for MudzMainConfig {
             tcp_bind: None,
             max_cache_size: DEFAULT_MAX_CACHE_SIZE,
             log_level: "info".to_string(),
+            load_etc_hosts: true,
         }
     }
 }
 
 /// Configuration for the fallback (default upstream) section
-#[derive(Debug, Deserialize, Clone, Default)]
+#[derive(Debug, Deserialize, Clone, Default, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct MudzFallbackConfig {
+pub struct MudzFallbackConfig {
     /// Upstream DNS servers for fallback
-    pub(crate) nameservers: Vec<String>,
+    pub nameservers: Vec<String>,
     /// Disable AAAA queries for fallback servers
     #[serde(default)]
-    pub(crate) disable_ipv6: bool,
+    pub disable_ipv6: bool,
 }
 
 /// Configuration for the [doh] section. Provides plain IP nameservers for
 /// resolving DoH server hostnames. Mandatory if any nameserver is a DoH URL.
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct MudzDohConfig {
+pub struct MudzDohConfig {
     /// UDP nameservers for resolving DoH server hostnames
-    pub(crate) nameservers: Vec<IpAddr>,
+    pub nameservers: Vec<IpAddr>,
     /// Disable AAAA queries for DoH resolver
     #[serde(default)]
-    pub(crate) disable_ipv6: bool,
+    pub disable_ipv6: bool,
     /// Overall timeout in seconds for one DoH lookup, including retries.
     #[serde(default = "default_doh_timeout")]
-    pub(crate) timeout: u64,
+    pub timeout: u64,
     /// Number of retries after the first DoH attempt.
     #[serde(default = "default_doh_retries")]
-    pub(crate) retries: usize,
+    pub retries: usize,
     /// HTTP/2 keepalive ping interval in seconds; 0 disables keepalive.
     #[serde(default = "default_doh_keepalive_interval")]
-    pub(crate) keepalive_interval: u64,
+    pub keepalive_interval: u64,
     /// Seconds to wait for a keepalive ping acknowledgement.
     #[serde(default = "default_doh_keepalive_timeout")]
-    pub(crate) keepalive_timeout: u64,
+    pub keepalive_timeout: u64,
     /// Seconds an idle pooled connection may stay open.
     #[serde(default = "default_doh_idle_timeout")]
-    pub(crate) idle_timeout: u64,
+    pub idle_timeout: u64,
 }
 
 impl Default for MudzDohConfig {
@@ -118,38 +122,39 @@ impl Default for MudzDohConfig {
 }
 
 /// Configuration for a named group of upstream DNS servers
-#[derive(Debug, Deserialize, Clone, Default)]
+#[derive(Debug, Deserialize, Clone, Default, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
-pub(crate) struct DnsUpstreamGroup {
+pub struct MudzGroupConfig {
     /// Nameservers in this group
-    pub(crate) nameservers: Vec<String>,
+    pub nameservers: Vec<String>,
     /// Domains that should be routed to this group, empty means reply NXDOMAIN
     /// immediately without forwarding to fallback.
-    pub(crate) domains: Vec<String>,
+    pub domains: Vec<String>,
     /// Disable AAAA queries for this group
-    pub(crate) disable_ipv6: bool,
+    pub disable_ipv6: bool,
 }
 
-/// Full mudz configuration
-#[derive(Debug, Deserialize, Clone, Default)]
+/// Configuration of the DNS cache server.
+///
+/// It can be loaded from a TOML file with [`MudzConfig::from_file`] or built
+/// directly for embedding the server into another daemon.
+#[derive(Debug, Deserialize, Clone, Default, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
-pub(crate) struct MudzConfig {
+pub struct MudzConfig {
     /// Main settings
-    pub(crate) main: MudzMainConfig,
+    pub main: MudzMainConfig,
     /// Fallback (default upstream) settings
-    pub(crate) fallback: MudzFallbackConfig,
+    pub fallback: MudzFallbackConfig,
     /// DoH resolver settings (mandatory if any nameserver is a DoH URL)
-    pub(crate) doh: Option<MudzDohConfig>,
+    pub doh: Option<MudzDohConfig>,
     /// Named upstream groups, keyed by group name (from [group.*] sections)
     #[serde(rename = "group")]
-    pub(crate) groups: HashMap<String, DnsUpstreamGroup>,
+    pub groups: HashMap<String, MudzGroupConfig>,
 }
 
 impl MudzConfig {
     /// Load configuration from a TOML file
-    pub(crate) fn from_file<P: AsRef<Path>>(
-        path: P,
-    ) -> Result<Self, MudzError> {
+    pub fn from_file<P: AsRef<Path>>(path: P) -> Result<Self, MudzError> {
         let path_ref = path.as_ref();
         let content = fs::read_to_string(path_ref).map_err(|e| {
             MudzError::new(
@@ -177,7 +182,7 @@ impl MudzConfig {
         for name in self.groups.keys() {
             if name.is_empty() {
                 return Err(MudzError::new(
-                    mudz::ErrorKind::InvalidConfig,
+                    ErrorKind::InvalidConfig,
                     "group name cannot be empty",
                 ));
             }
@@ -190,7 +195,7 @@ impl MudzConfig {
     /// 2. Group domains cannot overlap
     /// 3. If any nameserver uses DoH, [doh] section must be present with plain
     ///    IP nameservers
-    pub(crate) fn validate(&self) -> Result<(), MudzError> {
+    pub fn validate(&self) -> Result<(), MudzError> {
         self.validate_group_names()?;
         self.validate_domain_overlap()?;
         self.validate_doh_nameservers()?;
@@ -239,7 +244,7 @@ impl MudzConfig {
 
     /// Validate that no two groups have overlapping domains.
     fn validate_domain_overlap(&self) -> Result<(), MudzError> {
-        let group_list: Vec<(&String, &DnsUpstreamGroup)> =
+        let group_list: Vec<(&String, &MudzGroupConfig)> =
             self.groups.iter().collect();
         for i in 0..group_list.len() {
             for j in (i + 1)..group_list.len() {
@@ -249,7 +254,7 @@ impl MudzConfig {
                     for db in &group_b.domains {
                         if domains_overlap(da, db) {
                             return Err(MudzError::new(
-                                mudz::ErrorKind::InvalidConfig,
+                                ErrorKind::InvalidConfig,
                                 format!(
                                     "Domain '{da}' in group '{name_a}' \
                                      overlaps with domain '{db}' in group \
@@ -275,7 +280,7 @@ impl MudzConfig {
                 let name = trimmed[7..trimmed.len() - 1].trim();
                 if !name.is_empty() && !seen.insert(name) {
                     return Err(MudzError::new(
-                        mudz::ErrorKind::InvalidConfig,
+                        ErrorKind::InvalidConfig,
                         format!("Duplicate DNS cache group name: {name}"),
                     ));
                 }
@@ -303,7 +308,7 @@ impl MudzConfig {
         match &self.doh {
             None => {
                 return Err(MudzError::new(
-                    mudz::ErrorKind::InvalidConfig,
+                    ErrorKind::InvalidConfig,
                     "DoH servers are configured but no [doh] section found. \
                      Please add a [doh] section with plain IP nameservers to \
                      resolve DoH server hostnames",
@@ -312,7 +317,7 @@ impl MudzConfig {
             Some(doh) => {
                 if doh.nameservers.is_empty() {
                     return Err(MudzError::new(
-                        mudz::ErrorKind::InvalidConfig,
+                        ErrorKind::InvalidConfig,
                         "[doh] section must have at least one nameserver",
                     ));
                 }
@@ -342,3 +347,7 @@ pub(crate) fn extract_doh_hostname(url: &str) -> Option<String> {
 fn domains_overlap(a: &str, b: &str) -> bool {
     a.eq_ignore_ascii_case(b)
 }
+
+#[cfg(test)]
+#[path = "unit_tests/config.rs"]
+mod tests;

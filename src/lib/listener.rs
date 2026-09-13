@@ -2,14 +2,15 @@
 
 use std::{net::SocketAddr, sync::Arc, time::Duration};
 
-use mudz::{DnsHeader, DnsPacket, DnsResponseCode};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream, UdpSocket},
     sync::{mpsc::UnboundedSender, oneshot},
+    task::JoinSet,
 };
 
 use super::server::{DnsQueryPacket, DnsReplyTarget};
+use crate::{DnsHeader, DnsPacket, DnsResponseCode};
 
 /// Idle timeout for reading the next query on a TCP connection. RFC 7766
 /// §6.2.1 permits servers to close idle connections; this sheds dead peers
@@ -89,21 +90,41 @@ impl DnsTcpListener {
         sender: UnboundedSender<DnsQueryPacket>,
         listener: Arc<TcpListener>,
     ) {
+        // Connection tasks are tracked so that aborting this listener (which
+        // happens on server shutdown) also aborts the connections it spawned.
+        let mut connections = JoinSet::new();
         loop {
-            match listener.accept().await {
-                Ok((stream, peer)) => {
-                    log::debug!("Accepted TCP DNS connection from {peer}");
-                    let sender = sender.clone();
-                    tokio::spawn(async move {
-                        handle_tcp_connection(sender, stream).await;
-                    });
-                }
-                Err(e) => {
-                    log::error!("Error accepting TCP DNS connection: {e}");
-                    if is_listener_fatal_error(&e) {
-                        break;
+            tokio::select! {
+                accepted = listener.accept() => {
+                    match accepted {
+                        Ok((stream, peer)) => {
+                            log::debug!(
+                                "Accepted TCP DNS connection from {peer}"
+                            );
+                            let sender = sender.clone();
+                            connections.spawn(async move {
+                                handle_tcp_connection(sender, stream).await;
+                            });
+                        }
+                        Err(e) => {
+                            log::error!(
+                                "Error accepting TCP DNS connection: {e}"
+                            );
+                            if is_listener_fatal_error(&e) {
+                                break;
+                            }
+                            tokio::time::sleep(
+                                Duration::from_millis(100)
+                            ).await;
+                        }
                     }
-                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+                Some(result) = connections.join_next(),
+                    if !connections.is_empty() =>
+                {
+                    if let Err(e) = result {
+                        log::warn!("DNS TCP connection task failed: {e}");
+                    }
                 }
             }
         }

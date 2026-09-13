@@ -1,16 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
 
-mod cache;
-mod config;
-mod doh;
-mod group;
-mod host;
-mod listener;
-mod resolver;
-mod retry;
-mod server;
-mod suspend;
-
 #[cfg(test)]
 mod tests;
 
@@ -18,9 +7,7 @@ use std::cmp::min;
 
 use env_logger::Builder;
 use log::LevelFilter;
-use mudz::{ErrorKind, MudzError};
-
-use self::{config::MudzConfig, server::DnsUdpServer};
+use mudz::{ErrorKind, MudzConfig, MudzError, MudzServer};
 
 const DEFAULT_CONFIG_PATH: &str = "/etc/mudz/mudz.conf";
 
@@ -78,5 +65,5 @@ fn main() -> Result<(), MudzError> {
             MudzError::new(ErrorKind::Bug, "Failed to create Tokio runtime")
         })?;
 
-    rt.block_on(async move { DnsUdpServer::new(config).await?.run().await })
+    rt.block_on(async move { MudzServer::new(config).await?.run().await })
 }

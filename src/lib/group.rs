@@ -9,16 +9,16 @@ use std::{
 };
 
 use futures_util::{StreamExt, future::Either, stream::FuturesUnordered};
-use mudz::{
-    DnsClass, DnsHeader, DnsPacket, DnsResourceRecord, DnsResponseCode,
-    DnsType, ErrorKind, MudzError,
-};
 use tokio::{net::UdpSocket, sync::oneshot};
 
 use super::{
     config::MudzConfig,
     doh::{DohClient, DohOptions, DohResolvCache, is_transport_error},
     retry::{Attempt, CooldownGate, DNS_RETRY_COOLDOWN, UpstreamState},
+};
+use crate::{
+    DnsClass, DnsHeader, DnsPacket, DnsResourceRecord, DnsResponseCode,
+    DnsType, ErrorKind, MudzError,
 };
 
 const DNS_TIMEOUT_SEC: Duration = Duration::from_secs(5);
