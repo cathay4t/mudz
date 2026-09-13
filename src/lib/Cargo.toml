@@ -2,7 +2,7 @@
 name = "mudz"
 version.workspace = true
 authors.workspace = true
-description = "The library of controling mudz daemon"
+description = "The library of DNS cache"
 documentation.workspace = true
 edition.workspace = true
 license.workspace = true

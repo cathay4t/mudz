@@ -9,6 +9,7 @@ mod listener;
 mod resolver;
 mod retry;
 mod server;
+mod suspend;
 
 #[cfg(test)]
 mod tests;

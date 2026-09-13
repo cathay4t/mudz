@@ -129,6 +129,7 @@ async fn test_group_transports_created_on_demand() {
         false,
         false,
         None,
+        DohOptions::default(),
     );
 
     {
@@ -203,6 +204,82 @@ async fn test_named_group_resolves_when_fallback_unavailable() {
     server_task.await.unwrap();
 }
 
+fn test_doh_upstream(name: &str) -> Arc<DohUpstream> {
+    let client = DohClient::new(
+        "https://doh.test/dns-query",
+        Arc::new(DohResolvCache::new(HashMap::new())),
+        DohOptions::default(),
+    )
+    .expect("create test DoH client");
+    Arc::new(DohUpstream::new(client, name, "test"))
+}
+
+fn test_doh_group() -> DnsGroup {
+    DnsGroup::new(
+        "test".to_string(),
+        vec!["https://doh.test/dns-query".to_string()],
+        false,
+        false,
+        None,
+        DohOptions::default(),
+    )
+}
+
+#[tokio::test]
+async fn test_handle_resume_resets_doh_health_and_pool() {
+    let upstream = test_doh_upstream("doh.test");
+    upstream.state.record_failure();
+    upstream.state.record_failure();
+    assert!(matches!(upstream.state.may_attempt(), Attempt::Dead));
+
+    let group = test_doh_group();
+    group
+        .state
+        .write()
+        .await
+        .doh_clients
+        .push(Arc::clone(&upstream));
+    let generation_before = upstream.client.pool_generation();
+
+    group.handle_resume().await;
+
+    assert!(
+        matches!(upstream.state.may_attempt(), Attempt::Ready),
+        "resume must clear the DoH upstream failure state"
+    );
+    assert_ne!(
+        upstream.client.pool_generation(),
+        generation_before,
+        "resume must rebuild the DoH connection pool"
+    );
+}
+
+#[tokio::test]
+async fn test_dead_doh_upstream_is_skipped() {
+    let upstream = test_doh_upstream("doh.test");
+    upstream.state.record_failure();
+    upstream.state.record_failure();
+
+    let group = test_doh_group();
+    group
+        .state
+        .write()
+        .await
+        .doh_clients
+        .push(Arc::clone(&upstream));
+
+    let query =
+        DnsPacket::new_query("example.com", DnsType::A).expect("build query");
+    let err = group
+        .request(query)
+        .await
+        .expect_err("a dead DoH upstream must not be used");
+    assert!(
+        err.to_string().contains("dead, failing fast"),
+        "unexpected error: {err}"
+    );
+}
+
 #[tokio::test]
 async fn test_ensure_transports_recovers_after_cooldown() {
     let probe = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -215,6 +292,7 @@ async fn test_ensure_transports_recovers_after_cooldown() {
         false,
         false,
         None,
+        DohOptions::default(),
     );
     assert!(group.ensure_transports().await);
 

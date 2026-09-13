@@ -17,7 +17,7 @@ use tokio::{net::UdpSocket, sync::oneshot};
 
 use super::{
     config::MudzConfig,
-    doh::{DohClient, DohResolvCache},
+    doh::{DohClient, DohOptions, DohResolvCache, is_transport_error},
     retry::{Attempt, CooldownGate, DNS_RETRY_COOLDOWN, UpstreamState},
 };
 
@@ -39,12 +39,18 @@ impl DnsGroups {
         mut config: MudzConfig,
         doh_cache: Option<Arc<DohResolvCache>>,
     ) -> Self {
+        let doh_options = config
+            .doh
+            .as_ref()
+            .map(DohOptions::from_config)
+            .unwrap_or_default();
         let fallback = DnsGroup::new(
             "fallback".to_string(),
             config.fallback.nameservers,
             config.fallback.disable_ipv6,
             false, // fallback is never intentionally blocking
             doh_cache.clone(),
+            doh_options,
         );
 
         let mut groups = HashMap::new();
@@ -57,6 +63,7 @@ impl DnsGroups {
                 group_config.disable_ipv6,
                 blocking,
                 doh_cache.clone(),
+                doh_options,
             );
             groups.insert(group_name.to_string(), dns_group);
 
@@ -71,6 +78,16 @@ impl DnsGroups {
             fallback,
             groups,
             search_index,
+        }
+    }
+
+    /// Drop pooled DoH connections and clear upstream failure state after
+    /// the system resumed from suspend. UDP transports are connectionless
+    /// and need no reset.
+    pub(crate) async fn handle_resume(&self) {
+        self.fallback.handle_resume().await;
+        for group in self.groups.values() {
+            group.handle_resume().await;
         }
     }
 
@@ -352,33 +369,54 @@ impl DnsUdpTransport {
     }
 }
 
-fn record_upstream_success(transport: Option<Arc<DnsUdpTransport>>) {
-    if let Some(transport) = transport {
-        transport.state.record_success();
+fn record_upstream_success(upstream: Option<Upstream>) {
+    match upstream {
+        Some(Upstream::Udp(transport)) => transport.state.record_success(),
+        Some(Upstream::Doh(upstream)) => upstream.state.record_success(),
+        None => {}
     }
 }
 
-fn record_upstream_failure(
-    transport: Option<Arc<DnsUdpTransport>>,
+async fn record_upstream_failure(
+    upstream: Option<Upstream>,
     error: &MudzError,
     is_probe: bool,
 ) {
-    if let Some(transport) = transport {
-        if is_probe {
-            // The probe failed: the upstream has been unresponsive for a
-            // whole cooldown window. Evict and recreate the transport so a
-            // fresh socket (no latched errors, clean ARP/route state) is
-            // used instead of probing forever.
-            log::warn!(
-                "Upstream '{}' in group '{}' failed a probe, marking \
-                 transport broken for recreation",
-                transport.state.name(),
-                transport.state.group()
-            );
-            transport.state.mark_broken();
-        } else {
-            transport.state.record_failure();
+    match upstream {
+        Some(Upstream::Udp(transport)) => {
+            if is_probe {
+                // The probe failed: the upstream has been unresponsive for a
+                // whole cooldown window. Evict and recreate the transport so
+                // a fresh socket (no latched errors, clean ARP/route state)
+                // is used instead of probing forever.
+                log::warn!(
+                    "Upstream '{}' in group '{}' failed a probe, marking \
+                     transport broken for recreation",
+                    transport.state.name(),
+                    transport.state.group()
+                );
+                transport.state.mark_broken();
+            } else {
+                transport.state.record_failure();
+            }
         }
+        Some(Upstream::Doh(upstream)) if is_transport_error(error) => {
+            if is_probe {
+                log::debug!(
+                    "DoH upstream '{}' in group '{}' failed a probe; \
+                     rebuilding its connection pool",
+                    upstream.state.name(),
+                    upstream.state.group()
+                );
+                upstream.client.invalidate_pool().await;
+            }
+            upstream.state.record_failure();
+        }
+        Some(Upstream::Doh(_)) => {
+            // Protocol errors (SERVFAIL, HTTP 4xx, malformed replies) do not
+            // indicate a broken transport; they must not affect health.
+        }
+        None => {}
     }
     log::debug!("Error processing DNS response: {error}");
 }
@@ -398,11 +436,37 @@ struct DnsGroup {
     /// DoH hostname-to-IP mapping resolved at startup. `None` when the
     /// daemon has no DoH nameserver configured.
     doh_cache: Option<Arc<DohResolvCache>>,
+    /// DoH retry/timeout policy configured in the `[doh]` section.
+    doh_options: DohOptions,
 }
 
 struct GroupState {
     udp_transports: Vec<Arc<DnsUdpTransport>>,
-    doh_clients: Vec<DohClient>,
+    doh_clients: Vec<Arc<DohUpstream>>,
+}
+
+/// A DoH upstream plus the shared health/cooldown state used to skip it
+/// while it is failing and to probe it for recovery.
+struct DohUpstream {
+    client: DohClient,
+    state: Arc<UpstreamState>,
+}
+
+impl DohUpstream {
+    fn new(client: DohClient, server: &str, group: &str) -> Self {
+        Self {
+            client,
+            state: Arc::new(UpstreamState::new(server, group)),
+        }
+    }
+}
+
+/// Handle to the upstream a request future was sent to, so success and
+/// failure can be recorded in the right health state.
+#[derive(Clone)]
+enum Upstream {
+    Udp(Arc<DnsUdpTransport>),
+    Doh(Arc<DohUpstream>),
 }
 
 impl DnsGroup {
@@ -412,6 +476,7 @@ impl DnsGroup {
         disable_ipv6: bool,
         blocking: bool,
         doh_cache: Option<Arc<DohResolvCache>>,
+        doh_options: DohOptions,
     ) -> Self {
         Self {
             name,
@@ -427,6 +492,7 @@ impl DnsGroup {
             blocking,
             nameservers,
             doh_cache,
+            doh_options,
         }
     }
 
@@ -438,14 +504,17 @@ impl DnsGroup {
         doh_cache: &Option<Arc<DohResolvCache>>,
         group_name: &str,
         blocking: bool,
+        doh_options: DohOptions,
     ) -> GroupState {
         let mut udp_transports = Vec::new();
         let mut doh_clients = Vec::new();
 
         for srv in nameservers {
             if srv.starts_with("https://") {
-                match create_doh_client(srv, doh_cache) {
-                    Ok(client) => doh_clients.push(client),
+                match create_doh_client(srv, doh_cache, doh_options) {
+                    Ok(client) => doh_clients.push(Arc::new(DohUpstream::new(
+                        client, srv, group_name,
+                    ))),
                     Err(e) => log::warn!(
                         "Failed to create DoH client for '{}' in group '{}': \
                          {e}",
@@ -537,6 +606,7 @@ impl DnsGroup {
             &self.doh_cache,
             &self.name,
             false,
+            self.doh_options,
         )
         .await;
         let ok =
@@ -548,6 +618,16 @@ impl DnsGroup {
             );
         }
         ok
+    }
+
+    /// Drop pooled DoH connections and clear upstream failure state after
+    /// the system resumed from suspend.
+    async fn handle_resume(&self) {
+        let state = self.state.read().await;
+        for upstream in &state.doh_clients {
+            upstream.client.invalidate_pool().await;
+            upstream.state.reset();
+        }
     }
 
     fn is_blocking(&self) -> bool {
@@ -612,7 +692,6 @@ impl DnsGroup {
         let state = self.state.read().await;
         let mut futures = FuturesUnordered::new();
         let mut skipped_dead = 0usize;
-        let mut pending_udp = 0usize;
 
         for transport in &state.udp_transports {
             // Dead upstreams are skipped so clients fail fast with
@@ -674,18 +753,32 @@ impl DnsGroup {
                         "UDP DNS query timed out",
                     )),
                 };
-                (Some(transport), result, is_probe)
+                (Some(Upstream::Udp(transport)), result, is_probe)
             };
             futures.push(Either::Left(udp_future));
-            pending_udp += 1;
         }
 
-        // Send to all DoH clients
-        for doh_client in &state.doh_clients {
-            let doh_client = doh_client.clone();
+        // Send to all live DoH clients. Dead upstreams are skipped; the
+        // cooldown policy lets one probe through per window.
+        for doh in &state.doh_clients {
+            if doh.state.is_broken() {
+                skipped_dead += 1;
+                continue;
+            }
+            let attempt = doh.state.may_attempt();
+            match attempt {
+                Attempt::Ready | Attempt::Probing => {}
+                Attempt::Dead | Attempt::Broken => {
+                    skipped_dead += 1;
+                    continue;
+                }
+            }
+            let is_probe = matches!(attempt, Attempt::Probing);
+            let upstream = Arc::clone(doh);
             let doh_request = request.clone();
             let doh_future = async move {
-                (None, doh_client.request(&doh_request).await, false)
+                let result = upstream.client.request(&doh_request).await;
+                (Some(Upstream::Doh(upstream)), result, is_probe)
             };
             futures.push(Either::Right(doh_future));
         }
@@ -711,30 +804,28 @@ impl DnsGroup {
             });
         }
 
-        while let Some((transport, result, is_probe)) = futures.next().await {
-            if transport.is_some() {
-                pending_udp -= 1;
-            }
+        while let Some((upstream, result, is_probe)) = futures.next().await {
             match result {
                 Ok(response) => {
-                    record_upstream_success(transport);
-                    if pending_udp > 0 {
+                    record_upstream_success(upstream);
+                    if !futures.is_empty() {
                         // Keep accounting for the upstreams that did not win
                         // this request: their replies may still arrive (or
                         // time out), and their health state must not go stale
                         // just because another upstream answered first.
                         tokio::spawn(async move {
-                            while let Some((transport, result, is_probe)) =
+                            while let Some((upstream, result, is_probe)) =
                                 futures.next().await
                             {
                                 match result {
                                     Ok(_) => {
-                                        record_upstream_success(transport);
+                                        record_upstream_success(upstream);
                                     }
                                     Err(e) => {
                                         record_upstream_failure(
-                                            transport, &e, is_probe,
-                                        );
+                                            upstream, &e, is_probe,
+                                        )
+                                        .await;
                                     }
                                 }
                             }
@@ -743,7 +834,7 @@ impl DnsGroup {
                     return Ok(response);
                 }
                 Err(e) => {
-                    record_upstream_failure(transport, &e, is_probe);
+                    record_upstream_failure(upstream, &e, is_probe).await;
                 }
             }
         }
@@ -832,6 +923,7 @@ async fn create_udp_socket(srv: &str) -> Result<UdpSocket, MudzError> {
 fn create_doh_client(
     srv: &str,
     doh_cache: &Option<Arc<DohResolvCache>>,
+    options: DohOptions,
 ) -> Result<DohClient, MudzError> {
     let cache = doh_cache.clone().ok_or_else(|| {
         MudzError::new(
@@ -843,7 +935,7 @@ fn create_doh_client(
             ),
         )
     })?;
-    DohClient::new(srv, cache)
+    DohClient::new(srv, cache, options)
 }
 
 fn is_fatal_io_error(e: &std::io::Error) -> bool {

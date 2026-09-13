@@ -22,6 +22,16 @@ disable_ipv6 = false
 nameservers = ["223.5.5.5", "119.29.29.29"]
 # Do not resolve DoH server's domain name with IPv6
 disable_ipv6 = false
+# Overall timeout in seconds for one DoH lookup, including retries
+#timeout = 5
+# Retries after the first DoH attempt
+#retries = 1
+# HTTP/2 keepalive ping interval in seconds (0 disables keepalive)
+#keepalive_interval = 20
+# Seconds to wait for a keepalive acknowledgement
+#keepalive_timeout = 5
+# Seconds an idle pooled DoH connection may stay open
+#idle_timeout = 60
 
 # Redirect user's request on these domains to specified nameservers instead of
 # fallback ones

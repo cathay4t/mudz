@@ -7,6 +7,35 @@ use serde::Deserialize;
 
 const DEFAULT_MAX_CACHE_SIZE: usize = 4096;
 const DEFAULT_UDP_BIND: &str = "127.0.0.1:53";
+const DEFAULT_DOH_TIMEOUT_SEC: u64 = 5;
+const DEFAULT_DOH_RETRIES: usize = 1;
+const DEFAULT_DOH_KEEPALIVE_INTERVAL_SEC: u64 = 20;
+const DEFAULT_DOH_KEEPALIVE_TIMEOUT_SEC: u64 = 5;
+const DEFAULT_DOH_IDLE_TIMEOUT_SEC: u64 = 60;
+/// The DoH lookup must finish before the 6 s group-level guard, so a longer
+/// per-client timeout would only mask the group timeout.
+const MAX_DOH_TIMEOUT_SEC: u64 = 5;
+const MAX_DOH_RETRIES: usize = 5;
+
+fn default_doh_timeout() -> u64 {
+    DEFAULT_DOH_TIMEOUT_SEC
+}
+
+fn default_doh_retries() -> usize {
+    DEFAULT_DOH_RETRIES
+}
+
+fn default_doh_keepalive_interval() -> u64 {
+    DEFAULT_DOH_KEEPALIVE_INTERVAL_SEC
+}
+
+fn default_doh_keepalive_timeout() -> u64 {
+    DEFAULT_DOH_KEEPALIVE_TIMEOUT_SEC
+}
+
+fn default_doh_idle_timeout() -> u64 {
+    DEFAULT_DOH_IDLE_TIMEOUT_SEC
+}
 
 /// Configuration for the main section
 #[derive(Debug, Deserialize, Clone)]
@@ -49,7 +78,7 @@ pub(crate) struct MudzFallbackConfig {
 
 /// Configuration for the [doh] section. Provides plain IP nameservers for
 /// resolving DoH server hostnames. Mandatory if any nameserver is a DoH URL.
-#[derive(Debug, Deserialize, Clone, Default)]
+#[derive(Debug, Deserialize, Clone)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct MudzDohConfig {
     /// UDP nameservers for resolving DoH server hostnames
@@ -57,6 +86,35 @@ pub(crate) struct MudzDohConfig {
     /// Disable AAAA queries for DoH resolver
     #[serde(default)]
     pub(crate) disable_ipv6: bool,
+    /// Overall timeout in seconds for one DoH lookup, including retries.
+    #[serde(default = "default_doh_timeout")]
+    pub(crate) timeout: u64,
+    /// Number of retries after the first DoH attempt.
+    #[serde(default = "default_doh_retries")]
+    pub(crate) retries: usize,
+    /// HTTP/2 keepalive ping interval in seconds; 0 disables keepalive.
+    #[serde(default = "default_doh_keepalive_interval")]
+    pub(crate) keepalive_interval: u64,
+    /// Seconds to wait for a keepalive ping acknowledgement.
+    #[serde(default = "default_doh_keepalive_timeout")]
+    pub(crate) keepalive_timeout: u64,
+    /// Seconds an idle pooled connection may stay open.
+    #[serde(default = "default_doh_idle_timeout")]
+    pub(crate) idle_timeout: u64,
+}
+
+impl Default for MudzDohConfig {
+    fn default() -> Self {
+        Self {
+            nameservers: Vec::new(),
+            disable_ipv6: false,
+            timeout: DEFAULT_DOH_TIMEOUT_SEC,
+            retries: DEFAULT_DOH_RETRIES,
+            keepalive_interval: DEFAULT_DOH_KEEPALIVE_INTERVAL_SEC,
+            keepalive_timeout: DEFAULT_DOH_KEEPALIVE_TIMEOUT_SEC,
+            idle_timeout: DEFAULT_DOH_IDLE_TIMEOUT_SEC,
+        }
+    }
 }
 
 /// Configuration for a named group of upstream DNS servers
@@ -136,6 +194,46 @@ impl MudzConfig {
         self.validate_group_names()?;
         self.validate_domain_overlap()?;
         self.validate_doh_nameservers()?;
+        self.validate_doh_options()?;
+        Ok(())
+    }
+
+    /// Validate the DoH retry/timeout policy values.
+    fn validate_doh_options(&self) -> Result<(), MudzError> {
+        let Some(doh) = &self.doh else {
+            return Ok(());
+        };
+
+        if doh.timeout == 0 || doh.timeout > MAX_DOH_TIMEOUT_SEC {
+            return Err(MudzError::new(
+                ErrorKind::InvalidConfig,
+                format!(
+                    "[doh] timeout must be between 1 and \
+                     {MAX_DOH_TIMEOUT_SEC} seconds"
+                ),
+            ));
+        }
+        if doh.retries > MAX_DOH_RETRIES {
+            return Err(MudzError::new(
+                ErrorKind::InvalidConfig,
+                format!("[doh] retries must not exceed {MAX_DOH_RETRIES}"),
+            ));
+        }
+        if doh.keepalive_interval > 0
+            && doh.keepalive_timeout >= doh.keepalive_interval
+        {
+            return Err(MudzError::new(
+                ErrorKind::InvalidConfig,
+                "[doh] keepalive_timeout must be smaller than \
+                 keepalive_interval",
+            ));
+        }
+        if doh.idle_timeout == 0 {
+            return Err(MudzError::new(
+                ErrorKind::InvalidConfig,
+                "[doh] idle_timeout must be at least 1 second",
+            ));
+        }
         Ok(())
     }
 

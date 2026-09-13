@@ -3,6 +3,83 @@
 use crate::config::*;
 
 #[test]
+fn test_doh_options_defaults() {
+    let config_str = r#"
+[fallback]
+nameservers = ["https://dns.alidns.com/dns-query"]
+
+[doh]
+nameservers = ["223.5.5.5"]
+"#;
+    let config: MudzConfig =
+        toml::from_str(config_str).expect("parse DoH config");
+    config.validate().expect("defaults must validate");
+
+    let doh = config.doh.expect("[doh] section");
+    assert_eq!(doh.timeout, 5);
+    assert_eq!(doh.retries, 1);
+    assert_eq!(doh.keepalive_interval, 20);
+    assert_eq!(doh.keepalive_timeout, 5);
+    assert_eq!(doh.idle_timeout, 60);
+}
+
+#[test]
+fn test_doh_options_custom_values() {
+    let config_str = r#"
+[fallback]
+nameservers = ["https://dns.alidns.com/dns-query"]
+
+[doh]
+nameservers = ["223.5.5.5"]
+timeout = 3
+retries = 2
+keepalive_interval = 10
+keepalive_timeout = 3
+idle_timeout = 30
+"#;
+    let config: MudzConfig =
+        toml::from_str(config_str).expect("parse DoH config");
+    config.validate().expect("custom values must validate");
+
+    let doh = config.doh.expect("[doh] section");
+    assert_eq!(doh.timeout, 3);
+    assert_eq!(doh.retries, 2);
+    assert_eq!(doh.keepalive_interval, 10);
+    assert_eq!(doh.keepalive_timeout, 3);
+    assert_eq!(doh.idle_timeout, 30);
+}
+
+#[test]
+fn test_invalid_doh_options_rejected() {
+    let cases = [
+        ("timeout", "timeout = 0"),
+        ("timeout", "timeout = 6"),
+        ("retries", "retries = 6"),
+        ("keepalive", "keepalive_interval = 5\nkeepalive_timeout = 5"),
+        ("idle", "idle_timeout = 0"),
+    ];
+
+    for (name, extra) in cases {
+        let config_str = format!(
+            r#"
+[fallback]
+nameservers = ["https://dns.alidns.com/dns-query"]
+
+[doh]
+nameservers = ["223.5.5.5"]
+{extra}
+"#
+        );
+        let config: MudzConfig =
+            toml::from_str(&config_str).expect("parse DoH config");
+        assert!(
+            config.validate().is_err(),
+            "invalid DoH option '{name}' must be rejected"
+        );
+    }
+}
+
+#[test]
 fn test_unknown_field_in_group_rejected() {
     let config_str = r#"
 [main]

@@ -66,6 +66,66 @@ fn test_success_revives_dead_upstream() {
 }
 
 #[test]
+fn test_failed_probe_backs_off_exponentially() {
+    let state = upstream_state();
+    state.record_failure();
+    state.record_failure();
+    assert_eq!(state.health.lock().unwrap().cooldown_secs, 5);
+
+    expire_dead_window(&state);
+    assert!(matches!(state.may_attempt(), Attempt::Probing));
+    state.record_failure();
+    assert_eq!(
+        state.health.lock().unwrap().cooldown_secs,
+        10,
+        "a failed probe must double the cooldown"
+    );
+    assert!(matches!(state.may_attempt(), Attempt::Dead));
+
+    expire_dead_window(&state);
+    assert!(matches!(state.may_attempt(), Attempt::Probing));
+    state.record_failure();
+    assert_eq!(state.health.lock().unwrap().cooldown_secs, 20);
+}
+
+#[test]
+fn test_probe_backoff_is_capped_and_reset_on_success() {
+    let state = upstream_state();
+    state.record_failure();
+    state.record_failure();
+    for _ in 0..10 {
+        expire_dead_window(&state);
+        assert!(matches!(state.may_attempt(), Attempt::Probing));
+        state.record_failure();
+    }
+    assert_eq!(
+        state.health.lock().unwrap().cooldown_secs,
+        DNS_RETRY_COOLDOWN_MAX.as_secs()
+    );
+
+    state.record_success();
+    let health = state.health.lock().unwrap();
+    assert_eq!(health.consecutive_failures, 0);
+    assert_eq!(health.dead_until, 0);
+    assert_eq!(health.cooldown_secs, 0);
+}
+
+#[test]
+fn test_reset_clears_health_but_not_broken() {
+    let state = upstream_state();
+    state.record_failure();
+    state.record_failure();
+    state.mark_broken();
+
+    state.reset();
+    let health = state.health.lock().unwrap();
+    assert_eq!(health.consecutive_failures, 0);
+    assert_eq!(health.dead_until, 0);
+    assert_eq!(health.cooldown_secs, 0);
+    assert!(health.broken, "reset must not resurrect a broken transport");
+}
+
+#[test]
 fn test_broken_never_recovers() {
     let state = upstream_state();
     state.mark_broken();

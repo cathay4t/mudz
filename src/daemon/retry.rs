@@ -24,6 +24,9 @@ use std::{
 };
 
 pub(crate) const DNS_RETRY_COOLDOWN: Duration = Duration::from_secs(5);
+/// Upper bound for the exponential probe backoff applied when a probing
+/// query fails while the upstream is still dead.
+pub(crate) const DNS_RETRY_COOLDOWN_MAX: Duration = Duration::from_secs(60);
 /// Consecutive failures (timeout or send error) after which an upstream is
 /// declared dead: queries then fail fast with SERVFAIL instead of waiting
 /// out the per-request timeout on every lookup. After
@@ -58,6 +61,10 @@ struct HealthState {
     /// Unix seconds until which the upstream is considered dead; 0 means
     /// alive.
     dead_until: u64,
+    /// Current dead window in seconds. Starts at [`DNS_RETRY_COOLDOWN`] and
+    /// doubles (up to [`DNS_RETRY_COOLDOWN_MAX`]) every time a probe fails,
+    /// so an unreachable upstream is not probed once per cooldown forever.
+    cooldown_secs: u64,
     /// The receive loop died on a fatal socket error. Never clears — a
     /// broken transport must be evicted and recreated.
     broken: bool,
@@ -108,7 +115,12 @@ impl UpstreamState {
         if now < health.dead_until {
             return Attempt::Dead;
         }
-        health.dead_until = now + DNS_RETRY_COOLDOWN.as_secs();
+        let cooldown = if health.cooldown_secs == 0 {
+            DNS_RETRY_COOLDOWN.as_secs()
+        } else {
+            health.cooldown_secs
+        };
+        health.dead_until = now + cooldown;
         log::debug!(
             "Probing dead upstream '{}' in group '{}'",
             self.name,
@@ -125,15 +137,30 @@ impl UpstreamState {
         health.consecutive_failures += 1;
         if health.consecutive_failures >= UPSTREAM_FAIL_THRESHOLD {
             let was_alive = health.dead_until == 0;
-            health.dead_until = now_secs() + DNS_RETRY_COOLDOWN.as_secs();
+            if health.cooldown_secs == 0 {
+                health.cooldown_secs = DNS_RETRY_COOLDOWN.as_secs();
+            } else if !was_alive {
+                // The upstream stayed dead through a probe: back off.
+                health.cooldown_secs = (health.cooldown_secs * 2)
+                    .min(DNS_RETRY_COOLDOWN_MAX.as_secs());
+            }
+            health.dead_until = now_secs() + health.cooldown_secs;
             if was_alive {
                 log::warn!(
                     "Upstream '{}' in group '{}' marked dead for {}s after {} \
                      consecutive failures",
                     self.name,
                     self.group,
-                    DNS_RETRY_COOLDOWN.as_secs(),
+                    health.cooldown_secs,
                     health.consecutive_failures
+                );
+            } else {
+                log::debug!(
+                    "Probe to upstream '{}' in group '{}' failed; next probe \
+                     in {}s",
+                    self.name,
+                    self.group,
+                    health.cooldown_secs
                 );
             }
         }
@@ -154,6 +181,17 @@ impl UpstreamState {
         }
         health.consecutive_failures = 0;
         health.dead_until = 0;
+        health.cooldown_secs = 0;
+    }
+
+    /// Clear the failure and backoff state without touching the broken flag.
+    /// Used when the environment changed in a way that invalidates past
+    /// failures, such as resuming from system suspend.
+    pub(crate) fn reset(&self) {
+        let mut health = self.health.lock().expect("health lock poisoned");
+        health.consecutive_failures = 0;
+        health.dead_until = 0;
+        health.cooldown_secs = 0;
     }
 
     /// Mark the transport permanently unusable: its receive loop exited on

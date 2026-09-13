@@ -4,6 +4,7 @@ use std::{
     collections::{HashMap, hash_map::Entry},
     str::FromStr,
     sync::Arc,
+    time::Duration,
 };
 
 use futures_util::{StreamExt, stream::FuturesUnordered};
@@ -20,6 +21,7 @@ use super::{
     group::DnsGroups,
     host::HostsFile,
     server::{DnsQueryPacket, DnsReplyTarget},
+    suspend::ResumeDetector,
 };
 
 /// Pending client: (reply target, transaction ID, RD flag, EDNS payload
@@ -49,6 +51,8 @@ const NON_EDNS_UDP_LIMIT: usize = 512;
 /// Serialized size of the OPT ack appended by `build_client_reply`
 /// (1 byte root name + 2 type + 2 class + 4 TTL + 2 RDLENGTH).
 const OPT_ACK_LEN: usize = 11;
+/// How often to check for a suspend/resume cycle.
+const RESUME_CHECK_INTERVAL: Duration = Duration::from_secs(1);
 
 pub(crate) struct DnsResolver;
 
@@ -69,6 +73,10 @@ impl DnsResolver {
         // The first tick of a tokio interval completes immediately; skip it
         // so GC only runs after a full interval.
         cache_gc.tick().await;
+
+        let mut resume_check = tokio::time::interval(RESUME_CHECK_INTERVAL);
+        resume_check.tick().await;
+        let mut resume_detector = ResumeDetector::new();
 
         let mut futures = FuturesUnordered::new();
         loop {
@@ -108,6 +116,16 @@ impl DnsResolver {
                 }
                 _ = cache_gc.tick() => {
                     cache.gc();
+                }
+                _ = resume_check.tick() => {
+                    if let Some(suspended) = resume_detector.poll() {
+                        log::info!(
+                            "Detected resume from suspend after {}s; \
+                             resetting DoH connections",
+                            suspended.as_secs()
+                        );
+                        groups.handle_resume().await;
+                    }
                 }
                 else => {
                     break;
