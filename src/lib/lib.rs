@@ -32,6 +32,7 @@ mod cache;
 mod client;
 mod config;
 mod doh;
+mod endpoint;
 mod error;
 mod group;
 mod header;
@@ -42,6 +43,7 @@ mod record;
 mod resolver;
 mod retry;
 mod server;
+mod stream;
 mod suspend;
 
 pub use self::{

@@ -2,19 +2,26 @@
 
 use std::{
     collections::HashMap,
+    future::Future,
     net::SocketAddr,
-    str::FromStr as _,
+    pin::Pin,
     sync::{Arc, Mutex},
     time::Duration,
 };
 
-use futures_util::{StreamExt, future::Either, stream::FuturesUnordered};
+use futures_util::{
+    StreamExt,
+    future::{join_all, select_ok},
+    stream::FuturesUnordered,
+};
 use tokio::{net::UdpSocket, sync::oneshot};
 
 use super::{
     config::MudzConfig,
     doh::{DohClient, DohOptions, DohResolvCache, is_transport_error},
+    endpoint::{NameserverAddress, NameserverEndpoint, NameserverScheme},
     retry::{Attempt, CooldownGate, DNS_RETRY_COOLDOWN, UpstreamState},
+    stream::{DOT_PORT, DnsDotTransport, DnsTcpTransport},
 };
 use crate::{
     DnsClass, DnsHeader, DnsPacket, DnsResourceRecord, DnsResponseCode,
@@ -22,6 +29,9 @@ use crate::{
 };
 
 const DNS_TIMEOUT_SEC: Duration = Duration::from_secs(5);
+/// Standard plaintext DNS port (RFC 1035), used for `tcp://`, `udp://` and
+/// the plaintext fallbacks of a bare IP nameserver.
+const DNS_PORT: u16 = 53;
 const IPV6_BLOCKED_HINFO_CPU: &str =
     "AAAA queries have been locally blocked by mudz";
 const IPV6_BLOCKED_HINFO_OS: &str =
@@ -226,15 +236,25 @@ struct DnsUdpTransport {
 type PendingKey = (String, DnsType, DnsClass, u16);
 type PendingMap = HashMap<PendingKey, Vec<oneshot::Sender<DnsPacket>>>;
 
+impl Drop for DnsUdpTransport {
+    fn drop(&mut self) {
+        // The receive loop owns a clone of the socket. Dropping a
+        // `JoinHandle` does not cancel the task, so without this abort an
+        // evicted transport would keep its socket and its waiters alive.
+        self.recv_task.abort();
+    }
+}
+
 impl DnsUdpTransport {
     async fn new(
-        server_addr: &str,
+        nameserver: &str,
+        addr: SocketAddr,
         group_name: &str,
     ) -> Result<Self, MudzError> {
-        let socket = Arc::new(create_udp_socket(server_addr).await?);
+        let socket = Arc::new(create_udp_socket(addr).await?);
         let pending: Arc<Mutex<PendingMap>> =
             Arc::new(Mutex::new(HashMap::new()));
-        let state = Arc::new(UpstreamState::new(server_addr, group_name));
+        let state = Arc::new(UpstreamState::new(nameserver, group_name));
 
         let recv_socket = socket.clone();
         let recv_pending = pending.clone();
@@ -323,6 +343,14 @@ impl DnsUdpTransport {
                                     state.group()
                                 );
                                 state.mark_broken();
+                                // Fail every in-flight waiter immediately
+                                // instead of letting each one wait for the
+                                // full per-query timeout on a transport that
+                                // can never answer again.
+                                pending
+                                    .lock()
+                                    .expect("pending map lock poisoned")
+                                    .clear();
                                 break;
                             }
                             continue;
@@ -372,9 +400,28 @@ impl DnsUdpTransport {
 fn record_upstream_success(upstream: Option<Upstream>) {
     match upstream {
         Some(Upstream::Udp(transport)) => transport.state.record_success(),
+        Some(Upstream::Tcp(transport)) => transport.state.record_success(),
+        Some(Upstream::Dot(transport)) => transport.state.record_success(),
         Some(Upstream::Doh(upstream)) => upstream.state.record_success(),
         None => {}
     }
+}
+
+/// Record a failed attempt for a connection-oriented transport.
+///
+/// A failed probe means the transport has been silent for a whole cooldown
+/// window. A framed stream (plain TCP or DoT) or a connected UDP socket can
+/// be half-open without ever producing a read or write error, so probing the
+/// same transport forever would never recover; tear it down and let the next
+/// repair reconnect according to the configured scheme.
+fn record_transport_probe_failure(state: &UpstreamState) {
+    log::warn!(
+        "Upstream '{}' in group '{}' failed a probe, marking transport broken \
+         for recreation",
+        state.name(),
+        state.group()
+    );
+    state.mark_broken();
 }
 
 async fn record_upstream_failure(
@@ -385,17 +432,21 @@ async fn record_upstream_failure(
     match upstream {
         Some(Upstream::Udp(transport)) => {
             if is_probe {
-                // The probe failed: the upstream has been unresponsive for a
-                // whole cooldown window. Evict and recreate the transport so
-                // a fresh socket (no latched errors, clean ARP/route state)
-                // is used instead of probing forever.
-                log::warn!(
-                    "Upstream '{}' in group '{}' failed a probe, marking \
-                     transport broken for recreation",
-                    transport.state.name(),
-                    transport.state.group()
-                );
-                transport.state.mark_broken();
+                record_transport_probe_failure(&transport.state);
+            } else {
+                transport.state.record_failure();
+            }
+        }
+        Some(Upstream::Tcp(transport)) => {
+            if is_probe {
+                record_transport_probe_failure(&transport.state);
+            } else {
+                transport.state.record_failure();
+            }
+        }
+        Some(Upstream::Dot(transport)) => {
+            if is_probe {
+                record_transport_probe_failure(&transport.state);
             } else {
                 transport.state.record_failure();
             }
@@ -442,7 +493,18 @@ struct DnsGroup {
 
 struct GroupState {
     udp_transports: Vec<Arc<DnsUdpTransport>>,
+    tcp_transports: Vec<Arc<DnsTcpTransport>>,
+    dot_transports: Vec<Arc<DnsDotTransport>>,
     doh_clients: Vec<Arc<DohUpstream>>,
+}
+
+/// A transport created for one configured nameserver by
+/// [`DnsGroup::create_upstream`].
+enum CreatedUpstream {
+    Udp(Arc<DnsUdpTransport>),
+    Tcp(Arc<DnsTcpTransport>),
+    Dot(Arc<DnsDotTransport>),
+    Doh(Arc<DohUpstream>),
 }
 
 /// A DoH upstream plus the shared health/cooldown state used to skip it
@@ -466,8 +528,60 @@ impl DohUpstream {
 #[derive(Clone)]
 enum Upstream {
     Udp(Arc<DnsUdpTransport>),
+    Tcp(Arc<DnsTcpTransport>),
+    Dot(Arc<DnsDotTransport>),
     Doh(Arc<DohUpstream>),
 }
+
+/// A live framed-stream upstream (plain TCP or DoT). The two transports
+/// share their framing, demultiplexing, and health policy, so the fan-out
+/// drives both through this one handle.
+enum StreamTransport {
+    Tcp(Arc<DnsTcpTransport>),
+    Dot(Arc<DnsDotTransport>),
+}
+
+impl StreamTransport {
+    fn is_broken(&self) -> bool {
+        match self {
+            Self::Tcp(transport) => transport.is_broken(),
+            Self::Dot(transport) => transport.is_broken(),
+        }
+    }
+
+    fn state(&self) -> &Arc<UpstreamState> {
+        match self {
+            Self::Tcp(transport) => &transport.state,
+            Self::Dot(transport) => &transport.state,
+        }
+    }
+
+    async fn send_query(
+        &self,
+        bytes: &[u8],
+        key: &PendingKey,
+    ) -> Result<oneshot::Receiver<DnsPacket>, MudzError> {
+        match self {
+            Self::Tcp(transport) => transport.send_query(bytes, key).await,
+            Self::Dot(transport) => transport.send_query(bytes, key).await,
+        }
+    }
+
+    fn into_upstream(self) -> Upstream {
+        match self {
+            Self::Tcp(transport) => Upstream::Tcp(transport),
+            Self::Dot(transport) => Upstream::Dot(transport),
+        }
+    }
+}
+
+/// A single upstream lookup future: the upstream it was sent to (for health
+/// accounting), its result, and whether it was the cooldown-window probe.
+/// Boxed so the UDP, DoT, and DoH branches of the fan-out all share one
+/// `FuturesUnordered` element type.
+type UpstreamResult = (Option<Upstream>, Result<DnsPacket, MudzError>, bool);
+type UpstreamQueryFuture =
+    Pin<Box<dyn Future<Output = UpstreamResult> + Send + 'static>>;
 
 impl DnsGroup {
     fn new(
@@ -485,6 +599,8 @@ impl DnsGroup {
             // group) never blocks daemon startup or unrelated groups.
             state: tokio::sync::RwLock::new(GroupState {
                 udp_transports: Vec::new(),
+                tcp_transports: Vec::new(),
+                dot_transports: Vec::new(),
                 doh_clients: Vec::new(),
             }),
             recreate_gate: CooldownGate::new(DNS_RETRY_COOLDOWN),
@@ -499,6 +615,11 @@ impl DnsGroup {
     /// Build `GroupState` from the given nameserver list.  When
     /// `blocking` is false and all connections fail, a warning is
     /// logged and an empty state is returned — the caller will retry.
+    ///
+    /// Nameservers are probed concurrently: the callers bound transport
+    /// creation with the per-request timeout, and probing sequentially would
+    /// let a couple of unreachable DoT endpoints consume that budget and
+    /// discard every already-created transport.
     async fn create_state(
         nameservers: &[String],
         doh_cache: &Option<Arc<DohResolvCache>>,
@@ -506,38 +627,39 @@ impl DnsGroup {
         blocking: bool,
         doh_options: DohOptions,
     ) -> GroupState {
+        let created = join_all(nameservers.iter().map(|srv| {
+            Self::create_upstream(srv, doh_cache, group_name, doh_options)
+        }))
+        .await;
+
         let mut udp_transports = Vec::new();
+        let mut tcp_transports = Vec::new();
+        let mut dot_transports = Vec::new();
         let mut doh_clients = Vec::new();
 
-        for srv in nameservers {
-            if srv.starts_with("https://") {
-                match create_doh_client(srv, doh_cache, doh_options) {
-                    Ok(client) => doh_clients.push(Arc::new(DohUpstream::new(
-                        client, srv, group_name,
-                    ))),
-                    Err(e) => log::warn!(
-                        "Failed to create DoH client for '{}' in group '{}': \
-                         {e}",
-                        srv,
-                        group_name
-                    ),
+        for upstream in created.into_iter().flatten() {
+            match upstream {
+                CreatedUpstream::Udp(transport) => {
+                    udp_transports.push(transport);
                 }
-            } else {
-                match DnsUdpTransport::new(srv, group_name).await {
-                    Ok(transport) => {
-                        udp_transports.push(Arc::new(transport));
-                    }
-                    Err(e) => log::warn!(
-                        "Failed to create UDP transport for '{}' in group \
-                         '{}': {e}",
-                        srv,
-                        group_name
-                    ),
+                CreatedUpstream::Tcp(transport) => {
+                    tcp_transports.push(transport);
+                }
+                CreatedUpstream::Dot(transport) => {
+                    dot_transports.push(transport);
+                }
+                CreatedUpstream::Doh(upstream) => {
+                    doh_clients.push(upstream);
                 }
             }
         }
 
-        if udp_transports.is_empty() && doh_clients.is_empty() && !blocking {
+        if udp_transports.is_empty()
+            && tcp_transports.is_empty()
+            && dot_transports.is_empty()
+            && doh_clients.is_empty()
+            && !blocking
+        {
             log::warn!(
                 "No upstream connections available for group '{}', will retry \
                  on next request",
@@ -547,8 +669,296 @@ impl DnsGroup {
 
         GroupState {
             udp_transports,
+            tcp_transports,
+            dot_transports,
             doh_clients,
         }
+    }
+
+    /// Create the transport for one configured nameserver.
+    ///
+    /// A `https://` URL uses DoH. An IP literal prefixed with `tls://`,
+    /// `tcp://` or `udp://` uses exactly that transport, with no fallback. A
+    /// bare IP address tries DoT, then DNS over TCP, then UDP, so the
+    /// ordering is also the preference order.
+    async fn create_upstream(
+        srv: &str,
+        doh_cache: &Option<Arc<DohResolvCache>>,
+        group_name: &str,
+        doh_options: DohOptions,
+    ) -> Option<CreatedUpstream> {
+        if srv.starts_with("https://") {
+            return match create_doh_client(srv, doh_cache, doh_options) {
+                Ok(client) => Some(CreatedUpstream::Doh(Arc::new(
+                    DohUpstream::new(client, srv, group_name),
+                ))),
+                Err(e) => {
+                    log::warn!(
+                        "Failed to create DoH client for '{}' in group '{}': \
+                         {e}",
+                        srv,
+                        group_name
+                    );
+                    None
+                }
+            };
+        }
+
+        let nameserver = match NameserverEndpoint::parse(srv) {
+            Ok(nameserver) => nameserver,
+            Err(e) => {
+                log::warn!(
+                    "Failed to create upstream for '{}' in group '{}': {e}",
+                    srv,
+                    group_name
+                );
+                return None;
+            }
+        };
+
+        // A forced transport never falls back: a failure leaves the upstream
+        // unavailable until the group retries after the cooldown.
+        match nameserver.scheme {
+            NameserverScheme::Tls => {
+                match Self::create_dot_transport(
+                    srv,
+                    &nameserver,
+                    doh_cache,
+                    group_name,
+                )
+                .await
+                {
+                    Ok(transport) => {
+                        log::info!(
+                            "Upstream '{}' in group '{}' uses DNS over TLS",
+                            srv,
+                            group_name
+                        );
+                        Some(CreatedUpstream::Dot(Arc::new(transport)))
+                    }
+                    Err(e) => {
+                        log::warn!(
+                            "Forced DNS over TLS upstream '{}' in group '{}' \
+                             is unavailable: {e}",
+                            srv,
+                            group_name
+                        );
+                        None
+                    }
+                }
+            }
+            NameserverScheme::Tcp => {
+                let Some(ip) = nameserver.address.ip() else {
+                    log::warn!(
+                        "DNS over TCP upstream '{}' in group '{}' requires an \
+                         IP literal",
+                        srv,
+                        group_name
+                    );
+                    return None;
+                };
+                let addr = SocketAddr::new(ip, nameserver.port_or(DNS_PORT));
+                match DnsTcpTransport::new_tcp(srv, addr, group_name).await {
+                    Ok(transport) => {
+                        log::info!(
+                            "Upstream '{}' in group '{}' uses DNS over TCP",
+                            srv,
+                            group_name
+                        );
+                        Some(CreatedUpstream::Tcp(Arc::new(transport)))
+                    }
+                    Err(e) => {
+                        log::warn!(
+                            "Forced DNS over TCP upstream '{}' in group '{}' \
+                             is unavailable: {e}",
+                            srv,
+                            group_name
+                        );
+                        None
+                    }
+                }
+            }
+            NameserverScheme::Udp => {
+                let Some(ip) = nameserver.address.ip() else {
+                    log::warn!(
+                        "DNS over UDP upstream '{}' in group '{}' requires an \
+                         IP literal",
+                        srv,
+                        group_name
+                    );
+                    return None;
+                };
+                let addr = SocketAddr::new(ip, nameserver.port_or(DNS_PORT));
+                match DnsUdpTransport::new(srv, addr, group_name).await {
+                    Ok(transport) => {
+                        log::debug!(
+                            "Upstream '{}' in group '{}' uses plain UDP",
+                            srv,
+                            group_name
+                        );
+                        Some(CreatedUpstream::Udp(Arc::new(transport)))
+                    }
+                    Err(e) => {
+                        log::warn!(
+                            "Forced DNS over UDP upstream '{}' in group '{}' \
+                             is unavailable: {e}",
+                            srv,
+                            group_name
+                        );
+                        None
+                    }
+                }
+            }
+            NameserverScheme::Auto => {
+                // `Auto` is only produced for an IP literal: a bare
+                // hostname stays unsupported and a hostname endpoint is
+                // always `tls://`.
+                let Some(ip) = nameserver.address.ip() else {
+                    log::warn!(
+                        "Bare nameserver '{}' in group '{}' must be an IP \
+                         literal",
+                        srv,
+                        group_name
+                    );
+                    return None;
+                };
+                match Self::create_dot_transport(
+                    srv,
+                    &nameserver,
+                    doh_cache,
+                    group_name,
+                )
+                .await
+                {
+                    Ok(transport) => {
+                        log::info!(
+                            "Upstream '{}' in group '{}' uses DNS over TLS",
+                            srv,
+                            group_name
+                        );
+                        return Some(CreatedUpstream::Dot(Arc::new(transport)));
+                    }
+                    Err(e) => log::debug!(
+                        "DoT not available for '{}' in group '{}': {e}; \
+                         trying DNS over TCP",
+                        srv,
+                        group_name
+                    ),
+                }
+
+                let tcp_addr =
+                    SocketAddr::new(ip, nameserver.port_or(DNS_PORT));
+                match DnsTcpTransport::new_tcp(srv, tcp_addr, group_name).await
+                {
+                    Ok(transport) => {
+                        log::info!(
+                            "Upstream '{}' in group '{}' uses DNS over TCP",
+                            srv,
+                            group_name
+                        );
+                        return Some(CreatedUpstream::Tcp(Arc::new(transport)));
+                    }
+                    Err(e) => log::debug!(
+                        "DNS over TCP not available for '{}' in group '{}': \
+                         {e}; using plain UDP",
+                        srv,
+                        group_name
+                    ),
+                }
+
+                let udp_addr =
+                    SocketAddr::new(ip, nameserver.port_or(DNS_PORT));
+                match DnsUdpTransport::new(srv, udp_addr, group_name).await {
+                    Ok(transport) => {
+                        Some(CreatedUpstream::Udp(Arc::new(transport)))
+                    }
+                    Err(e) => {
+                        log::warn!(
+                            "Failed to create UDP transport for '{}' in group \
+                             '{}': {e}",
+                            srv,
+                            group_name
+                        );
+                        None
+                    }
+                }
+            }
+        }
+    }
+
+    /// Create a DoT transport for `endpoint`.
+    ///
+    /// An IP endpoint verifies the certificate against the IP literal. A
+    /// hostname endpoint (`tls://hostname`) connects to the addresses pinned
+    /// during bootstrap and verifies the certificate against the hostname
+    /// (sent as SNI); the pinned addresses are raced, so one blackholed
+    /// address cannot consume the whole transport-creation budget.
+    async fn create_dot_transport(
+        srv: &str,
+        endpoint: &NameserverEndpoint,
+        doh_cache: &Option<Arc<DohResolvCache>>,
+        group_name: &str,
+    ) -> Result<DnsDotTransport, MudzError> {
+        let port = endpoint.port_or(DOT_PORT);
+        let NameserverAddress::Hostname(hostname) = &endpoint.address else {
+            let ip = endpoint
+                .address
+                .ip()
+                .expect("IP endpoint has an IP address");
+            let addr = SocketAddr::new(ip, port);
+            return DnsDotTransport::new_dot(
+                srv,
+                addr,
+                &ip.to_string(),
+                group_name,
+            )
+            .await;
+        };
+
+        let cache = doh_cache.as_ref().ok_or_else(|| {
+            MudzError::new(
+                ErrorKind::InvalidConfig,
+                format!(
+                    "DoT hostname '{hostname}' requires a [doh] section with \
+                     plain IP nameservers for resolution"
+                ),
+            )
+        })?;
+        let ips = cache.lookup(hostname).ok_or_else(|| {
+            MudzError::new(
+                ErrorKind::InvalidConfig,
+                format!(
+                    "DoT hostname '{hostname}' was not resolved at startup"
+                ),
+            )
+        })?;
+
+        if ips.is_empty() {
+            return Err(MudzError::new(
+                ErrorKind::InvalidConfig,
+                format!("DoT hostname '{hostname}' has no resolved addresses"),
+            ));
+        }
+        let attempts = ips.iter().map(|ip| {
+            let addr = SocketAddr::new(*ip, port);
+            Box::pin(async move {
+                match DnsDotTransport::new_dot(srv, addr, hostname, group_name)
+                    .await
+                {
+                    Ok(transport) => Ok(transport),
+                    Err(e) => {
+                        log::debug!(
+                            "DoT to {addr} for hostname '{hostname}' failed: \
+                             {e}"
+                        );
+                        Err(e)
+                    }
+                }
+            })
+        });
+        select_ok(attempts)
+            .await
+            .map(|(transport, _losers)| transport)
     }
 
     /// Ensure this group has working transports. Transports are created
@@ -556,7 +966,10 @@ impl DnsGroup {
     /// interface was not up), retry — but only if at least
     /// [`DNS_RETRY_COOLDOWN`] has passed since the last attempt.
     ///
-    /// Returns `true` if one or more transports are now available.
+    /// UDP transports and the framed-stream transports (plain TCP and DoT)
+    /// are all tracked by `is_broken`; the DoH `clients` are always live as
+    /// far as this fast path is concerned (their pool is rebuilt on demand
+    /// and the per-request timeout catches any stale connection).
     async fn ensure_transports(&self) -> bool {
         if self.blocking {
             return false;
@@ -565,33 +978,116 @@ impl DnsGroup {
         // Fast path: every transport is live and at least one exists.
         {
             let state = self.state.read().await;
-            let has_broken = state.udp_transports.iter().any(|t| t.is_broken());
-            let has_live = !state.udp_transports.is_empty()
-                || !state.doh_clients.is_empty();
-            if !has_broken && has_live {
+            if !Self::state_has_broken(&state) && Self::state_has_live(&state) {
                 return true;
             }
         }
 
         let mut state = self.state.write().await;
-        // Evict transports whose receive loop died (fatal socket error or a
-        // silent panic) or that failed a probe: they can never dispatch
-        // responses again, and keeping them around would block recreation.
-        let before = state.udp_transports.len();
-        state.udp_transports.retain(|t| !t.is_broken());
-        if state.udp_transports.len() != before {
-            log::warn!(
-                "Group '{}': evicted {} broken upstream transport(s)",
-                self.name,
-                before - state.udp_transports.len()
-            );
-        }
-        // Double-check: another request may have recreated them already.
-        if !state.udp_transports.is_empty() || !state.doh_clients.is_empty() {
+        // Another request may have repaired the state while this task waited
+        // for the write lock.
+        if !Self::state_has_broken(&state) && Self::state_has_live(&state) {
             return true;
         }
 
-        // Cooldown check: at most one recreation attempt per window.
+        // Transports whose receive loop died (fatal socket/TLS error or a
+        // silent panic) or that failed a probe can never dispatch again and
+        // must be replaced. They are collected here but evicted only after
+        // the recreation below succeeded: this method is cancelled by the
+        // caller's timeout, and removing them before the await would forget
+        // them for good whenever another transport keeps the group alive.
+        let broken_udp: Vec<Arc<DnsUdpTransport>> = state
+            .udp_transports
+            .iter()
+            .filter(|t| t.is_broken())
+            .cloned()
+            .collect();
+        let broken_dot: Vec<Arc<DnsDotTransport>> = state
+            .dot_transports
+            .iter()
+            .filter(|t| t.is_broken())
+            .cloned()
+            .collect();
+        let broken_tcp: Vec<Arc<DnsTcpTransport>> = state
+            .tcp_transports
+            .iter()
+            .filter(|t| t.is_broken())
+            .cloned()
+            .collect();
+
+        if !broken_udp.is_empty()
+            || !broken_dot.is_empty()
+            || !broken_tcp.is_empty()
+        {
+            if !self.recreate_gate.try_acquire() {
+                log::debug!(
+                    "Group '{}' transport retry cooldown ({}s remaining)",
+                    self.name,
+                    self.recreate_gate.remaining_secs()
+                );
+                // Broken transports stay in the state so a later request
+                // retries them after the cooldown; requests skip them and
+                // use whatever is still live meanwhile.
+                return Self::state_has_live(&state);
+            }
+
+            // Recreate only the broken members, leaving healthy transports
+            // (and their streams/pools) untouched. Without this, a group
+            // that still has one live upstream would drop the broken UDP,
+            // TCP or DoT member forever instead of reconnecting it.
+            let nameservers: Vec<String> = broken_udp
+                .iter()
+                .map(|t| t.state.name().to_string())
+                .chain(broken_dot.iter().map(|t| t.state.name().to_string()))
+                .chain(broken_tcp.iter().map(|t| t.state.name().to_string()))
+                .collect();
+            log::warn!(
+                "Group '{}': recreating {} broken upstream transport(s)",
+                self.name,
+                nameservers.len()
+            );
+            let rebuilt = Self::create_state(
+                &nameservers,
+                &self.doh_cache,
+                &self.name,
+                false,
+                self.doh_options,
+            )
+            .await;
+            // Evict exactly the transports collected above. A peer that
+            // broke while the recreation was in flight is left in the state
+            // for the next pass instead of being dropped without a
+            // replacement.
+            state
+                .udp_transports
+                .retain(|t| !broken_udp.iter().any(|b| Arc::ptr_eq(b, t)));
+            state
+                .dot_transports
+                .retain(|t| !broken_dot.iter().any(|b| Arc::ptr_eq(b, t)));
+            state
+                .tcp_transports
+                .retain(|t| !broken_tcp.iter().any(|b| Arc::ptr_eq(b, t)));
+            state.udp_transports.extend(rebuilt.udp_transports);
+            state.dot_transports.extend(rebuilt.dot_transports);
+            state.tcp_transports.extend(rebuilt.tcp_transports);
+            state.doh_clients.extend(rebuilt.doh_clients);
+
+            let ok = Self::state_has_live(&state);
+            if !ok {
+                log::debug!(
+                    "Group '{}' transport recreation failed, will retry later",
+                    self.name
+                );
+            }
+            return ok;
+        }
+
+        if Self::state_has_live(&state) {
+            return true;
+        }
+
+        // No transport exists at all: try the complete nameserver list after
+        // the cooldown window.
         if !self.recreate_gate.try_acquire() {
             log::debug!(
                 "Group '{}' transport retry cooldown ({}s remaining)",
@@ -609,8 +1105,7 @@ impl DnsGroup {
             self.doh_options,
         )
         .await;
-        let ok =
-            !state.udp_transports.is_empty() || !state.doh_clients.is_empty();
+        let ok = Self::state_has_live(&state);
         if !ok {
             log::debug!(
                 "Group '{}' transport recreation failed, will retry later",
@@ -620,6 +1115,23 @@ impl DnsGroup {
         ok
     }
 
+    /// Whether the group has at least one transport that can still answer.
+    /// Broken transports are excluded: they are only kept until the
+    /// recreation gate allows replacing them.
+    fn state_has_live(state: &GroupState) -> bool {
+        state.udp_transports.iter().any(|t| !t.is_broken())
+            || state.tcp_transports.iter().any(|t| !t.is_broken())
+            || state.dot_transports.iter().any(|t| !t.is_broken())
+            || !state.doh_clients.is_empty()
+    }
+
+    /// Whether any attached transport must be replaced.
+    fn state_has_broken(state: &GroupState) -> bool {
+        state.udp_transports.iter().any(|t| t.is_broken())
+            || state.tcp_transports.iter().any(|t| t.is_broken())
+            || state.dot_transports.iter().any(|t| t.is_broken())
+    }
+
     /// Drop pooled DoH connections and clear upstream failure state after
     /// the system resumed from suspend.
     async fn handle_resume(&self) {
@@ -627,6 +1139,18 @@ impl DnsGroup {
         for upstream in &state.doh_clients {
             upstream.client.invalidate_pool().await;
             upstream.state.reset();
+        }
+        // Plain TCP and DoT are persistent streams like the DoH pool: after
+        // suspend the connection is likely half-open. Mark them broken so
+        // the next `ensure_transports` evicts the transport and
+        // `create_upstream` reconnects (or falls back according to the
+        // configured scheme). Plain UDP is connectionless and needs no reset
+        // here.
+        for tcp in &state.tcp_transports {
+            tcp.state.mark_broken();
+        }
+        for dot in &state.dot_transports {
+            dot.state.mark_broken();
         }
     }
 
@@ -690,7 +1214,8 @@ impl DnsGroup {
         let query_bytes = request.to_bytes();
 
         let state = self.state.read().await;
-        let mut futures = FuturesUnordered::new();
+        let mut futures: FuturesUnordered<UpstreamQueryFuture> =
+            FuturesUnordered::new();
         let mut skipped_dead = 0usize;
 
         for transport in &state.udp_transports {
@@ -755,7 +1280,81 @@ impl DnsGroup {
                 };
                 (Some(Upstream::Udp(transport)), result, is_probe)
             };
-            futures.push(Either::Left(udp_future));
+            futures.push(Box::pin(udp_future));
+        }
+
+        // Send to every live framed-stream transport (plain TCP and DoT),
+        // mirroring the UDP branches above: same wire-ID rewriting, same
+        // response matching, same liveness and cooldown policy. The only
+        // difference is the length framing handled inside the transport.
+        let stream_transports = state
+            .tcp_transports
+            .iter()
+            .map(|t| StreamTransport::Tcp(Arc::clone(t)))
+            .chain(
+                state
+                    .dot_transports
+                    .iter()
+                    .map(|t| StreamTransport::Dot(Arc::clone(t))),
+            );
+        for transport in stream_transports {
+            if transport.is_broken() {
+                skipped_dead += 1;
+                continue;
+            }
+            let attempt = transport.state().may_attempt();
+            match attempt {
+                Attempt::Ready | Attempt::Probing => {}
+                Attempt::Dead | Attempt::Broken => {
+                    skipped_dead += 1;
+                    continue;
+                }
+            }
+            let protocol = match &transport {
+                StreamTransport::Tcp(_) => "TCP",
+                StreamTransport::Dot(_) => "DoT",
+            };
+            let rx = match transport.send_query(&query_bytes, &key).await {
+                Ok(rx) => rx,
+                Err(e) => {
+                    log::debug!(
+                        "Error sending DNS query over {} to group '{}': {e}",
+                        protocol,
+                        self.name
+                    );
+                    if matches!(attempt, Attempt::Probing) {
+                        // A failed probe on a stream means the write failed,
+                        // i.e. the stream is gone: force a fresh
+                        // connection on the next recreation.
+                        transport.state().mark_broken();
+                    } else {
+                        transport.state().record_failure();
+                    }
+                    continue;
+                }
+            };
+            let client_id = key.3;
+            let upstream = transport.into_upstream();
+            let is_probe = matches!(attempt, Attempt::Probing);
+            let stream_future = async move {
+                let result =
+                    match tokio::time::timeout(DNS_TIMEOUT_SEC, rx).await {
+                        Ok(Ok(mut packet)) => {
+                            packet.header.id = client_id;
+                            Ok(packet)
+                        }
+                        Ok(Err(_)) => Err(MudzError::new(
+                            ErrorKind::Timeout,
+                            format!("{protocol} response channel closed"),
+                        )),
+                        Err(_) => Err(MudzError::new(
+                            ErrorKind::Timeout,
+                            format!("{protocol} DNS query timed out"),
+                        )),
+                    };
+                (Some(upstream), result, is_probe)
+            };
+            futures.push(Box::pin(stream_future));
         }
 
         // Send to all live DoH clients. Dead upstreams are skipped; the
@@ -780,7 +1379,7 @@ impl DnsGroup {
                 let result = upstream.client.request(&doh_request).await;
                 (Some(Upstream::Doh(upstream)), result, is_probe)
             };
-            futures.push(Either::Right(doh_future));
+            futures.push(Box::pin(doh_future));
         }
 
         if futures.is_empty() {
@@ -888,18 +1487,7 @@ fn make_ipv6_blocked_response(request: &DnsPacket) -> DnsPacket {
     }
 }
 
-async fn create_udp_socket(srv: &str) -> Result<UdpSocket, MudzError> {
-    let addr = if srv.contains(':') {
-        SocketAddr::from_str(srv)
-    } else {
-        SocketAddr::from_str(&format!("{srv}:53"))
-    }
-    .map_err(|e| {
-        MudzError::new(
-            ErrorKind::InvalidConfig,
-            format!("Invalid nameserver address '{srv}': {e}"),
-        )
-    })?;
+async fn create_udp_socket(addr: SocketAddr) -> Result<UdpSocket, MudzError> {
     let bind_addr = if addr.is_ipv6() {
         "[::]:0"
     } else {
@@ -946,6 +1534,21 @@ fn is_fatal_io_error(e: &std::io::Error) -> bool {
             | ErrorKind::ConnectionRefused
             | ErrorKind::NotConnected
     )
+}
+
+#[cfg(test)]
+impl DnsGroup {
+    /// Test helper: report the number of live UDP / TCP / DoT / DoH
+    /// transports.
+    async fn transport_counts(&self) -> (usize, usize, usize, usize) {
+        let s = self.state.read().await;
+        (
+            s.udp_transports.len(),
+            s.tcp_transports.len(),
+            s.dot_transports.len(),
+            s.doh_clients.len(),
+        )
+    }
 }
 
 #[cfg(test)]

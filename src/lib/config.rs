@@ -4,6 +4,7 @@ use std::{collections::HashMap, fs, net::IpAddr, path::Path};
 
 use serde::Deserialize;
 
+use super::endpoint::{NameserverAddress, NameserverEndpoint};
 use crate::{ErrorKind, MudzError};
 
 const DEFAULT_MAX_CACHE_SIZE: usize = 4096;
@@ -73,7 +74,11 @@ impl Default for MudzMainConfig {
 #[derive(Debug, Deserialize, Clone, Default, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct MudzFallbackConfig {
-    /// Upstream DNS servers for fallback
+    /// Upstream DNS servers for fallback.
+    ///
+    /// Each entry is a DoH URL, a bare IP address (try DoT, then DNS over
+    /// TCP, then UDP), or an IP address with a forced `tls://`, `tcp://` or
+    /// `udp://` scheme.
     pub nameservers: Vec<String>,
     /// Disable AAAA queries for fallback servers
     #[serde(default)]
@@ -81,11 +86,12 @@ pub struct MudzFallbackConfig {
 }
 
 /// Configuration for the [doh] section. Provides plain IP nameservers for
-/// resolving DoH server hostnames. Mandatory if any nameserver is a DoH URL.
+/// resolving DoH server hostnames and `tls://hostname` DoT endpoints.
+/// Mandatory if any nameserver uses either.
 #[derive(Debug, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct MudzDohConfig {
-    /// UDP nameservers for resolving DoH server hostnames
+    /// UDP nameservers for resolving DoH/DoT server hostnames
     pub nameservers: Vec<IpAddr>,
     /// Disable AAAA queries for DoH resolver
     #[serde(default)]
@@ -125,7 +131,11 @@ impl Default for MudzDohConfig {
 #[derive(Debug, Deserialize, Clone, Default, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
 pub struct MudzGroupConfig {
-    /// Nameservers in this group
+    /// Nameservers in this group.
+    ///
+    /// Each entry is a DoH URL, a bare IP address (try DoT, then DNS over
+    /// TCP, then UDP), or an IP address with a forced `tls://`, `tcp://` or
+    /// `udp://` scheme.
     pub nameservers: Vec<String>,
     /// Domains that should be routed to this group, empty means reply NXDOMAIN
     /// immediately without forwarding to fallback.
@@ -193,13 +203,43 @@ impl MudzConfig {
     /// Validate the configuration:
     /// 1. Group name cannot be empty
     /// 2. Group domains cannot overlap
-    /// 3. If any nameserver uses DoH, [doh] section must be present with plain
-    ///    IP nameservers
+    /// 3. Every nameserver must be a DoH URL, an IP literal with an optional
+    ///    transport scheme, or a `tls://hostname` endpoint
+    /// 4. If any nameserver uses DoH or a `tls://hostname`, the [doh] section
+    ///    must be present with plain IP nameservers
     pub fn validate(&self) -> Result<(), MudzError> {
         self.validate_group_names()?;
         self.validate_domain_overlap()?;
-        self.validate_doh_nameservers()?;
+        self.validate_nameservers()?;
+        self.validate_bootstrap_nameservers()?;
         self.validate_doh_options()?;
+        Ok(())
+    }
+
+    /// Validate every configured nameserver string.
+    ///
+    /// A malformed entry would otherwise only be reported as a warning when
+    /// the group lazily builds its transports, leaving the group without any
+    /// upstream and answering SERVFAIL for every query. Reject it at
+    /// configuration time instead.
+    fn validate_nameservers(&self) -> Result<(), MudzError> {
+        let nameservers = self
+            .fallback
+            .nameservers
+            .iter()
+            .chain(self.groups.values().flat_map(|g| g.nameservers.iter()));
+        for nameserver in nameservers {
+            if nameserver.starts_with("https://") {
+                if extract_doh_hostname(nameserver).is_none() {
+                    return Err(MudzError::new(
+                        ErrorKind::InvalidConfig,
+                        format!("Invalid DoH URL: {nameserver}"),
+                    ));
+                }
+                continue;
+            }
+            NameserverEndpoint::parse(nameserver)?;
+        }
         Ok(())
     }
 
@@ -289,19 +329,26 @@ impl MudzConfig {
         Ok(())
     }
 
-    /// Validate that if any nameserver uses DoH, a [doh] section with plain
-    /// IP nameservers is present
-    fn validate_doh_nameservers(&self) -> Result<(), MudzError> {
-        let has_doh = self
+    /// Validate that if any nameserver uses DoH or a `tls://hostname`, a
+    /// [doh] section with plain IP nameservers is present
+    fn validate_bootstrap_nameservers(&self) -> Result<(), MudzError> {
+        let nameservers = self
             .fallback
             .nameservers
             .iter()
-            .any(|ns| ns.starts_with("https://"))
-            || self.groups.values().any(|g| {
-                g.nameservers.iter().any(|ns| ns.starts_with("https://"))
-            });
+            .chain(self.groups.values().flat_map(|g| g.nameservers.iter()));
+        let needs_bootstrap = nameservers.into_iter().any(|ns| {
+            ns.starts_with("https://")
+                || matches!(
+                    NameserverEndpoint::parse(ns),
+                    Ok(NameserverEndpoint {
+                        address: NameserverAddress::Hostname(_),
+                        ..
+                    })
+                )
+        });
 
-        if !has_doh {
+        if !needs_bootstrap {
             return Ok(());
         }
 
@@ -309,9 +356,9 @@ impl MudzConfig {
             None => {
                 return Err(MudzError::new(
                     ErrorKind::InvalidConfig,
-                    "DoH servers are configured but no [doh] section found. \
-                     Please add a [doh] section with plain IP nameservers to \
-                     resolve DoH server hostnames",
+                    "DoH or DoT hostnames are configured but no [doh] section \
+                     found. Please add a [doh] section with plain IP \
+                     nameservers to resolve them",
                 ));
             }
             Some(doh) => {

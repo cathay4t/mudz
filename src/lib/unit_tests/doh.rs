@@ -138,6 +138,35 @@ fn test_doh_hostnames_are_unique_and_lowercased() {
     );
 }
 
+#[test]
+fn test_bootstrap_hostnames_include_dot_hostnames() {
+    let config = MudzConfig {
+        fallback: MudzFallbackConfig {
+            nameservers: vec![
+                "https://DoH.Example.COM/dns-query".to_string(),
+                "tls://DNS.Example.COM".to_string(),
+                "tls://1.2.3.4".to_string(),
+                "8.8.8.8".to_string(),
+            ],
+            disable_ipv6: false,
+        },
+        doh: Some(MudzDohConfig {
+            nameservers: vec![IpAddr::V4(Ipv4Addr::new(9, 9, 9, 9))],
+            disable_ipv6: false,
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+
+    let hostnames: Vec<String> =
+        bootstrap_hostnames(&config).unwrap().into_iter().collect();
+    assert_eq!(
+        hostnames,
+        vec!["dns.example.com".to_string(), "doh.example.com".to_string()],
+        "both DoH URLs and tls://hostname endpoints need bootstrap resolution"
+    );
+}
+
 #[tokio::test]
 async fn test_bootstrap_without_doh_is_none() {
     let config = MudzConfig::default();

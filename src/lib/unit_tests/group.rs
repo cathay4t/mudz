@@ -1,11 +1,18 @@
 // SPDX-License-Identifier: Apache-2.0
 
-use std::collections::HashMap;
+use std::{
+    collections::HashMap,
+    net::{IpAddr, Ipv4Addr},
+};
 
 use super::*;
 use crate::{
     DnsPacket, DnsResponseCode, DnsType,
-    config::{MudzConfig, MudzFallbackConfig, MudzGroupConfig, MudzMainConfig},
+    config::{
+        MudzConfig, MudzDohConfig, MudzFallbackConfig, MudzGroupConfig,
+        MudzMainConfig,
+    },
+    host::HostsFile,
     retry::now_secs,
 };
 
@@ -21,6 +28,70 @@ fn test_config(fallback_ns: &str) -> MudzConfig {
     }
 }
 
+/// Spawn a fake plain-TCP DNS upstream (RFC 7766) on loopback. The listener
+/// answers framed queries, and closes a TLS ClientHello immediately so a
+/// bare-IP `Auto` probe fails fast and falls through to TCP.
+async fn spawn_tcp_dns_upstream() -> (SocketAddr, tokio::task::JoinHandle<()>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let task = tokio::spawn(async move {
+        loop {
+            let Ok((socket, _)) = listener.accept().await else {
+                return;
+            };
+            tokio::spawn(handle_tcp_dns_connection(socket));
+        }
+    });
+    (addr, task)
+}
+
+async fn handle_tcp_dns_connection(mut socket: tokio::net::TcpStream) {
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+    let mut prefix = [0u8; 2];
+    if !matches!(socket.peek(&mut prefix).await, Ok(2)) {
+        return;
+    }
+    // 0x16 0x03 is the start of a TLS record; plain DNS over TCP starts
+    // with a small message length whose first byte is usually 0x00.
+    if prefix[0] == 0x16 {
+        return;
+    }
+    loop {
+        if socket.read_exact(&mut prefix).await.is_err() {
+            return;
+        }
+        let mut message = vec![0u8; u16::from_be_bytes(prefix) as usize];
+        if socket.read_exact(&mut message).await.is_err() {
+            return;
+        }
+        let Ok(query) = DnsPacket::parse(&message) else {
+            return;
+        };
+        let Some(question) = query.first_question() else {
+            return;
+        };
+        let reply = DnsPacket::new_reply(
+            query.header.id,
+            DnsResponseCode::NoError,
+            question.domain.clone(),
+            question.kind,
+            question.class,
+            true,
+        );
+        let bytes = reply.to_bytes();
+        if socket
+            .write_all(&(bytes.len() as u16).to_be_bytes())
+            .await
+            .is_err()
+            || socket.write_all(&bytes).await.is_err()
+        {
+            return;
+        }
+        socket.flush().await.ok();
+    }
+}
+
 /// Nothing listens on the upstream port, so the kernel answers with
 /// ICMP port-unreachable; the latched socket error must reach the recv
 /// loop (tokio >= 1.51.1, see tokio#8001) and mark the transport
@@ -28,7 +99,8 @@ fn test_config(fallback_ns: &str) -> MudzConfig {
 /// tests.
 #[tokio::test]
 async fn test_transport_broken_on_icmp_refused() {
-    let transport = DnsUdpTransport::new("127.0.0.1:53537", "test")
+    let addr: SocketAddr = "127.0.0.1:53537".parse().unwrap();
+    let transport = DnsUdpTransport::new("127.0.0.1:53537", addr, "test")
         .await
         .expect("create transport to dead port");
     let query = DnsPacket::new_query("example.com", DnsType::A).expect("query");
@@ -69,7 +141,8 @@ async fn test_transport_is_broken_when_recv_loop_panics() {
     // broken. `recv_loop` only exits on a fatal error or a panic, so a
     // finished task handle is a reliable liveness signal even when the
     // panic path never ran `mark_broken`.
-    let transport = DnsUdpTransport::new("127.0.0.1:53538", "test")
+    let addr: SocketAddr = "127.0.0.1:53538".parse().unwrap();
+    let transport = DnsUdpTransport::new("127.0.0.1:53538", addr, "test")
         .await
         .expect("create transport");
     assert!(
@@ -140,6 +213,286 @@ async fn test_group_transports_created_on_demand() {
     assert!(group.ensure_transports().await);
     let state = group.state.read().await;
     assert_eq!(state.udp_transports.len(), 1);
+}
+
+/// A bare IP nameserver whose configured port refuses TLS and TCP must still
+/// yield a UDP transport. The test picks a free loopback port and closes the
+/// listener, so both stream probes connect to the *configured* port and are
+/// refused by the kernel (ECONNREFUSED) — `create_upstream` then falls back
+/// to a UDP transport for the same address.
+#[tokio::test]
+async fn test_ip_nameserver_falls_back_to_udp() {
+    let probe = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = probe.local_addr().unwrap();
+    drop(probe);
+
+    let group = DnsGroup::new(
+        "test".to_string(),
+        vec![addr.to_string()],
+        false,
+        false,
+        None,
+        DohOptions::default(),
+    );
+    assert!(
+        group.ensure_transports().await,
+        "create_state must succeed by falling back to UDP"
+    );
+    let state = group.state.read().await;
+    assert_eq!(state.dot_transports.len(), 0);
+    assert_eq!(state.tcp_transports.len(), 0);
+    assert_eq!(
+        state.udp_transports.len(),
+        1,
+        "the fallback UDP transport must exist for the IP nameserver"
+    );
+}
+
+/// `udp://` forces plain UDP: the transport is created even though no TCP
+/// or TLS endpoint exists.
+#[tokio::test]
+async fn test_forced_udp_scheme_creates_only_udp() {
+    let probe = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let addr = probe.local_addr().unwrap();
+    drop(probe);
+
+    let group = DnsGroup::new(
+        "test".to_string(),
+        vec![format!("udp://{addr}")],
+        false,
+        false,
+        None,
+        DohOptions::default(),
+    );
+    assert!(group.ensure_transports().await);
+    assert_eq!(group.transport_counts().await, (1, 0, 0, 0));
+}
+
+/// `tcp://` forces plain DNS over TCP and resolves through the shared
+/// framed-stream transport.
+#[tokio::test]
+async fn test_forced_tcp_scheme_resolves_over_tcp() {
+    let (addr, server) = spawn_tcp_dns_upstream().await;
+    let group = DnsGroup::new(
+        "test".to_string(),
+        vec![format!("tcp://{addr}")],
+        false,
+        false,
+        None,
+        DohOptions::default(),
+    );
+    assert!(group.ensure_transports().await);
+    assert_eq!(
+        group.transport_counts().await,
+        (0, 1, 0, 0),
+        "tcp:// must create exactly one plain-TCP transport"
+    );
+
+    let query =
+        DnsPacket::new_query("example.com", DnsType::A).expect("build query");
+    let resp = group
+        .request(query)
+        .await
+        .expect("TCP upstream must answer");
+    assert_eq!(resp.header.rcode, DnsResponseCode::NoError);
+    server.abort();
+}
+
+/// A bare IP address prefers TCP over UDP once the TLS probe fails, matching
+/// the documented TLS -> TCP -> UDP order.
+#[tokio::test]
+async fn test_bare_ip_prefers_tcp_over_udp() {
+    let (addr, server) = spawn_tcp_dns_upstream().await;
+    let group = DnsGroup::new(
+        "test".to_string(),
+        vec![addr.to_string()],
+        false,
+        false,
+        None,
+        DohOptions::default(),
+    );
+    assert!(group.ensure_transports().await);
+    assert_eq!(
+        group.transport_counts().await,
+        (0, 1, 0, 0),
+        "a bare IP must use TCP when the DoT probe fails"
+    );
+
+    let query =
+        DnsPacket::new_query("example.com", DnsType::A).expect("build query");
+    let resp = group
+        .request(query)
+        .await
+        .expect("TCP upstream must answer");
+    assert_eq!(resp.header.rcode, DnsResponseCode::NoError);
+    server.abort();
+}
+
+/// Forced `tls://` and `tcp://` have no fallback: when the endpoint is
+/// unreachable the group stays empty instead of quietly switching to UDP.
+#[tokio::test]
+async fn test_forced_stream_schemes_have_no_fallback() {
+    let probe = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = probe.local_addr().unwrap();
+    drop(probe);
+
+    for scheme in ["tls", "tcp"] {
+        let group = DnsGroup::new(
+            "test".to_string(),
+            vec![format!("{scheme}://{addr}")],
+            false,
+            false,
+            None,
+            DohOptions::default(),
+        );
+        assert!(
+            !group.ensure_transports().await,
+            "{scheme}:// must not fall back to UDP"
+        );
+        assert_eq!(group.transport_counts().await, (0, 0, 0, 0));
+    }
+}
+
+/// `tls://hostname` depends on the startup-pinned bootstrap cache. Config
+/// validation rejects this combination without a [doh] section, but the
+/// group must also fail gracefully rather than panicking or falling back.
+#[tokio::test]
+async fn test_dot_hostname_without_bootstrap_cache_fails() {
+    let group = DnsGroup::new(
+        "test".to_string(),
+        vec!["tls://dns.example.com".to_string()],
+        false,
+        false,
+        None,
+        DohOptions::default(),
+    );
+    assert!(!group.ensure_transports().await);
+    assert_eq!(group.transport_counts().await, (0, 0, 0, 0));
+}
+
+/// A broken transport in a group that still has a live upstream must be
+/// recreated instead of being dropped silently. The recreation gate delays
+/// the attempt; until then the broken member is kept (but skipped by
+/// requests) so it is not forgotten.
+#[tokio::test]
+async fn test_broken_transport_recreated_with_live_peer() {
+    let probe_a = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let probe_b = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let addrs = [probe_a.local_addr().unwrap(), probe_b.local_addr().unwrap()];
+    drop(probe_a);
+    drop(probe_b);
+
+    let group = DnsGroup::new(
+        "test".to_string(),
+        addrs.iter().map(|a| a.to_string()).collect(),
+        false,
+        false,
+        None,
+        DohOptions::default(),
+    );
+    assert!(group.ensure_transports().await);
+    {
+        let state = group.state.read().await;
+        assert_eq!(state.udp_transports.len(), 2);
+        // Simulate a receive loop that died: this transport can never
+        // dispatch a response again.
+        state.udp_transports[0].state.mark_broken();
+    }
+
+    // While the recreation gate is closed, the broken member must be kept
+    // (and skipped by the request path) so a later request retries it.
+    group.recreate_gate.set_last_attempt(now_secs());
+    assert!(group.ensure_transports().await);
+    {
+        let state = group.state.read().await;
+        assert_eq!(state.udp_transports.len(), 2);
+        assert_eq!(
+            state
+                .udp_transports
+                .iter()
+                .filter(|t| t.is_broken())
+                .count(),
+            1,
+            "the broken transport must be kept until the retry is allowed"
+        );
+    }
+
+    // Once the cooldown has elapsed, only the broken member is recreated;
+    // the healthy peer's transport is left untouched.
+    group.recreate_gate.set_last_attempt(0);
+    assert!(group.ensure_transports().await);
+    let state = group.state.read().await;
+    assert_eq!(state.udp_transports.len(), 2);
+    assert!(
+        state.udp_transports.iter().all(|t| !t.is_broken()),
+        "the broken member must be replaced by a live transport"
+    );
+}
+
+/// Cancelling `ensure_transports` (the request path bounds it with a
+/// timeout) must not drop the broken transports before a replacement
+/// exists: otherwise a group that still has a live peer would forget the
+/// broken nameserver forever.
+#[tokio::test]
+async fn test_cancelled_recreation_keeps_broken_transport() {
+    // A peer that accepts TCP connections but never answers the TLS
+    // handshake, so recreating its transport takes the full 1.5 s
+    // handshake timeout and can be cancelled mid-flight.
+    let hang_listener =
+        tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let hang_addr = hang_listener.local_addr().unwrap();
+    let hang_task = tokio::spawn(async move {
+        let mut sockets = Vec::new();
+        while let Ok((socket, _)) = hang_listener.accept().await {
+            // Hold the connection open without ever replying.
+            sockets.push(socket);
+        }
+    });
+
+    let live = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let live_addr = live.local_addr().unwrap();
+    drop(live);
+
+    let group = DnsGroup::new(
+        "test".to_string(),
+        vec![hang_addr.to_string(), format!("udp://{live_addr}")],
+        false,
+        false,
+        None,
+        DohOptions::default(),
+    );
+    assert!(group.ensure_transports().await);
+    assert_eq!(group.transport_counts().await, (1, 1, 0, 0));
+    {
+        let state = group.state.read().await;
+        state.tcp_transports[0].state.mark_broken();
+    }
+
+    // The initial creation consumed the group's recreation gate; open it so
+    // the next call actually attempts the (hanging) recreation.
+    group.recreate_gate.set_last_attempt(0);
+
+    // The recreation hangs in the TLS handshake and is cancelled by the
+    // request-path timeout.
+    assert!(
+        tokio::time::timeout(
+            Duration::from_millis(50),
+            group.ensure_transports()
+        )
+        .await
+        .is_err(),
+        "the recreation must still be running when the guard fires"
+    );
+
+    let state = group.state.read().await;
+    assert_eq!(
+        state.tcp_transports.len(),
+        1,
+        "the broken transport must survive a cancelled recreation"
+    );
+    assert!(state.tcp_transports[0].is_broken());
+    assert_eq!(state.udp_transports.len(), 1);
+    hang_task.abort();
 }
 
 #[tokio::test]
@@ -297,6 +650,8 @@ async fn test_ensure_transports_recovers_after_cooldown() {
     // attempt, so ensure_transports must respect the cooldown.
     *group.state.write().await = GroupState {
         udp_transports: Vec::new(),
+        tcp_transports: Vec::new(),
+        dot_transports: Vec::new(),
         doh_clients: Vec::new(),
     };
     group.recreate_gate.set_last_attempt(now_secs());
@@ -347,7 +702,8 @@ async fn test_concurrent_same_id_queries_not_cross_delivered() {
         }
     });
 
-    let transport = DnsUdpTransport::new(&upstream_addr.to_string(), "test")
+    let name = upstream_addr.to_string();
+    let transport = DnsUdpTransport::new(&name, upstream_addr, "test")
         .await
         .unwrap();
 
@@ -397,4 +753,91 @@ async fn test_concurrent_same_id_queries_not_cross_delivered() {
     );
 
     server_task.await.unwrap();
+}
+
+/// Full group-level exercise against a real DoT-capable upstream that the
+/// user cited as a reference (`dig @223.5.5.5 bing.com +tls`). Proves the
+/// fan-out actually establishes a `DnsDotTransport` for the IP nameserver
+/// (not UDP) and delivers a valid NoError response for the query.
+/// `#[ignore]`d for hermetic CI; run on network-enabled machines:
+///   cargo test --lib -- --ignored group::tests::test_group_routes_ip_via_dot
+#[tokio::test]
+#[ignore = "requires outbound connectivity to 223.5.5.5:853"]
+async fn test_group_routes_ip_via_dot() {
+    let config = test_config("223.5.5.5");
+    let groups = DnsGroups::new(config, None);
+    let query =
+        DnsPacket::new_query("bing.com", DnsType::A).expect("build query");
+
+    let resp = groups.request(query).await.expect("request succeeds");
+    assert_eq!(resp.header.rcode, DnsResponseCode::NoError);
+    assert!(
+        !resp.answers.is_empty(),
+        "bing.com should have at least one A record"
+    );
+
+    // The group should have established a DoT transport (not a UDP one) for
+    // this IP nameserver — the probe to 223.5.5.5:853 succeeded and the
+    // fallback to UDP did not fire.
+    let (udp, tcp, dot, _doh) = groups.fallback.transport_counts().await;
+    assert_eq!(dot, 1, "a DoT transport must be established for 223.5.5.5");
+    assert_eq!(udp, 0, "UDP fallback must not be active when DoT is up");
+    assert_eq!(tcp, 0, "TCP fallback must not be active when DoT is up");
+
+    // A failed probe on an established stream must tear the stream down:
+    // a half-open stream never errors, so keeping it would probe the same
+    // dead connection forever instead of reconnecting.
+    let transport = {
+        let state = groups.fallback.state.read().await;
+        Arc::clone(&state.dot_transports[0])
+    };
+    record_upstream_failure(
+        Some(Upstream::Dot(Arc::clone(&transport))),
+        &MudzError::new(ErrorKind::Timeout, "DoT probe timed out"),
+        true,
+    )
+    .await;
+    assert!(
+        transport.state.is_broken(),
+        "a failed DoT probe must mark the stream broken for recreation"
+    );
+}
+
+/// `tls://hostname` is resolved through the plain-IP `[doh]` bootstrap
+/// nameservers at startup, then connects to the pinned address while the
+/// certificate is verified against the hostname (SNI + DNS SANs).
+///
+/// `#[ignore]`d for hermetic CI; run on network-enabled machines:
+///   cargo test --lib -- --ignored group::tests::test_group_routes_tls_hostname
+#[tokio::test]
+#[ignore = "requires outbound connectivity to 223.5.5.5 and dns.alidns.com"]
+async fn test_group_routes_tls_hostname() {
+    let config = MudzConfig {
+        main: MudzMainConfig::default(),
+        fallback: MudzFallbackConfig {
+            nameservers: vec!["tls://dns.alidns.com".to_string()],
+            disable_ipv6: false,
+        },
+        doh: Some(MudzDohConfig {
+            nameservers: vec![IpAddr::V4(Ipv4Addr::new(223, 5, 5, 5))],
+            disable_ipv6: true,
+            ..Default::default()
+        }),
+        groups: HashMap::new(),
+    };
+    let cache = crate::doh::bootstrap_doh_cache(&config, &HostsFile::empty())
+        .await
+        .expect("the DoT hostname must resolve through the bootstrap servers");
+    let groups = DnsGroups::new(config, cache);
+
+    let query =
+        DnsPacket::new_query("bing.com", DnsType::A).expect("build query");
+    let resp = groups.request(query).await.expect("request succeeds");
+    assert_eq!(resp.header.rcode, DnsResponseCode::NoError);
+    assert!(!resp.answers.is_empty());
+
+    let (udp, tcp, dot, _doh) = groups.fallback.transport_counts().await;
+    assert_eq!(dot, 1, "tls://hostname must establish a DoT transport");
+    assert_eq!(udp, 0, "a forced tls:// endpoint has no UDP fallback");
+    assert_eq!(tcp, 0, "a forced tls:// endpoint has no TCP fallback");
 }

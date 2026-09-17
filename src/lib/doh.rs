@@ -32,6 +32,7 @@ use tower_service::Service;
 
 use super::{
     config::{MudzConfig, MudzDohConfig},
+    endpoint::{NameserverAddress, NameserverEndpoint},
     host::HostsFile,
 };
 use crate::{DnsPacket, DnsResponseCode, DnsType, ErrorKind, MudzError};
@@ -433,7 +434,8 @@ async fn send_request(
     }
 }
 
-/// Resolver for DoH server hostnames, pinned at startup.
+/// Startup-pinned resolver for upstream hostnames (DoH URLs and
+/// `tls://hostname` DoT endpoints).
 ///
 /// The mapping is resolved once before the daemon starts serving (see
 /// [`bootstrap_doh_cache`]) and never changes, so no lock or refresh task is
@@ -450,7 +452,7 @@ impl DohResolvCache {
 
     /// Pinned addresses of `hostname`, if the hostname was resolved during
     /// bootstrap.
-    fn lookup(&self, hostname: &str) -> Option<&[IpAddr]> {
+    pub(crate) fn lookup(&self, hostname: &str) -> Option<&[IpAddr]> {
         self.store.get(hostname).map(Vec::as_slice)
     }
 }
@@ -597,18 +599,47 @@ fn doh_hostnames(config: &MudzConfig) -> Result<BTreeSet<String>, MudzError> {
     Ok(hostnames)
 }
 
-/// Resolve every configured DoH hostname and pin it for the process
+/// Collect the unique `tls://hostname` DoT server hostnames from the fallback
+/// and named group nameserver lists.
+fn dot_hostnames(config: &MudzConfig) -> BTreeSet<String> {
+    let mut hostnames = BTreeSet::new();
+    let nameservers = config
+        .fallback
+        .nameservers
+        .iter()
+        .chain(config.groups.values().flat_map(|g| g.nameservers.iter()));
+    for srv in nameservers {
+        if let Ok(endpoint) = NameserverEndpoint::parse(srv)
+            && let NameserverAddress::Hostname(hostname) = endpoint.address
+        {
+            hostnames.insert(hostname);
+        }
+    }
+    hostnames
+}
+
+/// Every hostname that must be resolved before the daemon starts serving:
+/// DoH URLs and `tls://hostname` DoT endpoints.
+fn bootstrap_hostnames(
+    config: &MudzConfig,
+) -> Result<BTreeSet<String>, MudzError> {
+    let mut hostnames = doh_hostnames(config)?;
+    hostnames.extend(dot_hostnames(config));
+    Ok(hostnames)
+}
+
+/// Resolve every configured DoH/DoT hostname and pin it for the process
 /// lifetime.
 ///
 /// Called before the daemon starts serving. Failure aborts startup: the DoH
-/// client uses [`DohResolvCache`] instead of the system resolver, so without
-/// the bootstrap addresses no DoH query could ever succeed. Returns `None`
-/// when no DoH nameserver is configured.
+/// client and `tls://hostname` DoT endpoints use [`DohResolvCache`] instead
+/// of the system resolver, so without the bootstrap addresses neither could
+/// connect. Returns `None` when no hostname nameserver is configured.
 pub(crate) async fn bootstrap_doh_cache(
     config: &MudzConfig,
     hosts: &HostsFile,
 ) -> Result<Option<Arc<DohResolvCache>>, MudzError> {
-    let hostnames = doh_hostnames(config)?;
+    let hostnames = bootstrap_hostnames(config)?;
     if hostnames.is_empty() {
         return Ok(None);
     }
@@ -616,7 +647,7 @@ pub(crate) async fn bootstrap_doh_cache(
     let doh_cfg = config.doh.as_ref().ok_or_else(|| {
         MudzError::new(
             ErrorKind::InvalidConfig,
-            "DoH servers are configured but no [doh] section found",
+            "DoH/DoT hostnames are configured but no [doh] section found",
         )
     })?;
     if doh_cfg.nameservers.is_empty() {
@@ -640,14 +671,15 @@ pub(crate) async fn bootstrap_doh_cache(
     let mut store = HashMap::with_capacity(hostnames.len());
     for (hostname, result) in hostnames.into_iter().zip(results) {
         let ips = result?;
-        log::info!("DoH hostname {} resolved to {:?}", hostname, ips);
+        log::info!("Bootstrap hostname {} resolved to {:?}", hostname, ips);
         store.insert(hostname, ips);
     }
 
     Ok(Some(Arc::new(DohResolvCache::new(store))))
 }
 
-/// Resolve one DoH hostname through the plain-IP `[doh]` nameservers.
+/// Resolve one bootstrap hostname (a DoH URL or a `tls://` DoT endpoint)
+/// through the plain-IP `[doh]` nameservers.
 ///
 /// `/etc/hosts` entries win over DNS, mirroring the resolver's own query
 /// handling. AAAA queries are skipped when `disable_ipv6` is set.
@@ -657,12 +689,12 @@ async fn resolve_hostname(
     disable_ipv6: bool,
     hosts: &HostsFile,
 ) -> Result<Vec<IpAddr>, MudzError> {
-    log::info!("Resolving DoH hostname {}", host_name);
+    log::info!("Resolving bootstrap hostname {}", host_name);
 
     let hosts_ips = hosts.lookup_ips(host_name);
     if !hosts_ips.is_empty() {
         log::info!(
-            "Resolved DoH hostname {} from /etc/hosts: {:?}",
+            "Resolved bootstrap hostname {} from /etc/hosts: {:?}",
             host_name,
             hosts_ips
         );
@@ -676,7 +708,7 @@ async fn resolve_hostname(
         Ok(ips) => ret.extend_from_slice(&ips),
         Err(e) => {
             log::debug!(
-                "Failed to resolve DoH hostname {} to A record: {e}",
+                "Failed to resolve bootstrap hostname {} to A record: {e}",
                 host_name
             );
         }
@@ -687,7 +719,7 @@ async fn resolve_hostname(
             return Err(MudzError::new(
                 ErrorKind::InvalidConfig,
                 format!(
-                    "Failed to resolve DoH hostname {} to A record",
+                    "Failed to resolve bootstrap hostname {} to A record",
                     host_name
                 ),
             ));
@@ -700,7 +732,7 @@ async fn resolve_hostname(
         Ok(ips) => ret.extend_from_slice(&ips),
         Err(e) => {
             log::debug!(
-                "Failed to resolve DoH hostname {} to AAAA record: {e}",
+                "Failed to resolve bootstrap hostname {} to AAAA record: {e}",
                 host_name
             );
         }
@@ -709,7 +741,7 @@ async fn resolve_hostname(
     if ret.is_empty() {
         Err(MudzError::new(
             ErrorKind::InvalidConfig,
-            format!("Failed to resolve DoH hostname {}", host_name),
+            format!("Failed to resolve bootstrap hostname {}", host_name),
         ))
     } else {
         Ok(ret)

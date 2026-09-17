@@ -2,7 +2,22 @@
 
 ## Features
 
-- Support DNS over UDP, TCP and HTTPs.
+- Support DNS over UDP, TCP, HTTPs (DoH) and TLS (DoT). Upstream nameservers
+  can be DoH URLs, bare IP addresses, or endpoints with a forced transport
+  scheme:
+  - `tls://IP[:port]` or `tls://hostname[:port]` - DNS over TLS only, no
+    fallback. A hostname is verified through SNI and its DNS-name
+    certificate SANs.
+  - `tcp://IP[:port]` - DNS over TCP only, no fallback.
+  - `udp://IP[:port]` - DNS over UDP only, no fallback.
+
+  A bare IP address tries DoT (RFC 7858), then DNS over TCP (RFC 7766), then
+  UDP. An explicit port is used for every attempt; without one, DoT uses 853
+  and TCP/UDP use 53. A `tls://hostname` endpoint is resolved once at startup
+  through the plain-IP nameservers in the `[doh]` section, which is
+  mandatory when a hostname is used. The fallback of a bare IP address is
+  unencrypted, so an on-path attacker can block DoT and force the plaintext
+  transports; use `tls://hostname` or `tls://IP` to require DNS over TLS.
 - Domain based DNS name server selecting.
 - Embeddable: the whole cache server is a library crate.
 - Pure rust code with memory safe guarantee.

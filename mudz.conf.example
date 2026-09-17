@@ -15,7 +15,16 @@ log_level = "info"
 
 [fallback]
 # Send out DNS request to all nameservers simultaneously, and reply to user
-# once got any valid reply
+# once got any valid reply.
+#
+# Nameservers can be:
+#   - DoH URLs: "https://dns.alidns.com/dns-query"
+#   - Bare IP addresses: try DoT, then DNS over TCP, then UDP
+#   - "tls://IP[:port]" or "tls://hostname[:port]" to force DNS over TLS
+#     (a hostname is verified via SNI and needs the [doh] bootstrap below)
+#   - "tcp://IP[:port]" or "udp://IP[:port]" to force plain TCP/UDP
+# An explicit port is used for every attempt; without one, DoT uses 853 and
+# DNS over TCP/UDP use 53.
 nameservers = ["https://dns.alidns.com/dns-query", "https://doh.pub/dns-query"]
 disable_ipv6 = false
 
