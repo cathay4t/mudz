@@ -9,6 +9,11 @@ pub enum ErrorKind {
     InvalidPacket,
     InvalidConfig,
     InvalidArgument,
+    /// The remote peer refused the request — most often a non-retryable
+    /// HTTP status from a DoH server (401, 403, 406, 415, ...). Distinct from
+    /// [`ErrorKind::InvalidPacket`]: the server received and understood a
+    /// well-formed DNS message but chose not to answer it.
+    Rejected,
     Timeout,
 }
 
@@ -21,6 +26,7 @@ impl fmt::Display for ErrorKind {
             ErrorKind::InvalidConfig => {
                 write!(f, "invalid_config")
             }
+            ErrorKind::Rejected => write!(f, "rejected"),
             ErrorKind::Timeout => write!(f, "timeout"),
         }
     }

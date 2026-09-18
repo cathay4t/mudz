@@ -382,6 +382,7 @@ fn test_doh_transport_error_classification() {
     }
     for kind in [
         ErrorKind::InvalidPacket,
+        ErrorKind::Rejected,
         ErrorKind::InvalidConfig,
         ErrorKind::InvalidArgument,
     ] {
@@ -406,7 +407,44 @@ fn test_doh_http_status_classification() {
     assert!(!retryable(hyper::StatusCode::NOT_ACCEPTABLE));
     assert!(!retryable(hyper::StatusCode::UNSUPPORTED_MEDIA_TYPE));
     assert!(!retryable(hyper::StatusCode::BAD_REQUEST));
+    // 401 is permanent today (no credentials to refresh). Once
+    // authentication lands it becomes the one status worth a single
+    // same-server retry — but not before.
     assert!(!retryable(hyper::StatusCode::UNAUTHORIZED));
+}
+
+#[test]
+fn test_doh_http_status_error_kinds() {
+    let kind = |status: hyper::StatusCode| {
+        DohAttemptError::http(status, None).error.kind
+    };
+    // Transient failures share the `Timeout` identity and stay retryable.
+    assert_eq!(
+        kind(hyper::StatusCode::TOO_MANY_REQUESTS),
+        ErrorKind::Timeout
+    );
+    assert_eq!(
+        kind(hyper::StatusCode::INTERNAL_SERVER_ERROR),
+        ErrorKind::Timeout
+    );
+    assert_eq!(
+        kind(hyper::StatusCode::SERVICE_UNAVAILABLE),
+        ErrorKind::Timeout
+    );
+    // Permanent refusals carry their own identity — a 401 is a server
+    // refusing a valid request, not a malformed DNS message — and are
+    // distinctly *not* `InvalidPacket`.
+    let statuses = [
+        hyper::StatusCode::UNAUTHORIZED,           // 401
+        hyper::StatusCode::FORBIDDEN,              // 403
+        hyper::StatusCode::NOT_FOUND,              // 404
+        hyper::StatusCode::NOT_ACCEPTABLE,         // 406
+        hyper::StatusCode::UNSUPPORTED_MEDIA_TYPE, // 415
+    ];
+    for status in statuses {
+        assert_eq!(kind(status), ErrorKind::Rejected, "status {status}");
+        assert_ne!(kind(status), ErrorKind::InvalidPacket, "status {status}");
+    }
 }
 
 #[test]

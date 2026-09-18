@@ -324,17 +324,29 @@ impl DohAttemptError {
         }
     }
 
-    /// RFC 8484 §4.2.1 leaves non-2xx handling to normal HTTP semantics:
-    /// rate limiting and server errors are retryable, while a server that
-    /// cannot represent our queries (406/415) or rejects the request
-    /// permanently is not.
+    /// RFC 8484 §4.2.1 leaves non-2xx handling to normal HTTP semantics.
+    ///
+    /// Transient failures — rate limiting (429) and server errors (5xx) —
+    /// are [`ErrorKind::Timeout`] and retryable on a fresh connection. A
+    /// permanent client refusal (any other 4xx) is [`ErrorKind::Rejected`],
+    /// its own category distinct from a malformed [`ErrorKind::InvalidPacket`]:
+    /// the server received a well-formed DNS message and chose not to answer
+    /// it, so mislabeling it as a bad packet would mislead callers and future
+    /// readers.
+    ///
+    /// `401` is permanent *today* because no credentials are configured, so
+    /// retrying the same server cannot change the outcome. When
+    /// authentication is added, `401` is the one status this `retryable`
+    /// decision should flip — to retry a single extra time, on the same
+    /// server, after refreshing credentials (RFC 8484 §4.2.1). That is the
+    /// extension point to touch; the rest of this function stays put.
     fn http(status: hyper::StatusCode, retry_after: Option<Duration>) -> Self {
         let retryable = status == hyper::StatusCode::TOO_MANY_REQUESTS
             || status.is_server_error();
         let kind = if retryable {
             ErrorKind::Timeout
         } else {
-            ErrorKind::InvalidPacket
+            ErrorKind::Rejected
         };
         Self {
             error: MudzError::new(
