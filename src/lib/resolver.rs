@@ -52,7 +52,7 @@ const NON_EDNS_UDP_LIMIT: usize = 512;
 /// (1 byte root name + 2 type + 2 class + 4 TTL + 2 RDLENGTH).
 const OPT_ACK_LEN: usize = 11;
 /// How often to check for a suspend/resume cycle.
-const RESUME_CHECK_INTERVAL: Duration = Duration::from_secs(1);
+const RESUME_CHECK_INTERVAL: Duration = Duration::from_secs(5);
 
 pub(crate) struct DnsResolver;
 
@@ -86,7 +86,7 @@ impl DnsResolver {
 
         let mut futures = FuturesUnordered::new();
         loop {
-            if log::log_enabled!(log::Level::Debug) {
+            if !futures.is_empty() && log::log_enabled!(log::Level::Debug) {
                 log::debug!("Pending DNS reply count {}", futures.len());
             }
             if futures.is_empty() && !cli_index.is_empty() {
