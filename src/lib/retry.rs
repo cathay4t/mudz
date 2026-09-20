@@ -186,7 +186,8 @@ impl UpstreamState {
 
     /// Clear the failure and backoff state without touching the broken flag.
     /// Used when the environment changed in a way that invalidates past
-    /// failures, such as resuming from system suspend.
+    /// failures, such as resuming from system suspend or the embedder
+    /// reporting a new default gateway.
     pub(crate) fn reset(&self) {
         let mut health = self.health.lock().expect("health lock poisoned");
         health.consecutive_failures = 0;
@@ -238,6 +239,13 @@ impl CooldownGate {
         let prev = self.last_attempt.load(Ordering::Acquire);
         self.cooldown_secs
             .saturating_sub(now_secs().wrapping_sub(prev))
+    }
+
+    /// Clear the cooldown so the next attempt is allowed immediately.
+    /// Used when the environment changed in a way that invalidates past
+    /// failures, such as the embedder reporting a new default gateway.
+    pub(crate) fn reset(&self) {
+        self.last_attempt.store(0, Ordering::Release);
     }
 
     #[cfg(test)]

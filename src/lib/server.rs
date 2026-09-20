@@ -13,6 +13,7 @@ use super::{
     doh::{self, DohResolvCache},
     host::HostsFile,
     listener::{DnsTcpListener, DnsUdpListener},
+    notify::{MudzNotifier, MudzServerEvent},
     resolver::DnsResolver,
 };
 use crate::{DnsPacket, ErrorKind, MudzError};
@@ -72,6 +73,13 @@ pub struct MudzServer {
     /// DoH hostname-to-IP mapping resolved before the server starts. `None`
     /// when no DoH nameserver is configured.
     doh_cache: Option<Arc<DohResolvCache>>,
+    /// Kept so the event channel stays open for the whole serving lifetime
+    /// even when the embedder drops every [`MudzNotifier`] handle; clones
+    /// are handed out by [`MudzServer::notifier`].
+    event_sender: mpsc::UnboundedSender<MudzServerEvent>,
+    /// Host environment changes reported by the embedder, consumed by
+    /// `DnsResolver`.
+    events: mpsc::UnboundedReceiver<MudzServerEvent>,
 }
 
 impl MudzServer {
@@ -145,13 +153,28 @@ impl MudzServer {
             }
         };
 
+        let (event_sender, events) = mpsc::unbounded_channel();
+
         Ok(Self {
             socket,
             tcp_listener,
             config,
             hosts,
             doh_cache,
+            event_sender,
+            events,
         })
+    }
+
+    /// Create a handle the embedder uses to report host environment
+    /// changes the server cannot observe itself, such as the default
+    /// gateway changing after a DHCP lease or a route apply.
+    ///
+    /// The handle can be created before [`MudzServer::run`] or
+    /// [`MudzServer::run_with_shutdown`] is called and used from another
+    /// task afterwards.
+    pub fn notifier(&self) -> MudzNotifier {
+        MudzNotifier::new(self.event_sender.clone())
     }
 
     /// Serve DNS queries until the process receives `SIGINT` or `SIGTERM`.
@@ -198,6 +221,7 @@ impl MudzServer {
             Arc::clone(&self.socket),
             Arc::clone(&self.hosts),
             self.doh_cache.clone(),
+            self.events,
         ));
 
         let mut result = Ok(());

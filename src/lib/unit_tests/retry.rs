@@ -153,3 +153,18 @@ fn test_cooldown_gate() {
         "attempt must pass once the cooldown has elapsed"
     );
 }
+
+#[test]
+fn test_cooldown_gate_reset_allows_immediate_attempt() {
+    let gate = CooldownGate::new(DNS_RETRY_COOLDOWN);
+    assert!(gate.try_acquire(), "first attempt must pass");
+    assert!(!gate.try_acquire(), "cooldown must block the next attempt");
+
+    gate.reset();
+
+    assert!(
+        gate.try_acquire(),
+        "reset must clear the cooldown, e.g. after a network change"
+    );
+    assert_eq!(gate.remaining_secs(), DNS_RETRY_COOLDOWN.as_secs());
+}

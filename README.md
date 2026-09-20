@@ -59,6 +59,29 @@ and release the listening sockets before returning, so a configuration
 change is handled by dropping the old server and creating a new one. Live
 reconfiguration is not supported.
 
+The server only observes its own sockets, so host events it cannot see,
+such as the default gateway being replaced by a DHCP lease or a route
+apply, are reported through a `MudzNotifier` handle:
+
+```rust,no_run
+# async fn run() -> Result<(), mudz::MudzError> {
+# let config = mudz::MudzConfig::from_file("/etc/mudz/mudz.conf")?;
+let server = mudz::MudzServer::new(config).await?;
+// Hand this handle to whatever owns the host network state.
+let notifier = server.notifier();
+tokio::spawn(async move { server.run().await });
+
+// When a DHCP lease or a route apply replaced the default gateway:
+notifier.notify_network_change()?;
+# Ok(())
+# }
+```
+
+The notification keeps the DNS cache but clears the upstream failure
+state and drops the pooled upstream transports, so resolver groups which
+were marked dead are retried by the next query instead of serving
+SERVFAIL until their retry backoff elapsed.
+
 ## Configuration
 
 ```toml

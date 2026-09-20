@@ -1,4 +1,19 @@
 # Changelog
+## [Unreleased]
+### Breaking changes
+ - N/A
+### New Features
+ - library: Embedders can report a host network change (for example a new
+   default gateway) through `MudzServer::notifier()`, so upstream groups
+   which were marked dead are retried by the next query instead of failing
+   fast until their retry backoff elapsed.
+
+### Bug Fixes
+ - library: SERVFAIL replies are no longer cached. A cached SERVFAIL kept
+   clients failing for the minimum cache TTL after the upstream became
+   reachable again, which defeated the new network-change notification
+   (a group without any usable upstream transport answers a synthetic
+   SERVFAIL).
 ## [0.1.0] - 2026-09-13
 ### Breaking changes
  - N/A

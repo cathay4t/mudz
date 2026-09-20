@@ -16,6 +16,7 @@ use super::{
     doh::DohResolvCache,
     group::DnsGroups,
     host::HostsFile,
+    notify::MudzServerEvent,
     server::{DnsQueryPacket, DnsReplyTarget},
     suspend::ResumeDetector,
 };
@@ -63,6 +64,7 @@ impl DnsResolver {
         socket: Arc<UdpSocket>,
         hosts: Arc<HostsFile>,
         doh_cache: Option<Arc<DohResolvCache>>,
+        mut events: UnboundedReceiver<MudzServerEvent>,
     ) {
         let mut cache = DnsCacheStore::new(config.main.max_cache_size);
         if !cache.is_enabled() {
@@ -83,6 +85,11 @@ impl DnsResolver {
         let mut resume_check = tokio::time::interval(RESUME_CHECK_INTERVAL);
         resume_check.tick().await;
         let mut resume_detector = ResumeDetector::new();
+
+        // The embedder's notification handles may all be dropped while the
+        // server keeps running; stop polling the closed channel instead of
+        // busy-looping on its immediate `None`.
+        let mut events_open = true;
 
         let mut futures = FuturesUnordered::new();
         loop {
@@ -131,6 +138,26 @@ impl DnsResolver {
                             suspended.as_secs()
                         );
                         groups.handle_resume().await;
+                    }
+                }
+                event = events.recv(), if events_open => {
+                    match event {
+                        Some(MudzServerEvent::NetworkChange) => {
+                            log::info!(
+                                "Embedder reported a network change; \
+                                 clearing upstream failure state and \
+                                 dropping pooled transports"
+                            );
+                            groups.handle_network_change().await;
+                        }
+                        None => {
+                            log::debug!(
+                                "All embedder notification handles are \
+                                 dropped; network change notifications are \
+                                 disabled"
+                            );
+                            events_open = false;
+                        }
                     }
                 }
                 else => {

@@ -42,6 +42,34 @@ fn key_for(domain: &str) -> CacheKey {
 }
 
 #[test]
+fn test_servfail_is_not_cached() {
+    let mut cache = DnsCacheStore::new(16);
+
+    // The resolver caches the validated reply before answering the client,
+    // including the synthetic SERVFAIL it builds when a group has no usable
+    // upstream transport. Storing it would keep clients failing after the
+    // network recovered and the embedder reported the network change.
+    let mut servfail = response_for("transient.example", 1);
+    servfail.header.rcode = DnsResponseCode::ServFail;
+    servfail.header.ancount = 0;
+    servfail.answers.clear();
+    cache.add(key_for("transient.example"), servfail);
+    assert!(
+        cache.get(&key_for("transient.example")).is_none(),
+        "SERVFAIL reports a transient failure and must not be cached"
+    );
+
+    // The upstream recovered: its answer must be served right away, not
+    // after a cached SERVFAIL expired.
+    cache.add(
+        key_for("transient.example"),
+        response_for("transient.example", 2),
+    );
+    let cached = cache.get(&key_for("transient.example")).unwrap();
+    assert_eq!(cached.answers[0].rdata, vec![10, 0, 0, 2]);
+}
+
+#[test]
 fn test_lru_evicts_least_recently_accessed() {
     let mut cache = DnsCacheStore::new(2);
 

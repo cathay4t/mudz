@@ -38,6 +38,7 @@ mod group;
 mod header;
 mod host;
 mod listener;
+mod notify;
 mod packet;
 mod record;
 mod resolver;
@@ -54,6 +55,7 @@ pub use self::{
     },
     error::{ErrorKind, MudzError},
     header::{DnsHeader, DnsResponseCode},
+    notify::{MudzNotifier, MudzServerEvent},
     packet::{DnsPacket, DnsType},
     record::{
         DnsClass, DnsDomainName, DnsNameCompressionMap, DnsQuestion,

@@ -101,6 +101,16 @@ impl DnsGroups {
         }
     }
 
+    /// Clear upstream failure state and drop every pooled transport after
+    /// the embedder reported a network change, such as a new default
+    /// gateway. Cached DNS replies are kept.
+    pub(crate) async fn handle_network_change(&self) {
+        self.fallback.handle_network_change().await;
+        for group in self.groups.values() {
+            group.handle_network_change().await;
+        }
+    }
+
     pub(crate) async fn request(
         &self,
         request: DnsPacket,
@@ -1152,6 +1162,40 @@ impl DnsGroup {
         for dot in &state.dot_transports {
             dot.state.mark_broken();
         }
+    }
+
+    /// Clear upstream failure state and drop every pooled transport after
+    /// the embedder reported a network change - for example a new default
+    /// gateway or a new address on the interface carrying the upstream
+    /// traffic.
+    ///
+    /// Unlike [`Self::handle_resume`], the connected UDP sockets are
+    /// marked broken too: the kernel picks and caches the source address
+    /// of a connected UDP socket when the route is first resolved, so a
+    /// moved gateway or a renumbered interface leaves it sending from a
+    /// stale source address. Marking the transports broken makes
+    /// `ensure_transports` rebuild them on the next request, and the
+    /// recreation gate is cleared so that happens immediately instead of
+    /// after the retry cooldown.
+    async fn handle_network_change(&self) {
+        let state = self.state.read().await;
+        for upstream in &state.doh_clients {
+            upstream.client.invalidate_pool().await;
+            upstream.state.reset();
+        }
+        for transport in &state.udp_transports {
+            transport.state.mark_broken();
+            transport.state.reset();
+        }
+        for transport in &state.tcp_transports {
+            transport.state.mark_broken();
+            transport.state.reset();
+        }
+        for transport in &state.dot_transports {
+            transport.state.mark_broken();
+            transport.state.reset();
+        }
+        self.recreate_gate.reset();
     }
 
     fn is_blocking(&self) -> bool {

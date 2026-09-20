@@ -5,7 +5,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crate::{DnsClass, DnsPacket, DnsType};
+use crate::{DnsClass, DnsPacket, DnsResponseCode, DnsType};
 
 const MIN_CACHE_TTL_SEC: u32 = 5;
 const MAX_CACHE_TTL_SEC: u32 = 86400;
@@ -141,6 +141,24 @@ impl DnsCacheStore {
     /// Store or refresh the parsed response for `key`.
     pub(crate) fn add(&mut self, key: CacheKey, mut response: DnsPacket) {
         if !self.is_enabled() {
+            return;
+        }
+
+        // SERVFAIL reports a transient failure: the group had no usable
+        // upstream transport (e.g. no route to the configured nameserver) or
+        // every upstream failed. Caching it would keep clients failing for
+        // at least `MIN_CACHE_TTL_SEC` after the network recovered — even
+        // when the embedder reported the network change which made the
+        // upstream reachable again. The per-group retry cooldown already
+        // protects a failing upstream from a query storm.
+        if response.header.rcode == DnsResponseCode::ServFail {
+            log::debug!(
+                "Not caching SERVFAIL for {} {:?} {:?} (dnssec_ok={})",
+                key.0,
+                key.1,
+                key.2,
+                key.3
+            );
             return;
         }
 

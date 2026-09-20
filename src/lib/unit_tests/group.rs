@@ -605,6 +605,87 @@ async fn test_handle_resume_resets_doh_health_and_pool() {
 }
 
 #[tokio::test]
+async fn test_handle_network_change_resets_doh_health_and_pool() {
+    let upstream = test_doh_upstream("doh.test");
+    upstream.state.record_failure();
+    upstream.state.record_failure();
+    assert!(matches!(upstream.state.may_attempt(), Attempt::Dead));
+
+    let group = test_doh_group();
+    group
+        .state
+        .write()
+        .await
+        .doh_clients
+        .push(Arc::clone(&upstream));
+    let generation_before = upstream.client.pool_generation();
+
+    group.handle_network_change().await;
+
+    assert!(
+        matches!(upstream.state.may_attempt(), Attempt::Ready),
+        "a network change must clear the DoH upstream failure state"
+    );
+    assert_ne!(
+        upstream.client.pool_generation(),
+        generation_before,
+        "a network change must rebuild the DoH connection pool"
+    );
+}
+
+/// A network change must drop the connected UDP transports (their source
+/// address was picked when the old route was resolved) and clear the
+/// transport recreation cooldown, so a group which was failing is retried
+/// by the next query instead of after the retry backoff.
+#[tokio::test]
+async fn test_handle_network_change_recreates_udp_transport() {
+    // Nothing listens on the port: the ICMP port-unreachable answer kills
+    // the receive loop, mimicking an upstream behind a vanished gateway.
+    let probe = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let addr = probe.local_addr().unwrap();
+    drop(probe);
+
+    let group = DnsGroup::new(
+        "test".to_string(),
+        vec![addr.to_string()],
+        false,
+        false,
+        None,
+        DohOptions::default(),
+    );
+    assert!(group.ensure_transports().await);
+    let transport = {
+        let state = group.state.read().await;
+        Arc::clone(&state.udp_transports[0])
+    };
+    transport.state.record_failure();
+    transport.state.record_failure();
+    assert!(matches!(transport.state.may_attempt(), Attempt::Dead));
+
+    group.recreate_gate.set_last_attempt(now_secs());
+    assert!(
+        !group.recreate_gate.try_acquire(),
+        "the recreation gate must be in its cooldown window"
+    );
+
+    group.handle_network_change().await;
+
+    assert!(
+        transport.is_broken(),
+        "the connected UDP transport must be dropped so it is recreated with \
+         a fresh route and source address"
+    );
+    assert!(
+        matches!(transport.state.may_attempt(), Attempt::Broken),
+        "the dropped transport must not be probed again"
+    );
+    assert!(
+        group.recreate_gate.try_acquire(),
+        "a network change must clear the transport recreation cooldown"
+    );
+}
+
+#[tokio::test]
 async fn test_dead_doh_upstream_is_skipped() {
     let upstream = test_doh_upstream("doh.test");
     upstream.state.record_failure();
