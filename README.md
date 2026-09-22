@@ -18,6 +18,10 @@
   mandatory when a hostname is used. The fallback of a bare IP address is
   unencrypted, so an on-path attacker can block DoT and force the plaintext
   transports; use `tls://hostname` or `tls://IP` to require DNS over TLS.
+  The DoT probe result of a bare IP is remembered for the server lifetime
+  and cleared when the embedder reports a network change or a resume, so
+  reconnecting an upstream (for example after it closed an idle TCP
+  connection) does not probe DoT again.
 - Domain based DNS name server selecting.
 - Embeddable: the whole cache server is a library crate.
 - Pure rust code with memory safe guarantee.

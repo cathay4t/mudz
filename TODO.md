@@ -1,5 +1,11 @@
 # TODO
 
+- A peer-initiated TCP close is normal RFC 7766 behavior, but
+  `DnsStreamTransport::recv_loop` treats the read end as a fatal error:
+  the transport is marked broken, `ensure_transports` recreates it with a
+  `WARN`, and in-flight queries are dropped. Add a reconnect path (or at
+  least distinguish a clean idle close from a fatal read error) instead of
+  tearing down the whole transport.
 - DoH HTTP status handling follow-ups (RFC 8484 section 4.2.1): the
   client retries 429 and 5xx on a fresh pool and honours integer-second
   `Retry-After` values, but these gaps remain:

@@ -3,6 +3,7 @@
 use std::{
     collections::HashMap,
     net::{IpAddr, Ipv4Addr},
+    sync::atomic::{AtomicUsize, Ordering},
 };
 
 use super::*;
@@ -30,22 +31,33 @@ fn test_config(fallback_ns: &str) -> MudzConfig {
 
 /// Spawn a fake plain-TCP DNS upstream (RFC 7766) on loopback. The listener
 /// answers framed queries, and closes a TLS ClientHello immediately so a
-/// bare-IP `Auto` probe fails fast and falls through to TCP.
-async fn spawn_tcp_dns_upstream() -> (SocketAddr, tokio::task::JoinHandle<()>) {
+/// bare-IP `Auto` probe fails fast and falls through to TCP. The returned
+/// counter counts the TLS ClientHello connections so tests can assert how
+/// often the opportunistic DoT probe ran.
+async fn spawn_tcp_dns_upstream()
+-> (SocketAddr, tokio::task::JoinHandle<()>, Arc<AtomicUsize>) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
+    let tls_probes = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&tls_probes);
     let task = tokio::spawn(async move {
         loop {
             let Ok((socket, _)) = listener.accept().await else {
                 return;
             };
-            tokio::spawn(handle_tcp_dns_connection(socket));
+            tokio::spawn(handle_tcp_dns_connection(
+                socket,
+                Arc::clone(&counter),
+            ));
         }
     });
-    (addr, task)
+    (addr, task, tls_probes)
 }
 
-async fn handle_tcp_dns_connection(mut socket: tokio::net::TcpStream) {
+async fn handle_tcp_dns_connection(
+    mut socket: tokio::net::TcpStream,
+    tls_probes: Arc<AtomicUsize>,
+) {
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
     let mut prefix = [0u8; 2];
@@ -55,6 +67,7 @@ async fn handle_tcp_dns_connection(mut socket: tokio::net::TcpStream) {
     // 0x16 0x03 is the start of a TLS record; plain DNS over TCP starts
     // with a small message length whose first byte is usually 0x00.
     if prefix[0] == 0x16 {
+        tls_probes.fetch_add(1, Ordering::SeqCst);
         return;
     }
     loop {
@@ -272,7 +285,7 @@ async fn test_forced_udp_scheme_creates_only_udp() {
 /// framed-stream transport.
 #[tokio::test]
 async fn test_forced_tcp_scheme_resolves_over_tcp() {
-    let (addr, server) = spawn_tcp_dns_upstream().await;
+    let (addr, server, _tls_probes) = spawn_tcp_dns_upstream().await;
     let group = DnsGroup::new(
         "test".to_string(),
         vec![format!("tcp://{addr}")],
@@ -302,7 +315,7 @@ async fn test_forced_tcp_scheme_resolves_over_tcp() {
 /// the documented TLS -> TCP -> UDP order.
 #[tokio::test]
 async fn test_bare_ip_prefers_tcp_over_udp() {
-    let (addr, server) = spawn_tcp_dns_upstream().await;
+    let (addr, server, _tls_probes) = spawn_tcp_dns_upstream().await;
     let group = DnsGroup::new(
         "test".to_string(),
         vec![addr.to_string()],
@@ -325,6 +338,84 @@ async fn test_bare_ip_prefers_tcp_over_udp() {
         .await
         .expect("TCP upstream must answer");
     assert_eq!(resp.header.rcode, DnsResponseCode::NoError);
+    server.abort();
+}
+
+/// The opportunistic DoT probe for a bare IP runs once per endpoint: a
+/// transport recreated after the upstream closed its TCP stream must go
+/// straight to the plaintext fallback instead of probing TLS again.
+#[tokio::test]
+async fn test_dot_probe_cached_across_transport_recreation() {
+    let (addr, server, tls_probes) = spawn_tcp_dns_upstream().await;
+    let group = DnsGroup::new(
+        "test".to_string(),
+        vec![addr.to_string()],
+        false,
+        false,
+        None,
+        DohOptions::default(),
+    );
+    assert!(group.ensure_transports().await);
+    assert_eq!(group.transport_counts().await, (0, 1, 0, 0));
+    assert_eq!(
+        tls_probes.load(Ordering::SeqCst),
+        1,
+        "the first transport must probe DoT once"
+    );
+
+    // The upstream closed the TCP stream (routine idle close): the next
+    // query evicts and recreates the broken transport.
+    {
+        let state = group.state.read().await;
+        state.tcp_transports[0].state.mark_broken();
+    }
+    group.recreate_gate.set_last_attempt(0);
+    assert!(group.ensure_transports().await);
+    assert_eq!(
+        tls_probes.load(Ordering::SeqCst),
+        1,
+        "transport recreation must not probe DoT again"
+    );
+    assert_eq!(
+        group.transport_counts().await,
+        (0, 1, 0, 0),
+        "the recreated transport must still use TCP"
+    );
+
+    let query =
+        DnsPacket::new_query("example.com", DnsType::A).expect("build query");
+    let resp = group
+        .request(query)
+        .await
+        .expect("TCP upstream must answer");
+    assert_eq!(resp.header.rcode, DnsResponseCode::NoError);
+    server.abort();
+}
+
+/// A network change invalidates the cached DoT capability: the path to the
+/// DoT port may now be usable, so the probe is allowed again.
+#[tokio::test]
+async fn test_network_change_clears_dot_probe_cache() {
+    let (addr, server, tls_probes) = spawn_tcp_dns_upstream().await;
+    let group = DnsGroup::new(
+        "test".to_string(),
+        vec![addr.to_string()],
+        false,
+        false,
+        None,
+        DohOptions::default(),
+    );
+    assert!(group.ensure_transports().await);
+    assert_eq!(tls_probes.load(Ordering::SeqCst), 1);
+
+    group.handle_network_change().await;
+    assert!(group.ensure_transports().await);
+    assert_eq!(
+        tls_probes.load(Ordering::SeqCst),
+        2,
+        "a network change must re-probe DoT"
+    );
+    assert_eq!(group.transport_counts().await, (0, 1, 0, 0));
     server.abort();
 }
 
@@ -471,6 +562,10 @@ async fn test_cancelled_recreation_keeps_broken_transport() {
     // The initial creation consumed the group's recreation gate; open it so
     // the next call actually attempts the (hanging) recreation.
     group.recreate_gate.set_last_attempt(0);
+    // The initial creation cached the failed DoT probe; clear it so the
+    // recreation still goes through the hanging TLS handshake this test
+    // needs to cancel.
+    group.dot_probe_cache.clear();
 
     // The recreation hangs in the TLS handshake and is cancelled by the
     // request-path timeout.

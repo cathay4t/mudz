@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     future::Future,
     net::SocketAddr,
     pin::Pin,
@@ -38,6 +38,43 @@ const IPV6_BLOCKED_HINFO_OS: &str =
     "Set disable_ipv6 to false to allow IPv6 DNS queries";
 const IPV6_BLOCKED_HINFO_TTL: u32 = 86_400;
 
+/// Negative cache for the opportunistic DoT probe of bare IP nameservers.
+///
+/// Whether an endpoint speaks DoT only changes when its configuration or
+/// the network path to it changes. Without this cache every transport
+/// recreation, for example after the upstream closed an idle TCP
+/// connection, re-ran the probe and added a full connect/handshake timeout
+/// before falling back to plaintext. The cache is cleared on a reported
+/// network change or resume, when the path to the DoT port may have
+/// changed.
+#[derive(Default)]
+struct DotProbeCache {
+    unsupported: Mutex<HashSet<SocketAddr>>,
+}
+
+impl DotProbeCache {
+    fn is_unsupported(&self, addr: &SocketAddr) -> bool {
+        self.unsupported
+            .lock()
+            .expect("DoT probe cache lock poisoned")
+            .contains(addr)
+    }
+
+    fn mark_unsupported(&self, addr: SocketAddr) {
+        self.unsupported
+            .lock()
+            .expect("DoT probe cache lock poisoned")
+            .insert(addr);
+    }
+
+    fn clear(&self) {
+        self.unsupported
+            .lock()
+            .expect("DoT probe cache lock poisoned")
+            .clear();
+    }
+}
+
 pub(crate) struct DnsGroups {
     fallback: DnsGroup,
     groups: HashMap<String, DnsGroup>,
@@ -54,26 +91,32 @@ impl DnsGroups {
             .as_ref()
             .map(DohOptions::from_config)
             .unwrap_or_default();
-        let fallback = DnsGroup::new(
+        // One cache per server: DoT capability belongs to the endpoint, not
+        // to a group, so the same nameserver listed in two groups is only
+        // probed once.
+        let dot_probe_cache = Arc::new(DotProbeCache::default());
+        let fallback = DnsGroup::with_dot_probe_cache(
             "fallback".to_string(),
             config.fallback.nameservers,
             config.fallback.disable_ipv6,
             false, // fallback is never intentionally blocking
             doh_cache.clone(),
             doh_options,
+            Arc::clone(&dot_probe_cache),
         );
 
         let mut groups = HashMap::new();
         let mut search_index = HashMap::new();
         for (group_name, group_config) in config.groups.drain() {
             let blocking = group_config.nameservers.is_empty();
-            let dns_group = DnsGroup::new(
+            let dns_group = DnsGroup::with_dot_probe_cache(
                 group_name.to_string(),
                 group_config.nameservers,
                 group_config.disable_ipv6,
                 blocking,
                 doh_cache.clone(),
                 doh_options,
+                Arc::clone(&dot_probe_cache),
             );
             groups.insert(group_name.to_string(), dns_group);
 
@@ -499,6 +542,9 @@ struct DnsGroup {
     doh_cache: Option<Arc<DohResolvCache>>,
     /// DoH retry/timeout policy configured in the `[doh]` section.
     doh_options: DohOptions,
+    /// Negative cache of the opportunistic DoT probe, shared by every group
+    /// of the server.
+    dot_probe_cache: Arc<DotProbeCache>,
 }
 
 struct GroupState {
@@ -594,6 +640,9 @@ type UpstreamQueryFuture =
     Pin<Box<dyn Future<Output = UpstreamResult> + Send + 'static>>;
 
 impl DnsGroup {
+    /// Test-only constructor with a private DoT probe cache. Production
+    /// groups share one cache through [`Self::with_dot_probe_cache`].
+    #[cfg(test)]
     fn new(
         name: String,
         nameservers: Vec<String>,
@@ -601,6 +650,26 @@ impl DnsGroup {
         blocking: bool,
         doh_cache: Option<Arc<DohResolvCache>>,
         doh_options: DohOptions,
+    ) -> Self {
+        Self::with_dot_probe_cache(
+            name,
+            nameservers,
+            disable_ipv6,
+            blocking,
+            doh_cache,
+            doh_options,
+            Arc::new(DotProbeCache::default()),
+        )
+    }
+
+    fn with_dot_probe_cache(
+        name: String,
+        nameservers: Vec<String>,
+        disable_ipv6: bool,
+        blocking: bool,
+        doh_cache: Option<Arc<DohResolvCache>>,
+        doh_options: DohOptions,
+        dot_probe_cache: Arc<DotProbeCache>,
     ) -> Self {
         Self {
             name,
@@ -619,6 +688,7 @@ impl DnsGroup {
             nameservers,
             doh_cache,
             doh_options,
+            dot_probe_cache,
         }
     }
 
@@ -636,9 +706,16 @@ impl DnsGroup {
         group_name: &str,
         blocking: bool,
         doh_options: DohOptions,
+        dot_probe_cache: &DotProbeCache,
     ) -> GroupState {
         let created = join_all(nameservers.iter().map(|srv| {
-            Self::create_upstream(srv, doh_cache, group_name, doh_options)
+            Self::create_upstream(
+                srv,
+                doh_cache,
+                group_name,
+                doh_options,
+                dot_probe_cache,
+            )
         }))
         .await;
 
@@ -696,6 +773,7 @@ impl DnsGroup {
         doh_cache: &Option<Arc<DohResolvCache>>,
         group_name: &str,
         doh_options: DohOptions,
+        dot_probe_cache: &DotProbeCache,
     ) -> Option<CreatedUpstream> {
         if srv.starts_with("https://") {
             return match create_doh_client(srv, doh_cache, doh_options) {
@@ -832,28 +910,37 @@ impl DnsGroup {
                     );
                     return None;
                 };
-                match Self::create_dot_transport(
-                    srv,
-                    &nameserver,
-                    doh_cache,
-                    group_name,
-                )
-                .await
-                {
-                    Ok(transport) => {
-                        log::info!(
-                            "Upstream '{}' in group '{}' uses DNS over TLS",
-                            srv,
-                            group_name
-                        );
-                        return Some(CreatedUpstream::Dot(Arc::new(transport)));
-                    }
-                    Err(e) => log::debug!(
-                        "DoT not available for '{}' in group '{}': {e}; \
-                         trying DNS over TCP",
+                let dot_addr =
+                    SocketAddr::new(ip, nameserver.port_or(DOT_PORT));
+                if !dot_probe_cache.is_unsupported(&dot_addr) {
+                    match Self::create_dot_transport(
                         srv,
-                        group_name
-                    ),
+                        &nameserver,
+                        doh_cache,
+                        group_name,
+                    )
+                    .await
+                    {
+                        Ok(transport) => {
+                            log::info!(
+                                "Upstream '{}' in group '{}' uses DNS over TLS",
+                                srv,
+                                group_name
+                            );
+                            return Some(CreatedUpstream::Dot(Arc::new(
+                                transport,
+                            )));
+                        }
+                        Err(e) => {
+                            log::debug!(
+                                "DoT not available for '{}' in group '{}': \
+                                 {e}; trying DNS over TCP",
+                                srv,
+                                group_name
+                            );
+                            dot_probe_cache.mark_unsupported(dot_addr);
+                        }
+                    }
                 }
 
                 let tcp_addr =
@@ -1062,6 +1149,7 @@ impl DnsGroup {
                 &self.name,
                 false,
                 self.doh_options,
+                self.dot_probe_cache.as_ref(),
             )
             .await;
             // Evict exactly the transports collected above. A peer that
@@ -1113,6 +1201,7 @@ impl DnsGroup {
             &self.name,
             false,
             self.doh_options,
+            self.dot_probe_cache.as_ref(),
         )
         .await;
         let ok = Self::state_has_live(&state);
@@ -1145,6 +1234,7 @@ impl DnsGroup {
     /// Drop pooled DoH connections and clear upstream failure state after
     /// the system resumed from suspend.
     async fn handle_resume(&self) {
+        self.dot_probe_cache.clear();
         let state = self.state.read().await;
         for upstream in &state.doh_clients {
             upstream.client.invalidate_pool().await;
@@ -1178,6 +1268,7 @@ impl DnsGroup {
     /// recreation gate is cleared so that happens immediately instead of
     /// after the retry cooldown.
     async fn handle_network_change(&self) {
+        self.dot_probe_cache.clear();
         let state = self.state.read().await;
         for upstream in &state.doh_clients {
             upstream.client.invalidate_pool().await;
