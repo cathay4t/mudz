@@ -93,14 +93,13 @@ impl FakeUpstream {
                     question.class,
                     query.header.rd,
                 );
-                reply.answers.push(DnsResourceRecord {
-                    domain: question.domain.clone(),
-                    kind: DnsType::A,
-                    class: DnsClass::IN,
-                    ttl: 60,
-                    rdlength: u16::from(FAKE_ANSWER.len() as u8),
-                    rdata: FAKE_ANSWER.to_vec(),
-                });
+                reply.answers.push(DnsResourceRecord::new(
+                    question.domain.clone(),
+                    DnsType::A,
+                    DnsClass::IN,
+                    60,
+                    FAKE_ANSWER.to_vec(),
+                ));
                 reply.header.ancount = 1;
                 let _ = thread_socket.send_to(&reply.to_bytes(), peer);
             }
@@ -141,19 +140,17 @@ impl Drop for ServerHandle {
 }
 
 fn embedded_config() -> MudzConfig {
-    MudzConfig {
-        main: MudzMainConfig {
-            udp_bind: BIND.to_string(),
-            max_cache_size: 64,
-            log_level: "warn".to_string(),
-            ..Default::default()
-        },
-        fallback: MudzFallbackConfig {
-            nameservers: vec![UPSTREAM.to_string()],
-            ..Default::default()
-        },
-        ..Default::default()
-    }
+    let mut config = MudzConfig::default();
+    config.main = MudzMainConfig::new(
+        BIND.to_string(),
+        None,
+        64,
+        "warn".to_string(),
+        true,
+    );
+    config.fallback =
+        MudzFallbackConfig::new(vec![UPSTREAM.to_string()], false);
+    config
 }
 
 /// Start the server on its own runtime and hand the notifier back to the
@@ -305,13 +302,8 @@ fn test_notify_without_running_server_fails() {
         .enable_all()
         .build()
         .expect("build test runtime");
-    let config = MudzConfig {
-        main: MudzMainConfig {
-            udp_bind: "127.0.0.1:53564".to_string(),
-            ..Default::default()
-        },
-        ..Default::default()
-    };
+    let mut config = MudzConfig::default();
+    config.main.udp_bind = "127.0.0.1:53564".to_string();
     rt.block_on(async move {
         let server = MudzServer::new(config)
             .await

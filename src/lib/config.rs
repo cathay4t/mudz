@@ -42,6 +42,7 @@ fn default_doh_idle_timeout() -> u64 {
 /// Configuration for the main section
 #[derive(Debug, Deserialize, Clone, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
+#[non_exhaustive]
 pub struct MudzMainConfig {
     /// UDP socket bind address
     pub udp_bind: String,
@@ -56,6 +57,27 @@ pub struct MudzMainConfig {
     pub log_level: String,
     /// Answer A/AAAA queries from `/etc/hosts` before forwarding them.
     pub load_etc_hosts: bool,
+}
+
+impl MudzMainConfig {
+    /// Build the main section from its fields. `tcp_bind` defaults to
+    /// `udp_bind` when omitted by the config file; pass `None` to keep that
+    /// behaviour.
+    pub fn new(
+        udp_bind: String,
+        tcp_bind: Option<String>,
+        max_cache_size: usize,
+        log_level: String,
+        load_etc_hosts: bool,
+    ) -> Self {
+        Self {
+            udp_bind,
+            tcp_bind,
+            max_cache_size,
+            log_level,
+            load_etc_hosts,
+        }
+    }
 }
 
 impl Default for MudzMainConfig {
@@ -73,6 +95,7 @@ impl Default for MudzMainConfig {
 /// Configuration for the fallback (default upstream) section
 #[derive(Debug, Deserialize, Clone, Default, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
+#[non_exhaustive]
 pub struct MudzFallbackConfig {
     /// Upstream DNS servers for fallback.
     ///
@@ -85,11 +108,22 @@ pub struct MudzFallbackConfig {
     pub disable_ipv6: bool,
 }
 
+impl MudzFallbackConfig {
+    /// Build the fallback section from its fields.
+    pub fn new(nameservers: Vec<String>, disable_ipv6: bool) -> Self {
+        Self {
+            nameservers,
+            disable_ipv6,
+        }
+    }
+}
+
 /// Configuration for the [doh] section. Provides plain IP nameservers for
 /// resolving DoH server hostnames and `tls://hostname` DoT endpoints.
 /// Mandatory if any nameserver uses either.
 #[derive(Debug, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
+#[non_exhaustive]
 pub struct MudzDohConfig {
     /// UDP nameservers for resolving DoH/DoT server hostnames
     pub nameservers: Vec<IpAddr>,
@@ -113,6 +147,29 @@ pub struct MudzDohConfig {
     pub idle_timeout: u64,
 }
 
+impl MudzDohConfig {
+    /// Build the DoH resolver section from its fields.
+    pub fn new(
+        nameservers: Vec<IpAddr>,
+        disable_ipv6: bool,
+        timeout: u64,
+        retries: usize,
+        keepalive_interval: u64,
+        keepalive_timeout: u64,
+        idle_timeout: u64,
+    ) -> Self {
+        Self {
+            nameservers,
+            disable_ipv6,
+            timeout,
+            retries,
+            keepalive_interval,
+            keepalive_timeout,
+            idle_timeout,
+        }
+    }
+}
+
 impl Default for MudzDohConfig {
     fn default() -> Self {
         Self {
@@ -130,6 +187,7 @@ impl Default for MudzDohConfig {
 /// Configuration for a named group of upstream DNS servers
 #[derive(Debug, Deserialize, Clone, Default, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
+#[non_exhaustive]
 pub struct MudzGroupConfig {
     /// Nameservers in this group.
     ///
@@ -144,12 +202,39 @@ pub struct MudzGroupConfig {
     pub disable_ipv6: bool,
 }
 
+impl MudzGroupConfig {
+    /// Build a group section from its fields.
+    pub fn new(
+        nameservers: Vec<String>,
+        domains: Vec<String>,
+        disable_ipv6: bool,
+    ) -> Self {
+        Self {
+            nameservers,
+            domains,
+            disable_ipv6,
+        }
+    }
+}
+
 /// Configuration of the DNS cache server.
 ///
 /// It can be loaded from a TOML file with [`MudzConfig::from_file`] or built
-/// directly for embedding the server into another daemon.
+/// for embedding the server into another daemon. Because the struct is
+/// `#[non_exhaustive]`, build it with [`MudzConfig::default`] followed by
+/// field assignments, or with [`MudzConfig::new`]:
+///
+/// ```
+/// use mudz::{MudzConfig, MudzFallbackConfig};
+///
+/// let mut config = MudzConfig::default();
+/// config.main.udp_bind = "127.0.0.1:53".to_string();
+/// config.fallback =
+///     MudzFallbackConfig::new(vec!["223.5.5.5".to_string()], false);
+/// ```
 #[derive(Debug, Deserialize, Clone, Default, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
+#[non_exhaustive]
 pub struct MudzConfig {
     /// Main settings
     pub main: MudzMainConfig,
@@ -163,6 +248,21 @@ pub struct MudzConfig {
 }
 
 impl MudzConfig {
+    /// Build the configuration from its sections.
+    pub fn new(
+        main: MudzMainConfig,
+        fallback: MudzFallbackConfig,
+        doh: Option<MudzDohConfig>,
+        groups: HashMap<String, MudzGroupConfig>,
+    ) -> Self {
+        Self {
+            main,
+            fallback,
+            doh,
+            groups,
+        }
+    }
+
     /// Load configuration from a TOML file
     pub fn from_file<P: AsRef<Path>>(path: P) -> Result<Self, MudzError> {
         let path_ref = path.as_ref();

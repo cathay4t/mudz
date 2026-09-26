@@ -15,9 +15,11 @@
 //! # }
 //! ```
 //!
-//! [`MudzConfig`] can also be built from plain struct literals (all fields
-//! are public and have defaults) when the embedder stores its configuration
-//! in another format.
+//! [`MudzConfig`] can also be built in code when the embedder stores its
+//! configuration in another format: start from [`MudzConfig::default`] (or a
+//! section's `new`) and assign the public fields. The structs are
+//! `#[non_exhaustive]`, so struct-literal construction is intentionally not
+//! available outside the crate.
 //!
 //! [`MudzServer::new`] validates the configuration, binds the listening
 //! sockets and resolves the DoH bootstrap hostnames, so an error means

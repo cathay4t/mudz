@@ -4,6 +4,7 @@ use crate::{ErrorKind, MudzError};
 
 /// DNS response codes
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum DnsResponseCode {
     NoError,
     FormErr,
@@ -44,6 +45,7 @@ impl From<u8> for DnsResponseCode {
 
 /// DNS Header structure
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct DnsHeader {
     pub id: u16,
     pub qr: bool,
@@ -66,6 +68,40 @@ pub struct DnsHeader {
 
 impl DnsHeader {
     pub const LEN: usize = 12;
+
+    /// Build a header from all of its fields.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        id: u16,
+        qr: bool,
+        opcode: u16,
+        aa: bool,
+        tc: bool,
+        rd: bool,
+        ra: bool,
+        z: u16,
+        rcode: DnsResponseCode,
+        qdcount: u16,
+        ancount: u16,
+        nscount: u16,
+        arcount: u16,
+    ) -> Self {
+        Self {
+            id,
+            qr,
+            opcode,
+            aa,
+            tc,
+            rd,
+            ra,
+            z,
+            rcode,
+            qdcount,
+            ancount,
+            nscount,
+            arcount,
+        }
+    }
 
     pub fn is_query(&self) -> bool {
         !self.qr

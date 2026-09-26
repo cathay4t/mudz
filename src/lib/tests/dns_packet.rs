@@ -391,11 +391,7 @@ fn test_parse_domain_name() {
 
 #[test]
 fn test_emit_domain_name() {
-    let domain = DnsDomainName {
-        labels: vec![b"google".to_vec(), b"com".to_vec()],
-        raw_offset: 0,
-        compression_pointer: None,
-    };
+    let domain = DnsDomainName::new(vec![b"google".to_vec(), b"com".to_vec()]);
 
     let mut buf = Vec::new();
     domain.emit_to(&mut buf);
@@ -475,21 +471,21 @@ fn test_packet_too_short() {
 
 #[test]
 fn test_header_serialization() {
-    let header = DnsHeader {
-        id: 0x1234,
-        qr: false,
-        opcode: 0,
-        aa: false,
-        tc: false,
-        rd: true,
-        ra: false,
-        z: 0,
-        rcode: DnsResponseCode::NoError,
-        qdcount: 1,
-        ancount: 2,
-        nscount: 3,
-        arcount: 4,
-    };
+    let header = DnsHeader::new(
+        0x1234,
+        false,
+        0,
+        false,
+        false,
+        true,
+        false,
+        0,
+        DnsResponseCode::NoError,
+        1,
+        2,
+        3,
+        4,
+    );
 
     let bytes = header.to_bytes();
     assert_eq!(bytes.len(), 12);
@@ -563,21 +559,21 @@ fn test_z_field_parsing() {
 
 #[test]
 fn test_z_field_serialization() {
-    let header = DnsHeader {
-        id: 0x1234,
-        qr: false,
-        opcode: 0,
-        aa: false,
-        tc: false,
-        rd: true,
-        ra: false,
-        z: 0,
-        rcode: DnsResponseCode::NoError,
-        qdcount: 1,
-        ancount: 0,
-        nscount: 0,
-        arcount: 0,
-    };
+    let header = DnsHeader::new(
+        0x1234,
+        false,
+        0,
+        false,
+        false,
+        true,
+        false,
+        0,
+        DnsResponseCode::NoError,
+        1,
+        0,
+        0,
+        0,
+    );
 
     let bytes = header.to_bytes();
     assert_eq!(bytes.len(), 12);
@@ -710,39 +706,39 @@ fn test_has_edns() {
 fn edns_response(do_bit: bool) -> DnsPacket {
     let domain = DnsDomainName::from_str("example.com").unwrap();
     let opt_ttl: u32 = if do_bit { 0x0000_8000 } else { 0 };
-    DnsPacket {
-        header: DnsHeader {
-            id: 0x1234,
-            qr: true,
-            rcode: DnsResponseCode::NoError,
-            qdcount: 1,
-            ancount: 1,
-            arcount: 1,
-            ..Default::default()
-        },
-        questions: vec![DnsQuestion {
-            domain: domain.clone(),
-            kind: DnsType::A,
-            class: DnsClass::IN,
-        }],
-        answers: vec![DnsResourceRecord {
-            domain: domain.clone(),
-            kind: DnsType::A,
-            class: DnsClass::IN,
-            ttl: 300,
-            rdlength: 4,
-            rdata: vec![1, 2, 3, 4],
-        }],
-        authorities: Vec::new(),
-        additionals: vec![DnsResourceRecord {
-            domain: DnsDomainName::default(),
-            kind: DnsType::Other(41),
-            class: DnsClass::Other(1232),
-            ttl: opt_ttl,
-            rdlength: 0,
-            rdata: Vec::new(),
-        }],
-    }
+    DnsPacket::new(
+        DnsHeader::new(
+            0x1234,
+            true,
+            0,
+            false,
+            false,
+            true,
+            true,
+            0,
+            DnsResponseCode::NoError,
+            1,
+            1,
+            0,
+            1,
+        ),
+        vec![DnsQuestion::new(domain.clone(), DnsType::A, DnsClass::IN)],
+        vec![DnsResourceRecord::new(
+            domain.clone(),
+            DnsType::A,
+            DnsClass::IN,
+            300,
+            vec![1, 2, 3, 4],
+        )],
+        Vec::new(),
+        vec![DnsResourceRecord::new(
+            DnsDomainName::default(),
+            DnsType::Other(41),
+            DnsClass::Other(1232),
+            opt_ttl,
+            Vec::new(),
+        )],
+    )
 }
 
 #[test]

@@ -50,19 +50,17 @@ static PORT_LOCK: Mutex<()> = Mutex::new(());
 /// Build the runtime configuration the way an embedder does: plain Rust
 /// structs, no TOML file and no `MudzConfig::from_file`.
 fn embedded_config() -> MudzConfig {
-    MudzConfig {
-        main: MudzMainConfig {
-            udp_bind: BIND.to_string(),
-            max_cache_size: 64,
-            log_level: "error".to_string(),
-            ..Default::default()
-        },
-        fallback: MudzFallbackConfig {
-            nameservers: vec![UPSTREAM.to_string()],
-            ..Default::default()
-        },
-        ..Default::default()
-    }
+    let mut config = MudzConfig::default();
+    config.main = MudzMainConfig::new(
+        BIND.to_string(),
+        None,
+        64,
+        "error".to_string(),
+        true,
+    );
+    config.fallback =
+        MudzFallbackConfig::new(vec![UPSTREAM.to_string()], false);
+    config
 }
 
 /// A runtime shaped like the one an embedder runs: multi-threaded with all
@@ -242,14 +240,13 @@ impl FakeUpstream {
                     question.class,
                     query.header.rd,
                 );
-                reply.answers.push(DnsResourceRecord {
-                    domain: question.domain.clone(),
-                    kind: DnsType::A,
-                    class: DnsClass::IN,
-                    ttl: 60,
-                    rdlength: ANSWER.len() as u16,
-                    rdata: ANSWER.to_vec(),
-                });
+                reply.answers.push(DnsResourceRecord::new(
+                    question.domain.clone(),
+                    DnsType::A,
+                    DnsClass::IN,
+                    60,
+                    ANSWER.to_vec(),
+                ));
                 reply.header.ancount = 1;
                 let _ = socket.send_to(&reply.to_bytes(), peer);
             }

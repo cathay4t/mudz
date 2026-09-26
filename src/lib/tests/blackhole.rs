@@ -296,14 +296,13 @@ impl FakeUpstream {
                     question.class,
                     query.header.rd,
                 );
-                reply.answers.push(DnsResourceRecord {
-                    domain: question.domain.clone(),
-                    kind: DnsType::A,
-                    class: DnsClass::IN,
-                    ttl: 60,
-                    rdlength: u16::from(FAKE_ANSWER.len() as u8),
-                    rdata: FAKE_ANSWER.to_vec(),
-                });
+                reply.answers.push(DnsResourceRecord::new(
+                    question.domain.clone(),
+                    DnsType::A,
+                    DnsClass::IN,
+                    60,
+                    FAKE_ANSWER.to_vec(),
+                ));
                 reply.header.ancount = 1;
                 let _ = socket.send_to(&reply.to_bytes(), peer);
             }

@@ -236,29 +236,37 @@ fn start_large_upstream() -> std::net::SocketAddr {
             };
             let domain = question.domain.clone();
             let answers = (0..100u8)
-                .map(|i| DnsResourceRecord {
-                    domain: domain.clone(),
-                    kind: DnsType::A,
-                    class: DnsClass::IN,
-                    ttl: 300,
-                    rdlength: 4,
-                    rdata: vec![10, 0, 0, i],
+                .map(|i| {
+                    DnsResourceRecord::new(
+                        domain.clone(),
+                        DnsType::A,
+                        DnsClass::IN,
+                        300,
+                        vec![10, 0, 0, i],
+                    )
                 })
                 .collect();
-            let response = DnsPacket {
-                header: DnsHeader {
-                    id: query.header.id,
-                    qr: true,
-                    rcode: DnsResponseCode::NoError,
-                    qdcount: 1,
-                    ancount: 100,
-                    ..Default::default()
-                },
-                questions: vec![question.clone()],
+            let response = DnsPacket::new(
+                DnsHeader::new(
+                    query.header.id,
+                    true,
+                    0,
+                    false,
+                    false,
+                    true,
+                    true,
+                    0,
+                    DnsResponseCode::NoError,
+                    1,
+                    100,
+                    0,
+                    0,
+                ),
+                vec![question.clone()],
                 answers,
-                authorities: Vec::new(),
-                additionals: Vec::new(),
-            };
+                Vec::new(),
+                Vec::new(),
+            );
             let bytes = response.to_bytes();
             assert!(
                 bytes.len() > 512,

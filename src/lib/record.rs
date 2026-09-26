@@ -5,6 +5,7 @@ use std::{collections::HashMap, str::FromStr};
 use crate::{DnsType, ErrorKind, MudzError};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum DnsClass {
     IN,
     CS,
@@ -44,6 +45,7 @@ impl Default for DnsClass {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct DnsQuestion {
     pub domain: DnsDomainName,
     pub kind: DnsType,
@@ -53,6 +55,15 @@ pub struct DnsQuestion {
 impl DnsQuestion {
     // 1 byte for QNAME, 2 byts for QTYPE, 2 bytes for QCLASS
     pub const HDR_LEN: usize = 5;
+
+    /// Build a question from its fields.
+    pub fn new(domain: DnsDomainName, kind: DnsType, class: DnsClass) -> Self {
+        Self {
+            domain,
+            kind,
+            class,
+        }
+    }
 
     pub fn parse_from(
         buf: &[u8],
@@ -101,6 +112,7 @@ impl DnsQuestion {
 
 /// DNS Resource Record
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct DnsResourceRecord {
     pub domain: DnsDomainName,
     pub kind: DnsType,
@@ -124,6 +136,26 @@ fn kind_has_domain_names(kind: DnsType) -> bool {
 
 impl DnsResourceRecord {
     pub const HDR_LEN: usize = 10;
+
+    /// Build a resource record from its fields. `rdlength` is derived from
+    /// the length of `rdata`.
+    pub fn new(
+        domain: DnsDomainName,
+        kind: DnsType,
+        class: DnsClass,
+        ttl: u32,
+        rdata: Vec<u8>,
+    ) -> Self {
+        let rdlength = rdata.len() as u16;
+        Self {
+            domain,
+            kind,
+            class,
+            ttl,
+            rdlength,
+            rdata,
+        }
+    }
 
     pub fn parse_from(
         buf: &[u8],
@@ -423,6 +455,7 @@ impl DnsResourceRecord {
 
 /// A fully domain name
 #[derive(Debug, Clone, Default)]
+#[non_exhaustive]
 pub struct DnsDomainName {
     pub labels: Vec<Vec<u8>>,
     pub raw_offset: usize,
@@ -479,6 +512,17 @@ impl std::fmt::Display for DnsDomainName {
 }
 
 impl DnsDomainName {
+    /// Build a domain name from its labels. `raw_offset` and
+    /// `compression_pointer` are left at their defaults; use
+    /// [`DnsDomainName::parse_from`] to preserve wire offsets.
+    pub fn new(labels: Vec<Vec<u8>>) -> Self {
+        Self {
+            labels,
+            raw_offset: 0,
+            compression_pointer: None,
+        }
+    }
+
     /// Parse a domain name from the buffer, handling compression pointers
     pub fn parse_from(
         buf: &[u8],

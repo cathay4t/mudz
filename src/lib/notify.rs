@@ -14,6 +14,7 @@ use crate::{ErrorKind, MudzError};
 /// Host environment change an embedder reports to a running
 /// [`MudzServer`](crate::MudzServer).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum MudzServerEvent {
     /// The network path to the configured upstreams changed, for example
     /// because the default gateway was replaced by a route apply or by a

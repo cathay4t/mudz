@@ -4,6 +4,7 @@ use std::fmt;
 
 /// DNS error kinds
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ErrorKind {
     Bug,
     InvalidPacket,
@@ -34,6 +35,7 @@ impl fmt::Display for ErrorKind {
 
 /// DNS parsing/serialization errors
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct MudzError {
     pub kind: ErrorKind,
     pub message: String,

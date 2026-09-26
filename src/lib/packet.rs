@@ -9,6 +9,7 @@ use crate::{
 
 /// DNS query types
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum DnsType {
     /// RFC 1035: The IPv4 address record
     A,
@@ -99,6 +100,7 @@ impl Default for DnsType {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub struct DnsPacket {
     pub header: DnsHeader,
     // RFC 9619 said: In the DNS, QDCOUNT Is (Usually) One
@@ -115,6 +117,23 @@ impl DnsPacket {
     /// RFC 8484: This media type restricts the maximum size of the DNS message
     /// to 65535 bytes
     pub const MAX_DOH_PACKET_SIZE: usize = 65535;
+
+    /// Build a packet from its header and the four record sections.
+    pub fn new(
+        header: DnsHeader,
+        questions: Vec<DnsQuestion>,
+        answers: Vec<DnsResourceRecord>,
+        authorities: Vec<DnsResourceRecord>,
+        additionals: Vec<DnsResourceRecord>,
+    ) -> Self {
+        Self {
+            header,
+            questions,
+            answers,
+            authorities,
+            additionals,
+        }
+    }
 
     pub fn parse(data: &[u8]) -> Result<Self, MudzError> {
         let header = DnsHeader::parse(data)?;
